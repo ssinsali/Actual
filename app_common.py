@@ -29,6 +29,80 @@ _DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEAM_STACK_ORDER = ("A조", "B조", "C조")
 
 
+def render_slicer(
+    label: str,
+    options: list[str],
+    *,
+    key: str,
+    default_on: bool = True,
+) -> list[str]:
+    """피벗 슬라이서형 필터 — 항목을 모두 보여 주고 ON/OFF로 선택."""
+    st.markdown(f"**{label}**")
+    if not options:
+        st.caption("선택 가능한 항목이 없습니다.")
+        return []
+
+    keys = [f"{key}__{i}" for i, _ in enumerate(options)]
+    # 최초 기본값
+    for ck in keys:
+        if ck not in st.session_state:
+            st.session_state[ck] = default_on
+
+    a1, a2 = st.columns(2)
+    with a1:
+        if st.button("전체", key=f"{key}_btn_all", use_container_width=True):
+            for ck in keys:
+                st.session_state[ck] = True
+            st.rerun()
+    with a2:
+        if st.button("해제", key=f"{key}_btn_none", use_container_width=True):
+            for ck in keys:
+                st.session_state[ck] = False
+            st.rerun()
+
+    ncols = min(len(options), 4)
+    cols = st.columns(ncols)
+    selected: list[str] = []
+    for i, opt in enumerate(options):
+        with cols[i % ncols]:
+            if st.checkbox(str(opt), key=keys[i]):
+                selected.append(opt)
+    return selected
+
+
+def render_single_slicer(
+    label: str,
+    options: list[str],
+    *,
+    key: str,
+    default: str | None = None,
+) -> str:
+    """피벗 슬라이서형 단일 선택 — 항목을 모두 보여 주고 하나만 선택."""
+    st.markdown(f"**{label}**")
+    if not options:
+        st.caption("선택 가능한 항목이 없습니다.")
+        return ""
+
+    state_key = f"{key}_value"
+    if state_key not in st.session_state or st.session_state[state_key] not in options:
+        st.session_state[state_key] = default if default in options else options[0]
+
+    ncols = min(len(options), 4)
+    cols = st.columns(ncols)
+    for i, opt in enumerate(options):
+        with cols[i % ncols]:
+            is_on = st.session_state[state_key] == opt
+            if st.button(
+                str(opt),
+                key=f"{key}_pick_{i}",
+                type="primary" if is_on else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state[state_key] = opt
+                st.rerun()
+    return str(st.session_state[state_key])
+
+
 def app_dir() -> Path:
     return _APP_DIR
 
