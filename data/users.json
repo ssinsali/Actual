@@ -4,6 +4,11 @@
       "password_hash": "pbkdf2_sha256$260000$aa04c5fe02e801b80a683e085b734db5$5c1cd31d9697a08a1e3c8c44ccaa02780874cdaec68e43e898a43ac3b8756102",
       "display_name": "김영명",
       "role": "admin"
+    },
+    "2180606": {
+      "password_hash": "pbkdf2_sha256$260000$d46697f3738db532de26da4cb4195f29$3ec1e2b1504d6bfb9888de12de0442919b1a6af391f9ab519ae4b24653f27b29",
+      "display_name": "우선식",
+      "role": "user"
     }
   }
 }
