@@ -9,6 +9,11 @@
       "password_hash": "pbkdf2_sha256$260000$d46697f3738db532de26da4cb4195f29$3ec1e2b1504d6bfb9888de12de0442919b1a6af391f9ab519ae4b24653f27b29",
       "display_name": "우선식",
       "role": "user"
+    },
+    "chilsoo": {
+      "password_hash": "pbkdf2_sha256$260000$301a7d6a31924a513a685789dc8150c1$2fb8ed9b34361d211ff613393de34e9ea505fd25eef894512e62804f78ea7076",
+      "display_name": "김상섭",
+      "role": "user"
     }
   }
 }
