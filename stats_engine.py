@@ -360,17 +360,6 @@ def normalize_records(
     team_col = info.get("team_col")
     campus_col = info.get("campus_col")
     shift_col = info.get("shift_col")
-    rows: list[dict] = []
-
-    def _row_campus(r: pd.Series) -> str:
-        if campus_col and campus_col in r.index:
-            return _map_campus_label(r[campus_col])
-        return "(미지정)"
-
-    def _row_shift(r: pd.Series) -> str:
-        if shift_col and shift_col in r.index:
-            return _map_shift_label(r[shift_col])
-        return "(미지정)"
 
     if info.get("layout") == "long" or (
         info.get("process_col") and (info.get("manpower_col") or info.get("output_col"))
@@ -381,23 +370,36 @@ def normalize_records(
         else:
             work["_date"] = pd.NaT
         work["_team"] = work[team_col].astype(str).str.strip() if team_col else "(미지정)"
+        work["_team"] = work["_team"].where(
+            work["_team"].notna() & (work["_team"].str.lower() != "nan"),
+            "(미지정)",
+        )
         work["_area"] = work[info["process_col"]].map(_map_area_label)
-        work = work[work["_area"].notna()]
-        work["_man"] = _to_number(work[info["manpower_col"]]) if info.get("manpower_col") else 0
-        work["_out"] = _to_number(work[info["output_col"]]) if info.get("output_col") else 0
-        for _, r in work.iterrows():
-            rows.append(
-                {
-                    "일자": r["_date"],
-                    "조": r["_team"] if r["_team"] and r["_team"].lower() != "nan" else "(미지정)",
-                    "캠퍼스": _row_campus(r),
-                    "주야": _row_shift(r),
-                    "영역": r["_area"],
-                    "인력": float(r["_man"]) if pd.notna(r["_man"]) else 0.0,
-                    "실적": float(r["_out"]) if pd.notna(r["_out"]) else 0.0,
-                    "source": source,
-                }
-            )
+        work = work[work["_area"].notna()].copy()
+        work["_man"] = _to_number(work[info["manpower_col"]]) if info.get("manpower_col") else 0.0
+        work["_out"] = _to_number(work[info["output_col"]]) if info.get("output_col") else 0.0
+        work["_man"] = pd.to_numeric(work["_man"], errors="coerce").fillna(0.0)
+        work["_out"] = pd.to_numeric(work["_out"], errors="coerce").fillna(0.0)
+        if campus_col and campus_col in work.columns:
+            work["_campus"] = work[campus_col].map(_map_campus_label)
+        else:
+            work["_campus"] = "(미지정)"
+        if shift_col and shift_col in work.columns:
+            work["_shift"] = work[shift_col].map(_map_shift_label)
+        else:
+            work["_shift"] = "(미지정)"
+        out = pd.DataFrame(
+            {
+                "일자": work["_date"].values,
+                "조": work["_team"].values,
+                "캠퍼스": work["_campus"].values,
+                "주야": work["_shift"].values,
+                "영역": work["_area"].values,
+                "인력": work["_man"].values,
+                "실적": work["_out"].values,
+                "source": source,
+            }
+        )
     else:
         work = df.copy()
         if date_col:
@@ -405,32 +407,43 @@ def normalize_records(
         else:
             work["_date"] = pd.NaT
         work["_team"] = work[team_col].astype(str).str.strip() if team_col else "(미지정)"
-        wide_map = info.get("wide_map") or {}
-        for _, r in work.iterrows():
-            team = r["_team"] if r["_team"] and str(r["_team"]).lower() != "nan" else "(미지정)"
-            campus = _row_campus(r)
-            shift = _row_shift(r)
-            for area in AREAS:
-                m = wide_map.get(area) or {}
-                man_c, out_c = m.get("인력"), m.get("실적")
-                man = float(_to_number(pd.Series([r[man_c]])).iloc[0] or 0) if man_c else 0.0
-                out = float(_to_number(pd.Series([r[out_c]])).iloc[0] or 0) if out_c else 0.0
-                if man == 0 and out == 0:
-                    continue
-                rows.append(
-                    {
-                        "일자": r["_date"],
-                        "조": team,
-                        "캠퍼스": campus,
-                        "주야": shift,
-                        "영역": area,
-                        "인력": man,
-                        "실적": out,
-                        "source": source,
-                    }
-                )
+        work["_team"] = work["_team"].where(
+            work["_team"].notna() & (work["_team"].str.lower() != "nan"),
+            "(미지정)",
+        )
+        if campus_col and campus_col in work.columns:
+            work["_campus"] = work[campus_col].map(_map_campus_label)
+        else:
+            work["_campus"] = "(미지정)"
+        if shift_col and shift_col in work.columns:
+            work["_shift"] = work[shift_col].map(_map_shift_label)
+        else:
+            work["_shift"] = "(미지정)"
 
-    out = pd.DataFrame(rows)
+        wide_map = info.get("wide_map") or {}
+        parts: list[pd.DataFrame] = []
+        for area in AREAS:
+            m = wide_map.get(area) or {}
+            man_c, out_c = m.get("인력"), m.get("실적")
+            if not man_c and not out_c:
+                continue
+            piece = pd.DataFrame(
+                {
+                    "일자": work["_date"].values,
+                    "조": work["_team"].values,
+                    "캠퍼스": work["_campus"].values,
+                    "주야": work["_shift"].values,
+                    "영역": area,
+                    "인력": _to_number(work[man_c]).fillna(0).values if man_c else 0.0,
+                    "실적": _to_number(work[out_c]).fillna(0).values if out_c else 0.0,
+                    "source": source,
+                }
+            )
+            piece = piece[(piece["인력"] != 0) | (piece["실적"] != 0)]
+            if not piece.empty:
+                parts.append(piece)
+        out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=empty_cols)
+
     if out.empty:
         return pd.DataFrame(columns=empty_cols)
     out["일자"] = pd.to_datetime(out["일자"], errors="coerce")
@@ -440,10 +453,8 @@ def normalize_records(
         out["캠퍼스"] = "(미지정)"
     if "주야" not in out.columns:
         out["주야"] = "(미지정)"
-    out["인당실적"] = out.apply(
-        lambda r: (r["실적"] / r["인력"]) if r["인력"] else None,
-        axis=1,
-    )
+    man = out["인력"].astype(float)
+    out["인당실적"] = (out["실적"].astype(float) / man).where(man > 0)
     return out
 
 
