@@ -1,6 +1,13 @@
 """캠퍼스 · 조별 실적 분석 (메인 화면)."""
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_APP_DIR = Path(__file__).resolve().parent
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -10,11 +17,15 @@ from app_common import (
     apply_basic_filters,
     load_records,
     render_data_sidebar,
+    render_single_slicer,
+    render_slicer,
     team_stack_order,
     timeseries_campus_team,
 )
 from auth import render_logout_controls
 from stats_engine import AREAS, SHIFTS, add_calendar_parts, summary_by
+
+_GRAIN_OPTS = ("일", "월", "분기", "년")
 
 
 def _grain_period_widgets(records: pd.DataFrame, grain: str) -> dict:
@@ -53,37 +64,62 @@ def _grain_period_widgets(records: pd.DataFrame, grain: str) -> dict:
             out["end"] = pd.Timestamp(rng[1])
             out["mode"] = "기간"
     elif grain == "월":
-        year = st.selectbox("년도", years, index=len(years) - 1, key="campus_rng_year_m")
-        out["year"] = int(year)
+        year_labels = [str(y) for y in years]
+        year_pick = render_single_slicer(
+            "년도",
+            year_labels,
+            key="campus_rng_year_m",
+            default=year_labels[-1] if year_labels else None,
+        )
+        year = int(year_pick) if year_pick else (years[-1] if years else None)
+        out["year"] = year
         out["mode"] = "년"
         months_avail = sorted(
             work.loc[work["년"] == year, "월"].dropna().unique().astype(int).tolist()
-        )
-        month_sel = st.multiselect(
+        ) if year is not None else list(range(1, 13))
+        if not months_avail:
+            months_avail = list(range(1, 13))
+        month_labels = [f"{m}월" for m in months_avail]
+        month_sel_labels = render_slicer(
             "월",
-            months_avail if months_avail else list(range(1, 13)),
-            default=months_avail if months_avail else list(range(1, 13)),
+            month_labels,
             key="campus_rng_months",
+            default_on=True,
         )
-        out["months"] = month_sel
+        out["months"] = [int(x.replace("월", "")) for x in month_sel_labels]
     elif grain == "분기":
-        year = st.selectbox("년도", years, index=len(years) - 1, key="campus_rng_year_q")
-        out["year"] = int(year)
+        year_labels = [str(y) for y in years]
+        year_pick = render_single_slicer(
+            "년도",
+            year_labels,
+            key="campus_rng_year_q",
+            default=year_labels[-1] if year_labels else None,
+        )
+        year = int(year_pick) if year_pick else (years[-1] if years else None)
+        out["year"] = year
         out["mode"] = "년"
         q_avail = sorted(
             work.loc[work["년"] == year, "분기"].dropna().unique().astype(int).tolist()
-        )
-        quarter_sel = st.multiselect(
+        ) if year is not None else [1, 2, 3, 4]
+        if not q_avail:
+            q_avail = [1, 2, 3, 4]
+        q_labels = [f"{q}분기" for q in q_avail]
+        q_sel_labels = render_slicer(
             "분기",
-            q_avail if q_avail else [1, 2, 3, 4],
-            default=q_avail if q_avail else [1, 2, 3, 4],
-            format_func=lambda q: f"{q}분기",
+            q_labels,
             key="campus_rng_quarters",
+            default_on=True,
         )
-        out["quarters"] = quarter_sel
+        out["quarters"] = [int(x.replace("분기", "")) for x in q_sel_labels]
     elif grain == "년":
-        year_sel = st.multiselect("년도", years, default=years, key="campus_rng_years")
-        out["years"] = year_sel
+        year_labels = [str(y) for y in years]
+        year_sel_labels = render_slicer(
+            "년도",
+            year_labels,
+            key="campus_rng_years",
+            default_on=True,
+        )
+        out["years"] = [int(x) for x in year_sel_labels]
     return out
 
 
@@ -114,7 +150,12 @@ def render() -> None:
         render_logout_controls()
         st.divider()
         st.header("조회 조건")
-        grain = st.radio("시계열 단위", ("일", "월", "분기", "년"), index=0, key="campus_grain")
+        grain = render_single_slicer(
+            "시계열 단위",
+            list(_GRAIN_OPTS),
+            key="campus_grain",
+            default="일",
+        )
         if not records.empty:
             scope = _grain_period_widgets(records, grain)
             period_args = {
@@ -129,18 +170,23 @@ def render() -> None:
             month_filter = scope.get("months")
             quarter_filter = scope.get("quarters")
             year_filter = scope.get("years")
-        area_sel = st.multiselect(
-            "영역 (기본=전체 합계)",
+        area_sel = render_slicer(
+            "영역",
             list(AREAS),
-            default=list(AREAS),
             key="campus_area",
+            default_on=True,
         )
         shift_sel: list[str] = []
         if not records.empty:
             shifts = sorted(records["주야"].dropna().unique().tolist())
             prefer_s = [s for s in SHIFTS if s in shifts]
             shift_opts = prefer_s + [s for s in shifts if s not in prefer_s]
-            shift_sel = st.multiselect("주/야 필터", shift_opts, default=shift_opts, key="campus_shift")
+            shift_sel = render_slicer(
+                "주/야",
+                shift_opts,
+                key="campus_shift",
+                default_on=True,
+            )
         else:
             st.caption("데이터 로드 후 기간·주/야 필터를 사용할 수 있습니다.")
 
@@ -148,6 +194,22 @@ def render() -> None:
 
     if records.empty:
         st.error("표준 데이터가 없습니다. 사이드바에서 양식을 받아 업로드하세요.")
+        st.stop()
+
+    if not area_sel:
+        st.warning("영역 필터에서 항목을 하나 이상 켜 주세요.")
+        st.stop()
+    if not shift_sel:
+        st.warning("주/야 필터에서 항목을 하나 이상 켜 주세요.")
+        st.stop()
+    if grain == "월" and not (month_filter or []):
+        st.warning("월 필터에서 항목을 하나 이상 켜 주세요.")
+        st.stop()
+    if grain == "분기" and not (quarter_filter or []):
+        st.warning("분기 필터에서 항목을 하나 이상 켜 주세요.")
+        st.stop()
+    if grain == "년" and not (year_filter or []):
+        st.warning("년도 필터에서 항목을 하나 이상 켜 주세요.")
         st.stop()
 
     with st.expander("로드 정보", expanded=False):
