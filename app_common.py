@@ -1,7 +1,12 @@
 """실적 분석 통계 — 페이지 공통 (경로·로드·데이터 사이드바)."""
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+_APP_DIR = Path(__file__).resolve().parent
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +23,6 @@ from stats_engine import (
     template_dataframe,
 )
 
-_APP_DIR = Path(__file__).resolve().parent
 _DATA_DIR = _APP_DIR / "data"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -121,10 +125,22 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
         accept_multiple_files=True,
         key=f"{key_prefix}uploader",
     )
-    if uploads:
+    # file_uploader는 파일이 남아 있으면 매 실행마다 True → rerun 루프 방지
+    upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
+    last_key = f"{key_prefix}last_upload_sig"
+    if uploads and upload_sig and upload_sig != st.session_state.get(last_key):
+        names: list[str] = []
         for up in uploads:
             save_upload(up)
+            names.append(up.name)
             st.success(f"저장: {up.name}")
+        st.session_state[last_key] = upload_sig
+        # 방금 올린 파일을 분석 대상에 포함
+        cur = list(st.session_state.get("selected_files") or [])
+        for n in names:
+            if n not in cur:
+                cur.append(n)
+        st.session_state.selected_files = cur
         st.cache_data.clear()
         st.rerun()
 
@@ -134,17 +150,23 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
         render_exit_ui(key_prefix=key_prefix)
         st.stop()
 
+    file_names = [p.name for p in files]
+    if "selected_files" not in st.session_state:
+        st.session_state.selected_files = file_names
+    # 사라진 파일 정리, 새 파일은 유지된 선택에 맞춤
+    st.session_state.selected_files = [n for n in st.session_state.selected_files if n in file_names]
+    if not st.session_state.selected_files:
+        st.session_state.selected_files = file_names
+
     selected = st.multiselect(
         "분석할 파일",
-        options=[p.name for p in files],
-        default=st.session_state.selected_files
-        if st.session_state.selected_files
-        else [p.name for p in files],
+        options=file_names,
+        default=st.session_state.selected_files,
         key=f"{key_prefix}file_select",
     )
+    # widget 값과 session 동기화 (불필요한 연속 rerun 방지)
     if selected != st.session_state.selected_files:
         st.session_state.selected_files = selected
-        st.rerun()
     if not selected:
         render_exit_ui(key_prefix=key_prefix)
         st.stop()
