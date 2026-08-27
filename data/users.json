@@ -1,3 +1,9 @@
 {
-  "users": {}
+  "users": {
+    "2120401": {
+      "password_hash": "pbkdf2_sha256$260000$aa04c5fe02e801b80a683e085b734db5$5c1cd31d9697a08a1e3c8c44ccaa02780874cdaec68e43e898a43ac3b8756102",
+      "display_name": "김영명",
+      "role": "admin"
+    }
+  }
 }
