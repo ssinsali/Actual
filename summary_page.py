@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from app_common import app_dir, render_exit_ui
+from app_common import app_dir, render_exit_ui, render_slicer
 from auth import render_logout_controls
 from stats_engine import (
     AREAS,
@@ -162,14 +162,29 @@ def render() -> None:
             campuses = sorted(records["캠퍼스"].dropna().unique().tolist())
             prefer = [c for c in CAMPUSES if c in campuses]
             campus_opts = prefer + [c for c in campuses if c not in prefer]
-            campus_sel = st.multiselect("캠퍼스", campus_opts, default=campus_opts, key="summary_campus")
+            campus_sel = render_slicer(
+                "캠퍼스",
+                campus_opts,
+                key="summary_campus",
+                default_on=True,
+            )
 
             shifts = sorted(records["주야"].dropna().unique().tolist())
             prefer_s = [s for s in SHIFTS if s in shifts]
             shift_opts = prefer_s + [s for s in shifts if s not in prefer_s]
-            shift_sel = st.multiselect("주/야", shift_opts, default=shift_opts, key="summary_shift")
+            shift_sel = render_slicer(
+                "주/야",
+                shift_opts,
+                key="summary_shift",
+                default_on=True,
+            )
 
-            area_sel = st.multiselect("영역", list(AREAS), default=list(AREAS), key="summary_area")
+            area_sel = render_slicer(
+                "영역",
+                list(AREAS),
+                key="summary_area",
+                default_on=True,
+            )
             pre_filtered = filter_period(
                 records,
                 mode=mode,
@@ -187,7 +202,12 @@ def render() -> None:
             if area_sel:
                 pre_filtered = pre_filtered[pre_filtered["영역"].isin(area_sel)]
             teams = sorted(pre_filtered["조"].dropna().unique().tolist()) if not pre_filtered.empty else []
-            team_sel = st.multiselect("조", teams, default=teams, key="summary_team")
+            team_sel = render_slicer(
+                "조",
+                teams,
+                key="summary_team",
+                default_on=True,
+            ) if teams else []
 
         st.divider()
         st.header("데이터")
