@@ -217,10 +217,19 @@ def render() -> None:
             accept_multiple_files=True,
             key="summary_upload",
         )
-        if uploads:
+        upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
+        if uploads and upload_sig and upload_sig != st.session_state.get("summary_last_upload_sig"):
+            names: list[str] = []
             for up in uploads:
                 _save_upload(up)
+                names.append(up.name)
                 st.success(f"저장: {up.name}")
+            st.session_state["summary_last_upload_sig"] = upload_sig
+            cur = list(st.session_state.get("selected_files") or [])
+            for n in names:
+                if n not in cur:
+                    cur.append(n)
+            st.session_state.selected_files = cur
             st.cache_data.clear()
             st.rerun()
 
@@ -230,15 +239,21 @@ def render() -> None:
             render_exit_ui(key_prefix="summary_")
             st.stop()
 
+        file_names = [p.name for p in files]
+        if "selected_files" not in st.session_state:
+            st.session_state.selected_files = file_names
+        st.session_state.selected_files = [n for n in st.session_state.selected_files if n in file_names]
+        if not st.session_state.selected_files:
+            st.session_state.selected_files = file_names
+
         selected = st.multiselect(
             "분석할 파일",
-            options=[p.name for p in files],
-            default=st.session_state.selected_files if st.session_state.selected_files else [p.name for p in files],
+            options=file_names,
+            default=st.session_state.selected_files,
             key="summary_file_select",
         )
         if selected != st.session_state.selected_files:
             st.session_state.selected_files = selected
-            st.rerun()
         if not selected:
             render_exit_ui(key_prefix="summary_")
             st.stop()
