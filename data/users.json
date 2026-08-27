@@ -19,6 +19,11 @@
       "password_hash": "pbkdf2_sha256$260000$62561d8616ed3eb6684f818294e20776$5d5364b428ec7d516fa9291fc5bd0d4e09333839581fb0c6f1d5d80a8c1426da",
       "display_name": "김주성",
       "role": "user"
+    },
+    "syun1004": {
+      "password_hash": "pbkdf2_sha256$260000$3fe32aaacaa0ffa27892f6ea1c50ec37$8fc9fc1891566949124cff94166b93880f6bbeb97fd8aec20ba09a03d0ba41dc",
+      "display_name": "경세현",
+      "role": "user"
     }
   }
 }
