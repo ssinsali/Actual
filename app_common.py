@@ -121,6 +121,23 @@ def default_files() -> list[Path]:
     return [p for p in files if not p.name.startswith("~$")]
 
 
+def newest_data_names() -> list[str]:
+    """수정 시각이 가장 늦은 실적 파일 하나."""
+    files = default_files()
+    if not files:
+        return []
+    newest = max(files, key=lambda p: (p.stat().st_mtime, p.name))
+    return [newest.name]
+
+
+def select_analysis_files(names: list[str]) -> None:
+    """분석 대상을 이 파일들로만 맞춘다."""
+    st.session_state.selected_files = list(names)
+    for key in list(st.session_state.keys()):
+        if "file_select" in str(key):
+            st.session_state.pop(key, None)
+
+
 _PROTECTED_DATA_NAMES = {"users.json", "README.txt"}
 
 
@@ -215,11 +232,11 @@ def ensure_dims(df: pd.DataFrame) -> pd.DataFrame:
 def load_records() -> tuple[pd.DataFrame, list[str], list[Path]]:
     files = default_files()
     if "selected_files" not in st.session_state:
-        st.session_state.selected_files = [p.name for p in files]
+        st.session_state.selected_files = newest_data_names()
     path_map = {p.name: p for p in files}
     chosen_names = [n for n in st.session_state.selected_files if n in path_map]
     if not chosen_names and files:
-        chosen_names = [p.name for p in files]
+        chosen_names = newest_data_names()
         st.session_state.selected_files = chosen_names
     chosen = [path_map[n] for n in chosen_names]
     mtimes = tuple((str(p), p.stat().st_mtime) for p in chosen) if chosen else tuple()
@@ -238,7 +255,7 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
     st.header("데이터")
     st.markdown(
         f"기본 폴더: `{_DATA_DIR}`  \n"
-        "표준 CSV 양식을 받거나, 엑셀/CSV를 업로드하세요."
+        "새로 올리면 **그 파일만** 분석합니다. 이전 파일은 목록에만 남습니다."
     )
     st.download_button(
         "기본 CSV 양식 다운로드 (예시 포함)",
@@ -278,12 +295,7 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
             names.append(up.name)
             st.success(f"저장: {up.name}")
         st.session_state[last_key] = upload_sig
-        # 방금 올린 파일을 분석 대상에 포함
-        cur = list(st.session_state.get("selected_files") or [])
-        for n in names:
-            if n not in cur:
-                cur.append(n)
-        st.session_state.selected_files = cur
+        select_analysis_files(names)
         st.cache_data.clear()
         st.rerun()
 
@@ -296,14 +308,13 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
 
     file_names = [p.name for p in files]
     if "selected_files" not in st.session_state:
-        st.session_state.selected_files = file_names
-    # 사라진 파일 정리, 새 파일은 유지된 선택에 맞춤
+        st.session_state.selected_files = newest_data_names()
     st.session_state.selected_files = [n for n in st.session_state.selected_files if n in file_names]
     if not st.session_state.selected_files:
-        st.session_state.selected_files = file_names
+        st.session_state.selected_files = newest_data_names() or file_names[:1]
 
     selected = st.multiselect(
-        "분석할 파일",
+        "분석할 파일 (기본: 마지막 업로드)",
         options=file_names,
         default=st.session_state.selected_files,
         key=f"{key_prefix}file_select",
