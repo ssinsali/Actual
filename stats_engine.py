@@ -741,7 +741,7 @@ def period_daily_average(
         return pd.DataFrame(columns=empty_cols)
 
     work = add_calendar_parts(df.dropna(subset=["일자"]).copy())
-    work["일자"] = _as_datetime(work["일자"]).dt.normalize()
+    work["일자"] = _normalize_dates(work["일자"])
     work = work.dropna(subset=["일자"])
     extras = [k for k in extras if k in work.columns]
     if period_col not in work.columns or work.empty:
@@ -775,3 +775,113 @@ def period_daily_average(
     g["_ord"] = g["영역"].map(lambda x: order.get(x, 99))
     g = g.sort_values([period_col, *extras, "_ord"]).drop(columns="_ord")
     return g.reset_index(drop=True)
+
+
+def _normalize_dates(series: pd.Series) -> pd.Series:
+    """일자에서 시분초를 제거. Series.dt 를 쓰지 않는다."""
+    out: list[pd.Timestamp] = []
+    for v in series.tolist():
+        try:
+            t = pd.NaT if v is None or v == "" else pd.Timestamp(v)
+            out.append(pd.NaT if pd.isna(t) else t.normalize())
+        except (ValueError, TypeError, OverflowError):
+            out.append(pd.NaT)
+    return pd.to_datetime(out, errors="coerce")
+
+
+def classify_mom(pct: float | None, hold_pct: float = 3.0) -> str:
+    """전월 대비 % → 상승/유지/하락."""
+    if pct is None or pd.isna(pct):
+        return "비교불가"
+    if abs(float(pct)) <= float(hold_pct):
+        return "유지"
+    return "상승" if float(pct) > 0 else "하락"
+
+
+def monthly_team_process_status(
+    df: pd.DataFrame,
+    *,
+    current_month: str | None = None,
+    hold_pct: float = 3.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None, str | None]:
+    """조×공정 월 일평균과, 기준 월 vs 직전 월 판정.
+
+    일평균_실적 = 그달 실적 합계 ÷ 작업일 수.
+    반환: (월별 시계열, 당월 대비표, 당월, 전월)
+    """
+    empty = pd.DataFrame()
+    series = period_daily_average(df, "년월", extra_keys=["조"])
+    if series.empty or "년월" not in series.columns:
+        return empty, empty, None, None
+
+    months = sorted(str(m) for m in series["년월"].dropna().unique().tolist())
+    if not months:
+        return empty, empty, None, None
+    if current_month not in months:
+        current_month = months[-1]
+    prev_candidates = [m for m in months if m < current_month]
+    prev_month = prev_candidates[-1] if prev_candidates else None
+
+    cur = series[series["년월"].astype(str) == current_month].copy()
+    cur = cur.rename(
+        columns={
+            "일평균_실적": "당월_일평균",
+            "작업일수": "당월_작업일수",
+            "인당실적": "당월_인당실적",
+        }
+    )
+    if prev_month is None:
+        cur["전월"] = None
+        cur["전월_일평균"] = None
+        cur["전월_작업일수"] = None
+        cur["차이"] = None
+        cur["전월대비%"] = None
+        cur["판정"] = "비교불가"
+        status = cur[
+            [
+                "조",
+                "영역",
+                "전월",
+                "년월",
+                "전월_일평균",
+                "당월_일평균",
+                "차이",
+                "전월대비%",
+                "판정",
+                "당월_작업일수",
+                "당월_인당실적",
+            ]
+        ].rename(columns={"년월": "당월", "영역": "공정"})
+        return series, status.reset_index(drop=True), current_month, None
+
+    prev = series[series["년월"].astype(str) == prev_month][
+        ["조", "영역", "일평균_실적", "작업일수"]
+    ].rename(columns={"일평균_실적": "전월_일평균", "작업일수": "전월_작업일수"})
+    status = cur.merge(prev, on=["조", "영역"], how="left")
+    status["전월"] = prev_month
+    status["차이"] = (status["당월_일평균"] - status["전월_일평균"]).round(1)
+    status["전월대비%"] = status.apply(
+        lambda r: round((float(r["당월_일평균"]) / float(r["전월_일평균"]) - 1) * 100, 1)
+        if pd.notna(r["전월_일평균"]) and r["전월_일평균"]
+        else None,
+        axis=1,
+    )
+    status["판정"] = status["전월대비%"].map(lambda p: classify_mom(p, hold_pct))
+    order = {a: i for i, a in enumerate(AREAS)}
+    status["_ord"] = status["영역"].map(lambda x: order.get(x, 99))
+    status = status.sort_values(["_ord", "조"]).drop(columns="_ord")
+    cols = [
+        "조",
+        "영역",
+        "전월",
+        "년월",
+        "전월_일평균",
+        "당월_일평균",
+        "차이",
+        "전월대비%",
+        "판정",
+        "당월_작업일수",
+        "당월_인당실적",
+    ]
+    status = status[cols].rename(columns={"년월": "당월", "영역": "공정"})
+    return series, status.reset_index(drop=True), current_month, prev_month
