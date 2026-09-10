@@ -173,14 +173,42 @@ def _team_avg_gap(status: pd.DataFrame, teams_all: list[str]) -> pd.DataFrame:
     return g.sort_values("_ord").drop(columns="_ord").reset_index(drop=True)
 
 
-def _bar(df: pd.DataFrame, x: str, y: str, *, color: str | None, title: str, x_sort, color_sort=None) -> None:
+def _status_base_view(status: pd.DataFrame, cur_m: str | None) -> pd.DataFrame:
+    """기준월 막대용. 내부 전월/당월 컬럼을 화면 이름으로 좁힌다."""
+    return pd.DataFrame(
+        {
+            "조": status["조"],
+            "공정": status["공정"],
+            "기준월": cur_m,
+            "일평균": status["당월_일평균"],
+            "작업일수": status["당월_작업일수"],
+            "인당실적": status["당월_인당실적"],
+        }
+    )
+
+
+def _bar(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    *,
+    color: str | None,
+    title: str,
+    x_sort,
+    color_sort=None,
+    tooltip=None,
+    y_title: str | None = None,
+) -> None:
     if df.empty or y not in df.columns:
         st.caption("표시할 데이터가 없습니다.")
         return
+    tips = tooltip
+    if tips is None:
+        tips = [c for c in (x, color, y) if c]
     enc = {
         "x": alt.X(f"{x}:N", title=x, sort=x_sort),
-        "y": alt.Y(f"{y}:Q", title=y),
-        "tooltip": list(df.columns),
+        "y": alt.Y(f"{y}:Q", title=y_title or y),
+        "tooltip": tips,
     }
     if color and color in df.columns:
         enc["color"] = alt.Color(
@@ -382,14 +410,18 @@ def render() -> None:
 
     st.subheader("조별 비교 (막대)")
     st.caption("기준월 일평균 실적. 같은 공정에서 조끼리, 같은 조에서 비교월·기준월을 비교합니다.")
+    base_view = _status_base_view(status, cur_m)
+    base_tip = ["조", "공정", "기준월", "일평균", "작업일수", "인당실적"]
     _bar(
-        status,
+        base_view,
         "공정",
-        "당월_일평균",
+        "일평균",
         color="조",
         title=f"기준월 {cur_m} · 공정별 조 비교 (일평균 실적)",
         x_sort=areas_all,
         color_sort=teams_all,
+        tooltip=base_tip,
+        y_title="일평균 실적",
     )
     cmp_label = f"비교월 {prev_m}" if prev_m else "비교월"
     cur_label = f"기준월 {cur_m}" if cur_m else "기준월"
@@ -424,13 +456,15 @@ def render() -> None:
         st.altair_chart(facet_chart, use_container_width=True)
 
     _bar(
-        status,
+        base_view,
         "조",
-        "당월_일평균",
+        "일평균",
         color="공정",
         title=f"기준월 {cur_m} · 조별 공정 비교 (일평균 실적)",
         x_sort=teams_all,
         color_sort=areas_all,
+        tooltip=base_tip,
+        y_title="일평균 실적",
     )
 
     st.subheader("조별 평균 차이")
