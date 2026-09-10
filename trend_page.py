@@ -193,81 +193,43 @@ def _team_mean_overlay(
     y: str,
     *,
     team_col: str = "조",
-    color: str | None = None,
     x_sort=None,
-    color_sort=None,
+    **_kwargs,
 ) -> alt.Chart | None:
-    """선택한 조들의 평균을 선·숫자로 겹친다."""
+    """선택한 조들의 평균을 가로 기준선·숫자로 겹친다."""
     if df.empty or team_col not in df.columns or y not in df.columns or x not in df.columns:
         return None
     n_teams = int(df[team_col].nunique())
     if n_teams < 2:
         return None
-    mean_title = f"{n_teams}개조 평균"
-    group_cols = [c for c in (x, color) if c and c != team_col and c in df.columns]
-    if not group_cols:
-        group_cols = [x]
-    means = df.groupby(group_cols, as_index=False)[y].mean()
-    means[y] = means[y].round(1)
-    means["평균라벨"] = means[y].map(lambda v: f"{float(v):.1f}")
-
-    if x != team_col:
-        line = (
-            alt.Chart(means)
-            .mark_line(point=True, color="#f7dc6f", strokeWidth=2)
-            .encode(
-                x=alt.X(f"{x}:N", sort=x_sort),
-                y=alt.Y(f"{y}:Q"),
-                tooltip=[x, alt.Tooltip(f"{y}:Q", title=mean_title)],
-            )
-        )
-        text = (
-            alt.Chart(means)
-            .mark_text(dy=-14, fontWeight="bold", color="#f7dc6f", fontSize=12)
-            .encode(
-                x=alt.X(f"{x}:N", sort=x_sort),
-                y=alt.Y(f"{y}:Q"),
-                text="평균라벨:N",
-            )
-        )
-        return line + text
-
-    teams = [t for t in (x_sort or []) if t in set(df[team_col].astype(str))]
-    if not teams:
-        teams = sorted(str(t) for t in df[team_col].dropna().unique().tolist())
-    rows: list[dict] = []
-    for _, r in means.iterrows():
-        for t in teams:
-            rec = {team_col: t, y: r[y], "평균라벨": r["평균라벨"], "_평균구분": mean_title}
-            if color and color in means.columns:
-                rec[color] = r[color]
-            rows.append(rec)
-    long = pd.DataFrame(rows)
-    if long.empty:
+    mean_val = round(float(pd.to_numeric(df[y], errors="coerce").mean()), 1)
+    if pd.isna(mean_val):
         return None
-    line_enc = {
-        "x": alt.X(f"{x}:N", sort=x_sort),
-        "y": alt.Y(f"{y}:Q"),
-        "tooltip": [c for c in (color, y) if c] + [alt.Tooltip("_평균구분:N", title="구분")],
-    }
-    if color and color in long.columns:
-        line_enc["color"] = alt.Color(
-            f"{color}:N",
-            sort=color_sort,
-            legend=None,
-            scale=alt.Scale(domain=color_sort) if color_sort else alt.Undefined,
+    mean_title = f"{n_teams}개조 평균"
+    label = f"{mean_val:.1f}"
+    mean_df = pd.DataFrame({y: [mean_val], "평균라벨": [label]})
+    rule = (
+        alt.Chart(mean_df)
+        .mark_rule(color="#f7dc6f", strokeWidth=2, strokeDash=[6, 4])
+        .encode(
+            y=alt.Y(f"{y}:Q"),
+            tooltip=[alt.Tooltip(f"{y}:Q", title=mean_title)],
         )
-    line = alt.Chart(long).mark_line(strokeDash=[6, 3], strokeWidth=2, point=True).encode(**line_enc)
-    last = long[long[team_col] == teams[-1]] if teams else long
-    text_enc = {
-        "x": alt.X(f"{x}:N", sort=x_sort),
-        "y": alt.Y(f"{y}:Q"),
-        "text": "평균라벨:N",
-    }
-    if color and color in last.columns:
-        text_enc["color"] = alt.Color(f"{color}:N", sort=color_sort, legend=None)
-    text = alt.Chart(last).mark_text(dx=10, align="left", fontWeight="bold", fontSize=11).encode(**text_enc)
-    return line + text
+    )
+    teams = [t for t in (x_sort or []) if t in set(df[x].astype(str))]
+    if not teams:
+        teams = [str(v) for v in df[x].dropna().unique().tolist()]
+    text_df = pd.DataFrame({x: [teams[-1]], y: [mean_val], "평균라벨": [label]})
+    text = (
+        alt.Chart(text_df)
+        .mark_text(dx=8, dy=-12, color="#f7dc6f", fontWeight="bold", fontSize=12)
+        .encode(
+            x=alt.X(f"{x}:N", sort=x_sort),
+            y=alt.Y(f"{y}:Q"),
+            text="평균라벨:N",
+        )
+    )
+    return rule + text
 
 
 def _bar(
@@ -282,6 +244,7 @@ def _bar(
     tooltip=None,
     y_title: str | None = None,
     team_mean: bool = False,
+    height: int = 320,
 ) -> None:
     if df.empty or y not in df.columns:
         st.caption("표시할 데이터가 없습니다.")
@@ -301,23 +264,16 @@ def _bar(
             sort=color_sort,
             scale=alt.Scale(domain=color_sort) if color_sort else alt.Undefined,
         )
-        enc["xOffset"] = alt.XOffset(f"{color}:N", sort=color_sort) if color_sort else f"{color}:N"
+        if color != x:
+            enc["xOffset"] = alt.XOffset(f"{color}:N", sort=color_sort) if color_sort else f"{color}:N"
     bars = alt.Chart(df).mark_bar().encode(**enc)
     overlay = (
-        _team_mean_overlay(
-            df,
-            x,
-            y,
-            team_col="조",
-            color=color,
-            x_sort=x_sort,
-            color_sort=color_sort,
-        )
+        _team_mean_overlay(df, x, y, team_col="조", x_sort=x_sort)
         if team_mean
         else None
     )
     chart = alt.layer(bars, overlay).resolve_scale(color="independent") if overlay is not None else bars
-    chart = chart.properties(height=360, title=title)
+    chart = chart.properties(height=height, title=title)
     st.altair_chart(chart, use_container_width=True)
 
 
@@ -510,22 +466,32 @@ def render() -> None:
     st.subheader("조별 비교 (막대)")
     st.caption(
         "기준월 일평균 실적. 같은 공정에서 조끼리, 같은 조에서 비교월·기준월을 비교합니다. "
-        "공정별 조 비교의 노란 선·숫자는 조회에서 켠 조들의 평균입니다."
+        "공정별 조 비교는 공정마다 나누고, 노란 가로선·숫자는 그 공정에서 켠 조들의 평균입니다."
     )
     base_view = _status_base_view(status, cur_m)
     base_tip = ["조", "공정", "기준월", "일평균", "작업일수", "인당실적"]
-    _bar(
-        base_view,
-        "공정",
-        "일평균",
-        color="조",
-        title=f"기준월 {cur_m} · 공정별 조 비교 (일평균 실적)",
-        x_sort=areas_all,
-        color_sort=teams_all,
-        tooltip=base_tip,
-        y_title="일평균 실적",
-        team_mean=True,
-    )
+    st.markdown(f"##### 기준월 {cur_m} · 공정별 조 비교 (일평균 실적)")
+    if not areas_all:
+        st.caption("표시할 공정이 없습니다.")
+    else:
+        for i in range(0, len(areas_all), 2):
+            cols = st.columns(2)
+            for j, area in enumerate(areas_all[i : i + 2]):
+                with cols[j]:
+                    sub = base_view[base_view["공정"] == area]
+                    _bar(
+                        sub,
+                        "조",
+                        "일평균",
+                        color="조",
+                        title=str(area),
+                        x_sort=teams_all,
+                        color_sort=teams_all,
+                        tooltip=base_tip,
+                        y_title="일평균 실적",
+                        team_mean=True,
+                        height=300,
+                    )
     cmp_label = f"비교월 {prev_m}" if prev_m else "비교월"
     cur_label = f"기준월 {cur_m}" if cur_m else "기준월"
     cmp_rows = []
