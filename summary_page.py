@@ -8,10 +8,12 @@ import streamlit as st
 
 from app_common import (
     app_dir,
+    newest_data_names,
     render_data_reset_ui,
     render_exit_ui,
     render_process_daily_avg,
     render_slicer,
+    select_analysis_files,
 )
 from auth import render_logout_controls
 from stats_engine import (
@@ -106,12 +108,12 @@ def render() -> None:
 
     files = _default_files()
     if "selected_files" not in st.session_state:
-        st.session_state.selected_files = [p.name for p in files]
+        st.session_state.selected_files = newest_data_names()
 
     path_map = {p.name: p for p in files}
     chosen_names = [n for n in st.session_state.selected_files if n in path_map]
     if not chosen_names and files:
-        chosen_names = [p.name for p in files]
+        chosen_names = newest_data_names()
         st.session_state.selected_files = chosen_names
     chosen = [path_map[n] for n in chosen_names]
     mtimes = tuple((str(p), p.stat().st_mtime) for p in chosen) if chosen else tuple()
@@ -217,7 +219,7 @@ def render() -> None:
 
         st.divider()
         st.header("데이터")
-        st.markdown(f"기본 폴더: `{_DATA_DIR}`")
+        st.markdown(f"기본 폴더: `{_DATA_DIR}`  \n새로 올리면 **그 파일만** 분석합니다.")
         st.download_button(
             "기본 CSV 양식 다운로드",
             data=template_csv_bytes(),
@@ -251,11 +253,7 @@ def render() -> None:
                 names.append(up.name)
                 st.success(f"저장: {up.name}")
             st.session_state["summary_last_upload_sig"] = upload_sig
-            cur = list(st.session_state.get("selected_files") or [])
-            for n in names:
-                if n not in cur:
-                    cur.append(n)
-            st.session_state.selected_files = cur
+            select_analysis_files(names)
             st.cache_data.clear()
             st.rerun()
 
@@ -268,13 +266,13 @@ def render() -> None:
 
         file_names = [p.name for p in files]
         if "selected_files" not in st.session_state:
-            st.session_state.selected_files = file_names
+            st.session_state.selected_files = newest_data_names()
         st.session_state.selected_files = [n for n in st.session_state.selected_files if n in file_names]
         if not st.session_state.selected_files:
-            st.session_state.selected_files = file_names
+            st.session_state.selected_files = newest_data_names() or file_names[:1]
 
         selected = st.multiselect(
-            "분석할 파일",
+            "분석할 파일 (기본: 마지막 업로드)",
             options=file_names,
             default=st.session_state.selected_files,
             key="summary_file_select",
