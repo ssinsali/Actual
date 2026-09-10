@@ -141,6 +141,84 @@ def _status_color(val: str) -> str:
     return colors.get(str(val), "")
 
 
+def _team_avg_gap(status: pd.DataFrame, teams_all: list[str]) -> pd.DataFrame:
+    """조별 공정 일평균의 산술평균과, 전월·전체 조 평균 대비 차이."""
+    if status.empty:
+        return pd.DataFrame()
+    g = status.groupby("조", as_index=False).agg(
+        전월_일평균=("전월_일평균", "mean"),
+        당월_일평균=("당월_일평균", "mean"),
+        공정수=("공정", "nunique"),
+    )
+    g["전월_일평균"] = g["전월_일평균"].round(1)
+    g["당월_일평균"] = g["당월_일평균"].round(1)
+    g["전월대비_차이"] = (g["당월_일평균"] - g["전월_일평균"]).round(1)
+    g["전월대비%"] = g.apply(
+        lambda r: round((float(r["당월_일평균"]) / float(r["전월_일평균"]) - 1) * 100, 1)
+        if pd.notna(r["전월_일평균"]) and r["전월_일평균"]
+        else None,
+        axis=1,
+    )
+    overall = g["당월_일평균"].mean()
+    g["조평균대비_차이"] = (g["당월_일평균"] - overall).round(1)
+    g["조평균대비%"] = g.apply(
+        lambda r: round((float(r["당월_일평균"]) / float(overall) - 1) * 100, 1)
+        if overall
+        else None,
+        axis=1,
+    )
+    g["_ord"] = g["조"].map(lambda x: teams_all.index(x) if x in teams_all else 99)
+    return g.sort_values("_ord").drop(columns="_ord").reset_index(drop=True)
+
+
+def _bar(df: pd.DataFrame, x: str, y: str, *, color: str | None, title: str, x_sort, color_sort=None) -> None:
+    if df.empty or y not in df.columns:
+        st.caption("표시할 데이터가 없습니다.")
+        return
+    enc = {
+        "x": alt.X(f"{x}:N", title=x, sort=x_sort),
+        "y": alt.Y(f"{y}:Q", title=y),
+        "tooltip": list(df.columns),
+    }
+    if color and color in df.columns:
+        enc["color"] = alt.Color(
+            f"{color}:N",
+            title=color,
+            sort=color_sort,
+            scale=alt.Scale(domain=color_sort) if color_sort else alt.Undefined,
+        )
+        enc["xOffset"] = alt.XOffset(f"{color}:N", sort=color_sort) if color_sort else f"{color}:N"
+    chart = alt.Chart(df).mark_bar().encode(**enc).properties(height=320, title=title)
+    st.altair_chart(chart, use_container_width=True)
+
+
+def _signed_bar(df: pd.DataFrame, x: str, y: str, *, title: str, x_sort) -> None:
+    if df.empty or y not in df.columns:
+        st.caption("표시할 데이터가 없습니다.")
+        return
+    work = df.dropna(subset=[y]).copy()
+    if work.empty:
+        st.caption("표시할 데이터가 없습니다.")
+        return
+    work["_양수"] = work[y].fillna(0) >= 0
+    chart = (
+        alt.Chart(work)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{x}:N", title=x, sort=x_sort),
+            y=alt.Y(f"{y}:Q", title=y),
+            color=alt.Color(
+                "_양수:N",
+                scale=alt.Scale(domain=[True, False], range=["#7dcea0", "#f1948a"]),
+                legend=None,
+            ),
+            tooltip=[c for c in work.columns if not str(c).startswith("_")],
+        )
+        .properties(height=300, title=title)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 def render() -> None:
     st.title("월평균 추이")
     st.caption(
@@ -271,47 +349,108 @@ def render() -> None:
 
     teams_all = team_stack_order(sorted(status["조"].dropna().unique().tolist()))
     areas_all = [a for a in AREAS if a in set(status["공정"].tolist())]
+    team_gap = _team_avg_gap(status, teams_all)
 
-    st.subheader("조 × 공정 — 당월 일평균")
-    st.caption("숫자는 당월 일평균 실적. 화살표는 전월 대비입니다.")
-    for area in areas_all:
-        st.markdown(f"##### {area}")
-        sub = status[status["공정"] == area]
-        cols = st.columns(max(len(teams_all), 1))
-        for col, team in zip(cols, teams_all):
-            row = sub[sub["조"] == team]
-            with col:
-                if row.empty:
-                    st.caption(f"{team} 없음")
-                    continue
-                r = row.iloc[0]
-                pct = r["전월대비%"]
-                judge = str(r["판정"])
-                if pd.notna(pct):
-                    delta = f"{float(pct):+.1f}% · {judge}"
-                else:
-                    delta = judge
-                delta_color = "off" if judge in ("유지", "비교불가") else "normal"
-                st.metric(
-                    str(team),
-                    f"{float(r['당월_일평균']):,.1f}" if pd.notna(r["당월_일평균"]) else "-",
-                    delta=delta,
-                    delta_color=delta_color,
-                )
+    st.subheader("조별 비교 (막대)")
+    st.caption("당월 일평균 실적. 같은 공정에서 조끼리, 같은 조에서 전월·당월을 비교합니다.")
+    _bar(
+        status,
+        "공정",
+        "당월_일평균",
+        color="조",
+        title=f"{cur_m} · 공정별 조 비교 (일평균 실적)",
+        x_sort=areas_all,
+        color_sort=teams_all,
+    )
+    cmp_rows = []
+    for _, r in status.iterrows():
+        if pd.notna(r.get("전월_일평균")):
+            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": "전월", "일평균": r["전월_일평균"]})
+        if pd.notna(r.get("당월_일평균")):
+            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": "당월", "일평균": r["당월_일평균"]})
+    cmp_df = pd.DataFrame(cmp_rows)
+    if not cmp_df.empty:
+        st.markdown("##### 공정별 · 전월 vs 당월")
+        facet_chart = (
+            alt.Chart(cmp_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("조:N", title="조", sort=teams_all),
+                y=alt.Y("일평균:Q", title="일평균 실적"),
+                color=alt.Color("구분:N", title="구분", sort=["전월", "당월"], scale=alt.Scale(domain=["전월", "당월"])),
+                xOffset=alt.XOffset("구분:N", sort=["전월", "당월"]),
+                tooltip=["조", "공정", "구분", "일평균"],
+            )
+            .properties(height=200)
+            .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
+        )
+        st.altair_chart(facet_chart, use_container_width=True)
 
-    st.subheader("판정표")
-    show = status.copy()
-    try:
-        styled = show.style.map(_status_color, subset=["판정"])
-        st.dataframe(styled, use_container_width=True)
-    except Exception:
-        st.dataframe(show, use_container_width=True)
+    _bar(
+        status,
+        "조",
+        "당월_일평균",
+        color="공정",
+        title=f"{cur_m} · 조별 공정 비교 (일평균 실적)",
+        x_sort=teams_all,
+        color_sort=areas_all,
+    )
 
-    piv = status.pivot_table(index="조", columns="공정", values="판정", aggfunc="first")
-    piv = piv.reindex(index=[t for t in teams_all if t in piv.index])
-    piv = piv.reindex(columns=areas_all)
-    st.markdown("##### 한눈에 보기 (행: 조, 열: 공정)")
-    st.dataframe(piv, use_container_width=True)
+    st.subheader("조별 평균 차이")
+    st.caption(
+        "조별 평균 = 그 조의 공정 일평균을 산술평균. "
+        "전월대비 차이 = 당월 조평균 − 전월 조평균. "
+        "조평균대비 차이 = 당월 조평균 − 전체 조 평균(양수면 전체보다 높음)."
+    )
+    if team_gap.empty:
+        st.caption("조별 평균을 계산할 데이터가 없습니다.")
+    else:
+        st.dataframe(team_gap, use_container_width=True)
+        g1, g2 = st.columns(2)
+        with g1:
+            _signed_bar(
+                team_gap,
+                "조",
+                "전월대비_차이",
+                title="조별 전월 대비 평균 차이 (당월 − 전월)",
+                x_sort=teams_all,
+            )
+        with g2:
+            _signed_bar(
+                team_gap,
+                "조",
+                "조평균대비_차이",
+                title="조별 전체평균 대비 차이 (당월 − 전체 조 평균)",
+                x_sort=teams_all,
+            )
+        team_long = []
+        for _, r in team_gap.iterrows():
+            if pd.notna(r.get("전월_일평균")):
+                team_long.append({"조": r["조"], "구분": "전월", "조평균": r["전월_일평균"]})
+            if pd.notna(r.get("당월_일평균")):
+                team_long.append({"조": r["조"], "구분": "당월", "조평균": r["당월_일평균"]})
+        _bar(
+            pd.DataFrame(team_long),
+            "조",
+            "조평균",
+            color="구분",
+            title="조별 평균 — 전월 vs 당월",
+            x_sort=teams_all,
+            color_sort=["전월", "당월"],
+        )
+
+    with st.expander("판정표 · 상세 숫자", expanded=False):
+        show = status.copy()
+        try:
+            styled = show.style.map(_status_color, subset=["판정"])
+            st.dataframe(styled, use_container_width=True)
+        except Exception:
+            st.dataframe(show, use_container_width=True)
+        piv = status.pivot_table(index="조", columns="공정", values="판정", aggfunc="first")
+        piv = piv.reindex(index=[t for t in teams_all if t in piv.index])
+        piv = piv.reindex(columns=areas_all)
+        st.markdown("##### 한눈에 보기 (행: 조, 열: 공정)")
+        st.dataframe(piv, use_container_width=True)
 
     st.subheader("월별 일평균 추이")
     if series.empty:
