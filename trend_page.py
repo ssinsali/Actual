@@ -30,9 +30,10 @@ def _monthly_team_process_status(
     df: pd.DataFrame,
     *,
     current_month: str | None = None,
+    compare_month: str | None = None,
     hold_pct: float = 3.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str | None, str | None]:
-    """조×공정 월 일평균과 기준 월 vs 직전 월 판정."""
+    """조×공정 월 일평균과 기준 월 vs 비교 월 판정."""
     empty = pd.DataFrame()
     if df.empty or "일자" not in df.columns or "영역" not in df.columns or "조" not in df.columns:
         return empty, empty, None, None
@@ -78,8 +79,9 @@ def _monthly_team_process_status(
         return empty, empty, None, None
     if current_month not in months:
         current_month = months[-1]
-    prev_candidates = [m for m in months if m < current_month]
-    prev_month = prev_candidates[-1] if prev_candidates else None
+    if compare_month not in months or compare_month == current_month:
+        prev_candidates = [m for m in months if m < current_month]
+        compare_month = prev_candidates[-1] if prev_candidates else None
 
     cur = series[series["년월"] == current_month].copy()
     cur = cur.rename(
@@ -102,7 +104,7 @@ def _monthly_team_process_status(
         "당월_작업일수",
         "당월_인당실적",
     ]
-    if prev_month is None:
+    if compare_month is None:
         cur["전월"] = None
         cur["전월_일평균"] = None
         cur["전월_작업일수"] = None
@@ -112,11 +114,11 @@ def _monthly_team_process_status(
         status = cur[status_cols].rename(columns={"년월": "당월", "영역": "공정"})
         return series, status.reset_index(drop=True), current_month, None
 
-    prev = series[series["년월"] == prev_month][["조", "영역", "일평균_실적", "작업일수"]].rename(
+    prev = series[series["년월"] == compare_month][["조", "영역", "일평균_실적", "작업일수"]].rename(
         columns={"일평균_실적": "전월_일평균", "작업일수": "전월_작업일수"}
     )
     status = cur.merge(prev, on=["조", "영역"], how="left")
-    status["전월"] = prev_month
+    status["전월"] = compare_month
     status["차이"] = (status["당월_일평균"] - status["전월_일평균"]).round(1)
     status["전월대비%"] = status.apply(
         lambda r: round((float(r["당월_일평균"]) / float(r["전월_일평균"]) - 1) * 100, 1)
@@ -128,7 +130,7 @@ def _monthly_team_process_status(
     status["_ord"] = status["영역"].map(lambda x: order.get(x, 99))
     status = status.sort_values(["_ord", "조"]).drop(columns="_ord")
     status = status[status_cols].rename(columns={"년월": "당월", "영역": "공정"})
-    return series, status.reset_index(drop=True), current_month, prev_month
+    return series, status.reset_index(drop=True), current_month, compare_month
 
 
 def _status_color(val: str) -> str:
@@ -223,7 +225,7 @@ def render() -> None:
     st.title("월평균 추이")
     st.caption(
         "월평균(일평균 실적) = 그달 실적 합계 ÷ 작업일 수. "
-        "기준 월을 직전 월과 비교해 조·공정별로 상승 / 유지 / 하락을 봅니다."
+        "기준 월과 비교 월을 골라 조·공정별로 상승 / 유지 / 하락을 봅니다."
     )
 
     records, notes, _chosen = load_records()
@@ -234,6 +236,7 @@ def render() -> None:
     team_sel: list[str] = []
     hold_pct = 3.0
     current_month = ""
+    compare_month = ""
 
     with st.sidebar:
         st.header("계정")
@@ -273,12 +276,27 @@ def render() -> None:
                 key="trend_month",
                 default=months[-1] if months else None,
             )
+            compare_opts = [m for m in months if m != current_month]
+            if not compare_opts:
+                compare_opts = list(months)
+            default_cmp = None
+            earlier = [m for m in months if m < current_month]
+            if earlier:
+                default_cmp = earlier[-1]
+            elif compare_opts:
+                default_cmp = compare_opts[0]
+            compare_month = render_single_slicer(
+                "비교 월",
+                compare_opts,
+                key="trend_compare_month",
+                default=default_cmp,
+            )
             hold_pct = st.slider(
                 "유지 범위 (±%)",
                 min_value=1,
                 max_value=10,
                 value=3,
-                help="전월 대비 이 범위 안이면 유지로 봅니다.",
+                help="기준 월이 비교 월 대비 이 범위 안이면 유지로 봅니다.",
             )
 
         render_data_sidebar(key_prefix="trend_")
@@ -299,7 +317,13 @@ def render() -> None:
         st.warning("조 필터에서 항목을 하나 이상 켜 주세요.")
         st.stop()
     if not current_month:
-        st.warning("비교할 월이 없습니다.")
+        st.warning("기준 월을 선택해 주세요.")
+        st.stop()
+    if not compare_month:
+        st.warning("비교 월을 선택해 주세요.")
+        st.stop()
+    if compare_month == current_month:
+        st.warning("기준 월과 비교 월을 서로 다르게 선택해 주세요.")
         st.stop()
 
     with st.expander("로드 정보", expanded=False):
@@ -321,6 +345,7 @@ def render() -> None:
     series, status, cur_m, prev_m = _monthly_team_process_status(
         filtered,
         current_month=current_month,
+        compare_month=compare_month,
         hold_pct=float(hold_pct),
     )
     if status.empty:
@@ -334,7 +359,7 @@ def render() -> None:
 
     st.markdown(
         f"**기준 월 {cur_m}**"
-        + (f"  vs  전월 **{prev_m}**" if prev_m else "  ·  비교할 전월이 없습니다.")
+        + (f"  vs  비교 월 **{prev_m}**" if prev_m else "  ·  비교 월이 없습니다.")
         + f"  ·  유지 범위 ±{hold_pct:g}%"
     )
     c1, c2, c3, c4 = st.columns(4)
@@ -352,7 +377,7 @@ def render() -> None:
     team_gap = _team_avg_gap(status, teams_all)
 
     st.subheader("조별 비교 (막대)")
-    st.caption("당월 일평균 실적. 같은 공정에서 조끼리, 같은 조에서 전월·당월을 비교합니다.")
+    st.caption("당월 일평균 실적. 같은 공정에서 조끼리, 같은 조에서 비교 월·기준 월을 비교합니다.")
     _bar(
         status,
         "공정",
@@ -362,27 +387,35 @@ def render() -> None:
         x_sort=areas_all,
         color_sort=teams_all,
     )
+    cmp_label = str(prev_m or "비교월")
+    cur_label = str(cur_m or "기준월")
     cmp_rows = []
     for _, r in status.iterrows():
         if pd.notna(r.get("전월_일평균")):
-            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": "전월", "일평균": r["전월_일평균"]})
+            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": cmp_label, "일평균": r["전월_일평균"]})
         if pd.notna(r.get("당월_일평균")):
-            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": "당월", "일평균": r["당월_일평균"]})
+            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": cur_label, "일평균": r["당월_일평균"]})
     cmp_df = pd.DataFrame(cmp_rows)
     if not cmp_df.empty:
-        st.markdown("##### 공정별 · 전월 vs 당월")
+        st.markdown("##### 공정별 · 비교 월 vs 기준 월")
         facet_chart = (
             alt.Chart(cmp_df)
             .mark_bar()
             .encode(
                 x=alt.X("조:N", title="조", sort=teams_all),
                 y=alt.Y("일평균:Q", title="일평균 실적"),
-                color=alt.Color("구분:N", title="구분", sort=["전월", "당월"], scale=alt.Scale(domain=["전월", "당월"])),
-                xOffset=alt.XOffset("구분:N", sort=["전월", "당월"]),
+                color=alt.Color(
+                    "구분:N",
+                    title="월",
+                    sort=[cmp_label, cur_label],
+                    scale=alt.Scale(domain=[cmp_label, cur_label]),
+                ),
+                xOffset=alt.XOffset("구분:N", sort=[cmp_label, cur_label]),
                 tooltip=["조", "공정", "구분", "일평균"],
             )
-            .properties(height=200)
+            .properties(height=380, width=520)
             .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
+            .resolve_scale(y="independent")
         )
         st.altair_chart(facet_chart, use_container_width=True)
 
@@ -399,8 +432,8 @@ def render() -> None:
     st.subheader("조별 평균 차이")
     st.caption(
         "조별 평균 = 그 조의 공정 일평균을 산술평균. "
-        "전월대비 차이 = 당월 조평균 − 전월 조평균. "
-        "조평균대비 차이 = 당월 조평균 − 전체 조 평균(양수면 전체보다 높음)."
+        "비교월대비 차이 = 기준 월 조평균 − 비교 월 조평균. "
+        "조평균대비 차이 = 기준 월 조평균 − 전체 조 평균(양수면 전체보다 높음)."
     )
     if team_gap.empty:
         st.caption("조별 평균을 계산할 데이터가 없습니다.")
@@ -412,7 +445,7 @@ def render() -> None:
                 team_gap,
                 "조",
                 "전월대비_차이",
-                title="조별 전월 대비 평균 차이 (당월 − 전월)",
+                title="조별 비교 월 대비 평균 차이 (기준 − 비교)",
                 x_sort=teams_all,
             )
         with g2:
@@ -426,17 +459,17 @@ def render() -> None:
         team_long = []
         for _, r in team_gap.iterrows():
             if pd.notna(r.get("전월_일평균")):
-                team_long.append({"조": r["조"], "구분": "전월", "조평균": r["전월_일평균"]})
+                team_long.append({"조": r["조"], "구분": cmp_label, "조평균": r["전월_일평균"]})
             if pd.notna(r.get("당월_일평균")):
-                team_long.append({"조": r["조"], "구분": "당월", "조평균": r["당월_일평균"]})
+                team_long.append({"조": r["조"], "구분": cur_label, "조평균": r["당월_일평균"]})
         _bar(
             pd.DataFrame(team_long),
             "조",
             "조평균",
             color="구분",
-            title="조별 평균 — 전월 vs 당월",
+            title="조별 평균 — 비교 월 vs 기준 월",
             x_sort=teams_all,
-            color_sort=["전월", "당월"],
+            color_sort=[cmp_label, cur_label],
         )
 
     with st.expander("판정표 · 상세 숫자", expanded=False):
@@ -469,8 +502,9 @@ def render() -> None:
             color=alt.Color("조:N", title="조", sort=teams_all),
             tooltip=["년월", "조", "공정", "일평균_실적", "작업일수", "인당실적"],
         )
-        .properties(height=180)
+        .properties(height=360, width=520)
         .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
+        .resolve_scale(y="independent")
     )
     st.altair_chart(chart, use_container_width=True)
 
