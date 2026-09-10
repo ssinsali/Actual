@@ -15,7 +15,120 @@ from app_common import (
     team_stack_order,
 )
 from auth import render_logout_controls
-from stats_engine import AREAS, SHIFTS, add_calendar_parts, monthly_team_process_status
+from stats_engine import AREAS, SHIFTS, add_calendar_parts
+
+
+def _classify_mom(pct, hold_pct: float = 3.0) -> str:
+    if pct is None or pd.isna(pct):
+        return "비교불가"
+    if abs(float(pct)) <= float(hold_pct):
+        return "유지"
+    return "상승" if float(pct) > 0 else "하락"
+
+
+def _monthly_team_process_status(
+    df: pd.DataFrame,
+    *,
+    current_month: str | None = None,
+    hold_pct: float = 3.0,
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None, str | None]:
+    """조×공정 월 일평균과 기준 월 vs 직전 월 판정."""
+    empty = pd.DataFrame()
+    if df.empty or "일자" not in df.columns or "영역" not in df.columns or "조" not in df.columns:
+        return empty, empty, None, None
+
+    work = add_calendar_parts(df.dropna(subset=["일자"]).copy())
+    if work.empty or "년월" not in work.columns:
+        return empty, empty, None, None
+
+    stamps: list[pd.Timestamp] = []
+    for v in work["일자"].tolist():
+        try:
+            t = pd.NaT if v is None or v == "" else pd.Timestamp(v)
+            stamps.append(pd.NaT if pd.isna(t) else t.normalize())
+        except (ValueError, TypeError, OverflowError):
+            stamps.append(pd.NaT)
+    work = work.copy()
+    work["일자"] = pd.to_datetime(stamps, errors="coerce")
+    work = work.dropna(subset=["일자"])
+    work["년월"] = work["년월"].astype(str)
+    if work.empty:
+        return empty, empty, None, None
+
+    daily = work.groupby(["일자", "년월", "조", "영역"], as_index=False).agg(
+        인력=("인력", "sum"),
+        실적=("실적", "sum"),
+    )
+    series = daily.groupby(["년월", "조", "영역"], as_index=False).agg(
+        작업일수=("일자", "nunique"),
+        합계_인력=("인력", "sum"),
+        합계_실적=("실적", "sum"),
+    )
+    series["일평균_실적"] = (series["합계_실적"] / series["작업일수"]).round(1)
+    series["인당실적"] = series.apply(
+        lambda r: round(float(r["합계_실적"]) / float(r["합계_인력"]), 2) if r["합계_인력"] else None,
+        axis=1,
+    )
+    order = {a: i for i, a in enumerate(AREAS)}
+    series["_ord"] = series["영역"].map(lambda x: order.get(x, 99))
+    series = series.sort_values(["년월", "조", "_ord"]).drop(columns="_ord").reset_index(drop=True)
+
+    months = sorted(str(m) for m in series["년월"].dropna().unique().tolist())
+    if not months:
+        return empty, empty, None, None
+    if current_month not in months:
+        current_month = months[-1]
+    prev_candidates = [m for m in months if m < current_month]
+    prev_month = prev_candidates[-1] if prev_candidates else None
+
+    cur = series[series["년월"] == current_month].copy()
+    cur = cur.rename(
+        columns={
+            "일평균_실적": "당월_일평균",
+            "작업일수": "당월_작업일수",
+            "인당실적": "당월_인당실적",
+        }
+    )
+    status_cols = [
+        "조",
+        "영역",
+        "전월",
+        "년월",
+        "전월_일평균",
+        "당월_일평균",
+        "차이",
+        "전월대비%",
+        "판정",
+        "당월_작업일수",
+        "당월_인당실적",
+    ]
+    if prev_month is None:
+        cur["전월"] = None
+        cur["전월_일평균"] = None
+        cur["전월_작업일수"] = None
+        cur["차이"] = None
+        cur["전월대비%"] = None
+        cur["판정"] = "비교불가"
+        status = cur[status_cols].rename(columns={"년월": "당월", "영역": "공정"})
+        return series, status.reset_index(drop=True), current_month, None
+
+    prev = series[series["년월"] == prev_month][["조", "영역", "일평균_실적", "작업일수"]].rename(
+        columns={"일평균_실적": "전월_일평균", "작업일수": "전월_작업일수"}
+    )
+    status = cur.merge(prev, on=["조", "영역"], how="left")
+    status["전월"] = prev_month
+    status["차이"] = (status["당월_일평균"] - status["전월_일평균"]).round(1)
+    status["전월대비%"] = status.apply(
+        lambda r: round((float(r["당월_일평균"]) / float(r["전월_일평균"]) - 1) * 100, 1)
+        if pd.notna(r["전월_일평균"]) and r["전월_일평균"]
+        else None,
+        axis=1,
+    )
+    status["판정"] = status["전월대비%"].map(lambda p: _classify_mom(p, hold_pct))
+    status["_ord"] = status["영역"].map(lambda x: order.get(x, 99))
+    status = status.sort_values(["_ord", "조"]).drop(columns="_ord")
+    status = status[status_cols].rename(columns={"년월": "당월", "영역": "공정"})
+    return series, status.reset_index(drop=True), current_month, prev_month
 
 
 def _status_color(val: str) -> str:
@@ -127,7 +240,7 @@ def render() -> None:
         st.warning("선택 조건에 해당하는 데이터가 없습니다.")
         st.stop()
 
-    series, status, cur_m, prev_m = monthly_team_process_status(
+    series, status, cur_m, prev_m = _monthly_team_process_status(
         filtered,
         current_month=current_month,
         hold_pct=float(hold_pct),
