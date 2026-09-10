@@ -26,6 +26,14 @@ def bar_chart(df: pd.DataFrame, x: str, y: str, color: str | None = None, title:
                 scale=alt.Scale(domain=list(SHIFTS)),
             )
             enc["xOffset"] = alt.XOffset(f"{color}:N", sort=list(SHIFTS))
+        elif color == "영역":
+            enc["color"] = alt.Color(
+                f"{color}:N",
+                title="공정",
+                sort=list(AREAS),
+                scale=alt.Scale(domain=list(AREAS)),
+            )
+            enc["xOffset"] = alt.XOffset(f"{color}:N", sort=list(AREAS))
         else:
             enc["color"] = alt.Color(f"{color}:N", title=color)
             enc["xOffset"] = f"{color}:N"
