@@ -19,6 +19,7 @@ from stats_engine import (
     empty_template_csv_bytes,
     filter_period,
     load_many,
+    period_daily_average,
     template_csv_bytes,
     template_dataframe,
 )
@@ -120,6 +121,74 @@ def default_files() -> list[Path]:
     return [p for p in files if not p.name.startswith("~$")]
 
 
+_PROTECTED_DATA_NAMES = {"users.json", "README.txt"}
+
+
+def _upload_nonce() -> int:
+    return int(st.session_state.get("upload_widget_nonce") or 0)
+
+
+def list_resettable_data_files() -> list[Path]:
+    """로그인·안내 파일을 제외한 실적 엑셀/CSV."""
+    return [p for p in default_files() if p.name not in _PROTECTED_DATA_NAMES]
+
+
+def clear_performance_data() -> list[str]:
+    """업로드된 실적 파일을 삭제한다. users.json 은 유지."""
+    deleted: list[str] = []
+    for path in list_resettable_data_files():
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except OSError:
+            continue
+    st.session_state.selected_files = []
+    st.session_state["upload_widget_nonce"] = _upload_nonce() + 1
+    for key in list(st.session_state.keys()):
+        name = str(key)
+        if name.endswith("last_upload_sig") or name.endswith("confirm_reset_data"):
+            st.session_state.pop(key, None)
+        elif "file_select" in name:
+            st.session_state.pop(key, None)
+    st.cache_data.clear()
+    return deleted
+
+
+def render_data_reset_ui(*, key_prefix: str = "") -> None:
+    """잘못 올린 실적 파일을 확인 후 삭제."""
+    files = list_resettable_data_files()
+    flag = f"{key_prefix}confirm_reset_data"
+    if flag not in st.session_state:
+        st.session_state[flag] = False
+
+    if not files:
+        st.caption("초기화할 실적 파일이 없습니다. 위에서 다시 업로드하세요.")
+        return
+
+    if not st.session_state[flag]:
+        if st.button(
+            "실적 데이터 초기화",
+            use_container_width=True,
+            key=f"{key_prefix}btn_reset_data",
+        ):
+            st.session_state[flag] = True
+            st.rerun()
+        return
+
+    st.warning("업로드한 엑셀/CSV를 모두 삭제합니다. 로그인 계정은 그대로입니다.")
+    st.caption("삭제: " + ", ".join(path.name for path in files))
+    yes, no = st.columns(2)
+    with yes:
+        if st.button("삭제", type="primary", use_container_width=True, key=f"{key_prefix}reset_yes"):
+            clear_performance_data()
+            st.session_state[flag] = False
+            st.rerun()
+    with no:
+        if st.button("취소", use_container_width=True, key=f"{key_prefix}reset_no"):
+            st.session_state[flag] = False
+            st.rerun()
+
+
 def save_upload(uploaded) -> Path:
     dest = _DATA_DIR / uploaded.name
     dest.write_bytes(uploaded.getvalue())
@@ -197,7 +266,7 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
         "엑셀/CSV 추가 업로드",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
-        key=f"{key_prefix}uploader",
+        key=f"{key_prefix}uploader_{_upload_nonce()}",
     )
     # file_uploader는 파일이 남아 있으면 매 실행마다 True → rerun 루프 방지
     upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
@@ -221,6 +290,7 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
     files = default_files()
     if not files:
         st.warning("data 폴더에 파일이 없습니다.")
+        render_data_reset_ui(key_prefix=key_prefix)
         render_exit_ui(key_prefix=key_prefix)
         st.stop()
 
@@ -242,6 +312,7 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
     if selected != st.session_state.selected_files:
         st.session_state.selected_files = selected
     if not selected:
+        render_data_reset_ui(key_prefix=key_prefix)
         render_exit_ui(key_prefix=key_prefix)
         st.stop()
 
@@ -249,6 +320,7 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
         st.cache_data.clear()
         st.rerun()
 
+    render_data_reset_ui(key_prefix=key_prefix)
     render_exit_ui(key_prefix=key_prefix)
 
 
@@ -359,3 +431,85 @@ def timeseries_campus_team(df: pd.DataFrame, grain: str) -> pd.DataFrame:
     g["인당실적"] = g.apply(lambda r: r["실적"] / r["인력"] if r["인력"] else None, axis=1)
     g = g.sort_values(["캠퍼스", "_sort", "조"]).drop(columns="_sort")
     return g.reset_index(drop=True)
+
+
+def render_process_daily_avg(
+    df: pd.DataFrame,
+    *,
+    period_col: str = "년월",
+    extra_keys: list[str] | None = None,
+    period_label: str = "월",
+    split_campus: bool = False,
+) -> pd.DataFrame:
+    """기간×단위공정 일평균 실적 비교표·차트."""
+    from ui_charts import bar_chart
+
+    st.subheader(f"{period_label}별 · 단위공정 일평균 실적")
+    st.caption(
+        "일평균 실적 = 해당 기간·공정의 실적 합계 ÷ 작업일 수. "
+        "월마다 근무일 수가 달라도 공정끼리, 월끼리 비교할 수 있습니다. "
+        "전기대비%는 같은 공정의 직전 기간 일평균 대비입니다."
+    )
+    keys = list(extra_keys or [])
+    if split_campus and "캠퍼스" not in keys:
+        keys = ["캠퍼스", *keys]
+    g = period_daily_average(df, period_col, extra_keys=keys or None)
+    if g.empty:
+        st.caption("표시할 데이터가 없습니다.")
+        return g
+
+    show_cols = [
+        c
+        for c in [
+            period_col,
+            *keys,
+            "영역",
+            "작업일수",
+            "합계_실적",
+            "일평균_실적",
+            "전기대비%",
+            "일평균_인력",
+            "인당실적",
+        ]
+        if c in g.columns
+    ]
+    st.dataframe(g[show_cols].rename(columns={"영역": "공정"}), use_container_width=True)
+
+    index_cols: list[str] = []
+    for c in [*keys, period_col]:
+        if c in g.columns and c not in index_cols:
+            index_cols.append(c)
+    piv = g.pivot_table(
+        index=index_cols,
+        columns="영역",
+        values="일평균_실적",
+        aggfunc="first",
+    )
+    piv = piv.reindex(columns=[a for a in AREAS if a in piv.columns])
+    st.markdown("##### 일평균 실적 비교표 (행: 기간, 열: 공정)")
+    st.dataframe(piv, use_container_width=True)
+
+    if split_campus and "캠퍼스" in g.columns:
+        campuses = [c for c in CAMPUSES if c in set(g["캠퍼스"])] + [
+            c for c in sorted(g["캠퍼스"].unique()) if c not in CAMPUSES
+        ]
+        cols = st.columns(max(len(campuses), 1))
+        for col, campus in zip(cols, campuses):
+            with col:
+                sub = g[g["캠퍼스"] == campus]
+                bar_chart(
+                    sub,
+                    period_col,
+                    "일평균_실적",
+                    color="영역",
+                    title=f"{campus} · {period_label}별 공정 일평균 실적",
+                )
+    else:
+        bar_chart(
+            g,
+            period_col,
+            "일평균_실적",
+            color="영역",
+            title=f"{period_label}별 · 공정 일평균 실적",
+        )
+    return g
