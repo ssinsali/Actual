@@ -328,21 +328,59 @@ def _map_area_label(value: Any) -> str | None:
     return None
 
 
-def _parse_dates(series: pd.Series) -> pd.Series:
-    """YYYY-MM-DD 및 M-D(연도 추정) 지원."""
-    s = series.copy()
-    parsed = pd.to_datetime(s, errors="coerce")
-    mask = parsed.isna() & s.notna()
-    if mask.any():
-        md = s[mask].astype(str).str.extract(r"^(\d{1,2})-(\d{1,2})$")
+def _as_datetime(series: pd.Series) -> pd.Series:
+    """일자 컬럼을 datetime64로. 문자열·캐시 복원·엑셀 일련번호·M-D를 허용."""
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    if series.empty:
+        return pd.to_datetime(series, errors="coerce")
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+
+    parsed = pd.to_datetime(series, errors="coerce")
+    try:
+        mixed = pd.to_datetime(series, errors="coerce", format="mixed")
+        better = mixed.notna() & parsed.isna()
+        if better.any():
+            parsed = parsed.mask(better, mixed)
+    except (TypeError, ValueError):
+        pass
+
+    still = parsed.isna() & series.notna()
+    if still.any():
+        nums = pd.to_numeric(series, errors="coerce")
+        excel_ok = still & nums.notna() & (nums >= 20000) & (nums <= 80000)
+        if excel_ok.any():
+            excel_dates = pd.to_datetime(
+                nums, unit="D", origin="1899-12-30", errors="coerce"
+            )
+            parsed = parsed.mask(excel_ok, excel_dates)
+
+    still = parsed.isna() & series.notna()
+    if still.any():
+        md = series[still].astype(str).str.extract(r"^(\d{1,2})-(\d{1,2})$")
         if not md.empty:
             year = pd.Timestamp.today().year
             trial = pd.to_datetime(
-                dict(year=year, month=pd.to_numeric(md[0], errors="coerce"), day=pd.to_numeric(md[1], errors="coerce")),
+                {
+                    "year": year,
+                    "month": pd.to_numeric(md[0], errors="coerce"),
+                    "day": pd.to_numeric(md[1], errors="coerce"),
+                },
                 errors="coerce",
             )
-            parsed.loc[mask] = trial.values
-    return parsed
+            trial.index = md.index
+            hit = trial.dropna()
+            if not hit.empty:
+                parsed.loc[hit.index] = hit
+
+    return pd.to_datetime(parsed, errors="coerce")
+
+
+def _parse_dates(series: pd.Series) -> pd.Series:
+    """YYYY-MM-DD 및 M-D(연도 추정) 지원."""
+    return _as_datetime(series)
 
 
 def normalize_records(
@@ -446,7 +484,7 @@ def normalize_records(
 
     if out.empty:
         return pd.DataFrame(columns=empty_cols)
-    out["일자"] = pd.to_datetime(out["일자"], errors="coerce")
+    out["일자"] = _as_datetime(out["일자"])
     out["인력"] = pd.to_numeric(out["인력"], errors="coerce").fillna(0)
     out["실적"] = pd.to_numeric(out["실적"], errors="coerce").fillna(0)
     if "캠퍼스" not in out.columns:
@@ -492,6 +530,8 @@ def load_many(paths: list[Path], sheet_by_file: dict[str, str] | None = None) ->
         all_df["캠퍼스"] = "(미지정)"
     if "주야" not in all_df.columns:
         all_df["주야"] = "(미지정)"
+    if "일자" in all_df.columns:
+        all_df["일자"] = _as_datetime(all_df["일자"])
     return all_df, notes
 
 
@@ -508,7 +548,9 @@ def filter_period(
 ) -> pd.DataFrame:
     if df.empty or "일자" not in df.columns:
         return df
-    work = df.dropna(subset=["일자"]).copy()
+    work = df.copy()
+    work["일자"] = _as_datetime(work["일자"])
+    work = work.dropna(subset=["일자"])
     if mode == "전체":
         return work
     if mode == "기간" and start is not None and end is not None:
@@ -530,7 +572,8 @@ def daily_team_area(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=cols)
     work = df.dropna(subset=["일자"]).copy()
-    work["일자"] = work["일자"].dt.normalize()
+    work["일자"] = _as_datetime(work["일자"]).dt.normalize()
+    work = work.dropna(subset=["일자"])
     if "캠퍼스" not in work.columns:
         work["캠퍼스"] = "(미지정)"
     if "주야" not in work.columns:
@@ -623,12 +666,81 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_calendar_parts(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
+    if df.empty or "일자" not in df.columns:
         return df
     out = df.copy()
-    out["년"] = out["일자"].dt.year
-    out["월"] = out["일자"].dt.month
-    out["분기"] = out["일자"].dt.quarter
-    out["년월"] = out["일자"].dt.strftime("%Y-%m")
-    out["년분기"] = out["년"].astype(str) + "Q" + out["분기"].astype(str)
+    idx = pd.DatetimeIndex(_as_datetime(out["일자"]))
+    out["일자"] = pd.Series(idx, index=out.index)
+    out["년"] = idx.year
+    out["월"] = idx.month
+    out["분기"] = idx.quarter
+    out["년월"] = idx.strftime("%Y-%m")
+    year_s = pd.Series(idx.year, index=out.index)
+    q_s = pd.Series(idx.quarter, index=out.index)
+    out["년분기"] = year_s.astype("Int64").astype(str) + "Q" + q_s.astype("Int64").astype(str)
+    out.loc[out["일자"].isna(), "년분기"] = pd.NA
     return out
+
+
+def period_daily_average(
+    df: pd.DataFrame,
+    period_col: str = "년월",
+    extra_keys: list[str] | None = None,
+) -> pd.DataFrame:
+    """기간×공정 일평균 실적.
+
+    같은 날의 조·주야·캠퍼스 행은 하루로 합친 뒤,
+    일평균_실적 = 기간 합계 실적 ÷ 작업일 수(일자 중복 제거).
+    월마다 근무일 수가 달라도 공정·월끼리 비교할 수 있습니다.
+    """
+    extras = list(extra_keys or [])
+    empty_cols = [
+        period_col,
+        *extras,
+        "영역",
+        "작업일수",
+        "합계_인력",
+        "합계_실적",
+        "일평균_인력",
+        "일평균_실적",
+        "인당실적",
+        "전기대비%",
+    ]
+    if df.empty or "일자" not in df.columns or "영역" not in df.columns:
+        return pd.DataFrame(columns=empty_cols)
+
+    work = add_calendar_parts(df.dropna(subset=["일자"]).copy())
+    work["일자"] = _as_datetime(work["일자"]).dt.normalize()
+    work = work.dropna(subset=["일자"])
+    extras = [k for k in extras if k in work.columns]
+    if period_col not in work.columns or work.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    work[period_col] = work[period_col].astype(str)
+    daily_keys = ["일자", period_col, *extras, "영역"]
+    daily = work.groupby(daily_keys, as_index=False).agg(
+        인력=("인력", "sum"),
+        실적=("실적", "sum"),
+    )
+    group_keys = [period_col, *extras, "영역"]
+    g = daily.groupby(group_keys, as_index=False).agg(
+        작업일수=("일자", "nunique"),
+        합계_인력=("인력", "sum"),
+        합계_실적=("실적", "sum"),
+    )
+    g["일평균_인력"] = (g["합계_인력"] / g["작업일수"]).round(2)
+    g["일평균_실적"] = (g["합계_실적"] / g["작업일수"]).round(1)
+    g["인당실적"] = g.apply(
+        lambda r: round(float(r["합계_실적"]) / float(r["합계_인력"]), 2)
+        if r["합계_인력"]
+        else None,
+        axis=1,
+    )
+    g = g.sort_values([*extras, "영역", period_col])
+    g["전기대비%"] = (
+        g.groupby([*extras, "영역"], dropna=False)["일평균_실적"].pct_change() * 100
+    ).round(1)
+    order = {a: i for i, a in enumerate(AREAS)}
+    g["_ord"] = g["영역"].map(lambda x: order.get(x, 99))
+    g = g.sort_values([period_col, *extras, "_ord"]).drop(columns="_ord")
+    return g.reset_index(drop=True)
