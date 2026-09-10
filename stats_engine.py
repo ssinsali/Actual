@@ -375,7 +375,16 @@ def _as_datetime(series: pd.Series) -> pd.Series:
             if not hit.empty:
                 parsed.loc[hit.index] = hit
 
-    return pd.to_datetime(parsed, errors="coerce")
+    result = pd.to_datetime(parsed, errors="coerce")
+    if pd.api.types.is_datetime64_any_dtype(result):
+        return result
+    converted: list[pd.Timestamp] = []
+    for v in series.tolist():
+        try:
+            converted.append(pd.NaT if v is None or v == "" else pd.Timestamp(v))
+        except (ValueError, TypeError, OverflowError):
+            converted.append(pd.NaT)
+    return pd.to_datetime(converted, errors="coerce")
 
 
 def _parse_dates(series: pd.Series) -> pd.Series:
@@ -666,19 +675,41 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_calendar_parts(df: pd.DataFrame) -> pd.DataFrame:
+    """일자에서 년·월·분기를 만든다. Series.dt 는 Cloud pandas에서 깨질 수 있어 쓰지 않는다."""
     if df.empty or "일자" not in df.columns:
         return df
     out = df.copy()
-    idx = pd.DatetimeIndex(_as_datetime(out["일자"]))
-    out["일자"] = pd.Series(idx, index=out.index)
-    out["년"] = idx.year
-    out["월"] = idx.month
-    out["분기"] = idx.quarter
-    out["년월"] = idx.strftime("%Y-%m")
-    year_s = pd.Series(idx.year, index=out.index)
-    q_s = pd.Series(idx.quarter, index=out.index)
-    out["년분기"] = year_s.astype("Int64").astype(str) + "Q" + q_s.astype("Int64").astype(str)
-    out.loc[out["일자"].isna(), "년분기"] = pd.NA
+    stamps: list[pd.Timestamp] = []
+    years: list[int | None] = []
+    months: list[int | None] = []
+    quarters: list[int | None] = []
+    yms: list[str | None] = []
+    yqs: list[str | None] = []
+    for v in out["일자"].tolist():
+        try:
+            t = pd.NaT if v is None or v == "" else pd.Timestamp(v)
+        except (ValueError, TypeError, OverflowError):
+            t = pd.NaT
+        if pd.isna(t):
+            stamps.append(pd.NaT)
+            years.append(None)
+            months.append(None)
+            quarters.append(None)
+            yms.append(None)
+            yqs.append(None)
+            continue
+        stamps.append(t)
+        years.append(int(t.year))
+        months.append(int(t.month))
+        quarters.append(int(t.quarter))
+        yms.append(f"{t.year:04d}-{t.month:02d}")
+        yqs.append(f"{t.year}Q{t.quarter}")
+    out["일자"] = pd.to_datetime(stamps, errors="coerce")
+    out["년"] = pd.array(years, dtype="Int64")
+    out["월"] = pd.array(months, dtype="Int64")
+    out["분기"] = pd.array(quarters, dtype="Int64")
+    out["년월"] = yms
+    out["년분기"] = yqs
     return out
 
 
