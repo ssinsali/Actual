@@ -309,7 +309,8 @@ def render() -> None:
     st.caption(
         "월평균(일평균 실적) = 그달 실적 합계 ÷ 작업일 수. "
         "비교 월을 기준 월 대비로 봐서 조·공정별로 상승 / 유지 / 하락을 봅니다. "
-        "비교월이 기준월보다 크면 +, 작으면 −."
+        "비교월이 기준월보다 작으면 −, 크면 +. "
+        "추이 월은 여러 달을 켜서 맨 아래 전체 흐름을 봅니다."
     )
 
     records, notes, _chosen = load_records()
@@ -321,6 +322,8 @@ def render() -> None:
     hold_pct = 3.0
     current_month = ""
     compare_month = ""
+    trend_months: list[str] = []
+    all_months: list[str] = []
 
     with st.sidebar:
         st.header("계정")
@@ -354,6 +357,7 @@ def render() -> None:
             months = sorted(
                 str(m) for m in work["년월"].dropna().unique().tolist() if str(m) not in ("None", "<NA>", "nan")
             )
+            all_months = list(months)
             current_month = render_single_slicer(
                 "기준 월",
                 months,
@@ -375,6 +379,10 @@ def render() -> None:
                 key="trend_compare_month",
                 default=default_cmp,
             )
+            trend_months = (
+                render_slicer("추이 월", months, key="trend_trend_months", default_on=True) if months else []
+            )
+            st.caption("추이 월은 맨 아래 월별 일평균 추이에만 적용됩니다. 여러 달을 켜 두세요.")
             hold_pct = st.slider(
                 "유지 범위 (±%)",
                 min_value=1,
@@ -602,6 +610,13 @@ def render() -> None:
         st.caption("표시할 시계열이 없습니다.")
         return
     chart_df = series.rename(columns={"영역": "공정"})
+    month_sort = [m for m in all_months if m in set(trend_months)] if trend_months else list(all_months)
+    if trend_months:
+        chart_df = chart_df[chart_df["년월"].astype(str).isin(trend_months)]
+    if chart_df.empty or not month_sort:
+        st.warning("추이 월을 하나 이상 켜 주세요.")
+        return
+    st.caption("선택한 추이 월: " + ", ".join(month_sort))
     if "조" in chart_df.columns:
         chart_df["_조순서"] = chart_df["조"].map(lambda x: teams_all.index(x) if x in teams_all else 99)
         chart_df = chart_df.sort_values(["공정", "_조순서", "년월"])
@@ -609,7 +624,7 @@ def render() -> None:
         alt.Chart(chart_df)
         .mark_line(point=True)
         .encode(
-            x=alt.X("년월:N", title="월", sort=None),
+            x=alt.X("년월:N", title="월", sort=month_sort),
             y=alt.Y("일평균_실적:Q", title="일평균 실적"),
             color=alt.Color("조:N", title="조", sort=teams_all),
             tooltip=["년월", "조", "공정", "일평균_실적", "작업일수", "인당실적"],
