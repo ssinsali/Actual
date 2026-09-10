@@ -510,7 +510,7 @@ def render() -> None:
     st.subheader("조별 비교 (막대)")
     st.caption(
         "기준월 일평균 실적. 같은 공정에서 조끼리, 같은 조에서 비교월·기준월을 비교합니다. "
-        "노란 선·숫자는 조회에서 켠 조들의 평균입니다."
+        "공정별 조 비교의 노란 선·숫자는 조회에서 켠 조들의 평균입니다."
     )
     base_view = _status_base_view(status, cur_m)
     base_tip = ["조", "공정", "기준월", "일평균", "작업일수", "인당실적"]
@@ -537,62 +537,23 @@ def render() -> None:
     cmp_df = pd.DataFrame(cmp_rows)
     if not cmp_df.empty:
         st.markdown("##### 공정별 · 기준월 vs 비교월")
-        n_teams = int(cmp_df["조"].nunique())
-        mean_title = f"{n_teams}개조 평균"
-        plot_df = cmp_df.copy()
-        if n_teams >= 2:
-            gmean = plot_df.groupby(["공정", "구분"], as_index=False)["일평균"].mean()
-            gmean["조평균"] = gmean["일평균"].round(1)
-            gmean["평균라벨"] = gmean["조평균"].map(lambda v: f"{float(v):.1f}")
-            plot_df = plot_df.merge(gmean[["공정", "구분", "조평균", "평균라벨"]], on=["공정", "구분"], how="left")
-            last_team = teams_all[-1] if teams_all else None
-            plot_df["_라벨"] = plot_df["조"].astype(str) == str(last_team)
-        base = alt.Chart()
-        bars = base.mark_bar().encode(
-            x=alt.X("조:N", title="조", sort=teams_all),
-            y=alt.Y("일평균:Q", title="일평균 실적"),
-            color=alt.Color(
-                "구분:N",
-                title="월",
-                sort=[cur_label, cmp_label],
-                scale=alt.Scale(domain=[cur_label, cmp_label]),
-            ),
-            xOffset=alt.XOffset("구분:N", sort=[cur_label, cmp_label]),
-            tooltip=["조", "공정", "구분", "일평균"],
-        )
-        if n_teams >= 2:
-            rules = base.mark_rule(strokeDash=[6, 4], strokeWidth=2).encode(
-                y=alt.Y("조평균:Q"),
+        facet_chart = (
+            alt.Chart(cmp_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("조:N", title="조", sort=teams_all),
+                y=alt.Y("일평균:Q", title="일평균 실적"),
                 color=alt.Color(
                     "구분:N",
                     title="월",
                     sort=[cur_label, cmp_label],
                     scale=alt.Scale(domain=[cur_label, cmp_label]),
-                    legend=None,
                 ),
-                tooltip=["공정", "구분", alt.Tooltip("조평균:Q", title=mean_title)],
+                xOffset=alt.XOffset("구분:N", sort=[cur_label, cmp_label]),
+                tooltip=["조", "공정", "구분", "일평균"],
             )
-            texts = (
-                base.mark_text(dx=14, dy=-8, fontWeight="bold", fontSize=11)
-                .encode(
-                    x=alt.X("조:N", sort=teams_all),
-                    y=alt.Y("조평균:Q"),
-                    text="평균라벨:N",
-                    color=alt.Color(
-                        "구분:N",
-                        sort=[cur_label, cmp_label],
-                        scale=alt.Scale(domain=[cur_label, cmp_label]),
-                        legend=None,
-                    ),
-                )
-                .transform_filter(alt.FieldEqualPredicate(field="_라벨", equal=True))
-            )
-            layered = alt.layer(bars, rules, texts, data=plot_df)
-        else:
-            layered = alt.layer(bars, data=plot_df)
-        facet_chart = (
-            layered.properties(height=380, width=520)
-            .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2, data=plot_df)
+            .properties(height=380, width=520)
+            .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
             .resolve_scale(y="independent")
         )
         st.altair_chart(facet_chart, use_container_width=True)
@@ -607,7 +568,6 @@ def render() -> None:
         color_sort=areas_all,
         tooltip=base_tip,
         y_title="일평균 실적",
-        team_mean=True,
     )
 
     st.subheader("조별 평균 차이")
