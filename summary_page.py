@@ -6,7 +6,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from app_common import app_dir, render_exit_ui, render_slicer
+from app_common import (
+    app_dir,
+    render_data_reset_ui,
+    render_exit_ui,
+    render_process_daily_avg,
+    render_slicer,
+)
 from auth import render_logout_controls
 from stats_engine import (
     AREAS,
@@ -235,7 +241,7 @@ def render() -> None:
             "엑셀/CSV 업로드",
             type=["xlsx", "xls", "csv"],
             accept_multiple_files=True,
-            key="summary_upload",
+            key=f"summary_upload_{int(st.session_state.get('upload_widget_nonce') or 0)}",
         )
         upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
         if uploads and upload_sig and upload_sig != st.session_state.get("summary_last_upload_sig"):
@@ -256,6 +262,7 @@ def render() -> None:
         files = _default_files()
         if not files:
             st.warning("data 폴더에 파일이 없습니다.")
+            render_data_reset_ui(key_prefix="summary_")
             render_exit_ui(key_prefix="summary_")
             st.stop()
 
@@ -275,6 +282,7 @@ def render() -> None:
         if selected != st.session_state.selected_files:
             st.session_state.selected_files = selected
         if not selected:
+            render_data_reset_ui(key_prefix="summary_")
             render_exit_ui(key_prefix="summary_")
             st.stop()
 
@@ -282,6 +290,7 @@ def render() -> None:
             st.cache_data.clear()
             st.rerun()
 
+        render_data_reset_ui(key_prefix="summary_")
         render_exit_ui(key_prefix="summary_")
 
     with st.expander("로드 정보 / 컬럼 인식 결과", expanded=False):
@@ -399,11 +408,28 @@ def render() -> None:
 
     with tab_period:
         f2 = add_calendar_parts(filtered)
+        daily_m = render_process_daily_avg(f2, period_col="년월", period_label="월")
+        if not daily_m.empty:
+            st.download_button(
+                "월별 공정 일평균 CSV",
+                data=daily_m.rename(columns={"영역": "공정"}).to_csv(index=False).encode("utf-8-sig"),
+                file_name="월별_공정_일평균실적.csv",
+                mime="text/csv",
+                key="summary_dl_daily_avg",
+            )
+
+        st.divider()
+        st.markdown("##### 월 합계 (참고)")
+        st.caption("근무일 수가 다른 월은 합계만으로 비교하면 왜곡될 수 있습니다. 위 일평균을 우선하세요.")
         by_m = summary_by(f2, ["년월", "영역"])
-        st.dataframe(by_m, use_container_width=True)
-        bar_chart(by_m, "년월", "실적", color="영역", title="월별 실적")
+        st.dataframe(by_m.rename(columns={"영역": "공정"}), use_container_width=True)
+        bar_chart(by_m, "년월", "실적", color="영역", title="월별 실적 합계")
         by_mt = summary_by(f2, ["년월", "조", "영역"])
-        bar_chart(by_mt, "년월", "실적", color="조", title="월별 · 조별 실적")
+        bar_chart(by_mt, "년월", "실적", color="조", title="월별 · 조별 실적 합계")
+
+        with st.expander("분기 · 년 일평균"):
+            render_process_daily_avg(f2, period_col="년분기", period_label="분기")
+            render_process_daily_avg(f2, period_col="년", period_label="년")
 
     with tab_raw:
         raw_view = format_display_df(filtered.sort_values("일자"))
