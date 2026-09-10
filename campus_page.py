@@ -17,6 +17,7 @@ from app_common import (
     apply_basic_filters,
     load_records,
     render_data_sidebar,
+    render_process_daily_avg,
     render_single_slicer,
     render_slicer,
     team_stack_order,
@@ -324,6 +325,14 @@ def render() -> None:
         st.markdown("##### 기타 캠퍼스")
         for oc in other:
             _stacked_campus_chart(oc)
+
+    st.divider()
+    render_process_daily_avg(
+        filtered,
+        period_col="년월",
+        period_label="월",
+        split_campus=True,
+    )
 
     st.divider()
     st.subheader("조별 주/야 차이")
