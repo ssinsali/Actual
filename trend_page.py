@@ -86,50 +86,50 @@ def _monthly_team_process_status(
     cur = series[series["년월"] == current_month].copy()
     cur = cur.rename(
         columns={
-            "일평균_실적": "당월_일평균",
-            "작업일수": "당월_작업일수",
-            "인당실적": "당월_인당실적",
+            "일평균_실적": "기준월_일평균",
+            "작업일수": "기준월_작업일수",
+            "인당실적": "기준월_인당실적",
         }
     )
     status_cols = [
         "조",
         "영역",
-        "전월",
+        "비교월",
         "년월",
-        "전월_일평균",
-        "당월_일평균",
+        "비교월_일평균",
+        "기준월_일평균",
         "차이",
-        "전월대비%",
+        "기준월대비%",
         "판정",
-        "당월_작업일수",
-        "당월_인당실적",
+        "기준월_작업일수",
+        "기준월_인당실적",
     ]
     if compare_month is None:
-        cur["전월"] = None
-        cur["전월_일평균"] = None
-        cur["전월_작업일수"] = None
+        cur["비교월"] = None
+        cur["비교월_일평균"] = None
+        cur["비교월_작업일수"] = None
         cur["차이"] = None
-        cur["전월대비%"] = None
+        cur["기준월대비%"] = None
         cur["판정"] = "비교불가"
-        status = cur[status_cols].rename(columns={"년월": "당월", "영역": "공정"})
+        status = cur[status_cols].rename(columns={"년월": "기준월", "영역": "공정"})
         return series, status.reset_index(drop=True), current_month, None
 
     prev = series[series["년월"] == compare_month][["조", "영역", "일평균_실적", "작업일수"]].rename(
-        columns={"일평균_실적": "전월_일평균", "작업일수": "전월_작업일수"}
+        columns={"일평균_실적": "비교월_일평균", "작업일수": "비교월_작업일수"}
     )
     status = cur.merge(prev, on=["조", "영역"], how="left")
-    status["전월"] = compare_month
-    status["차이"] = (status["전월_일평균"] - status["당월_일평균"]).round(1)
-    status["전월대비%"] = status.apply(
-        lambda r: round((float(r["전월_일평균"]) / float(r["당월_일평균"]) - 1) * 100, 1)
-        if pd.notna(r["당월_일평균"]) and r["당월_일평균"]
+    status["비교월"] = compare_month
+    status["차이"] = (status["비교월_일평균"] - status["기준월_일평균"]).round(1)
+    status["기준월대비%"] = status.apply(
+        lambda r: round((float(r["비교월_일평균"]) / float(r["기준월_일평균"]) - 1) * 100, 1)
+        if pd.notna(r["기준월_일평균"]) and r["기준월_일평균"]
         else None,
         axis=1,
     )
-    status["판정"] = status["전월대비%"].map(lambda p: _classify_mom(p, hold_pct))
+    status["판정"] = status["기준월대비%"].map(lambda p: _classify_mom(p, hold_pct))
     status["_ord"] = status["영역"].map(lambda x: order.get(x, 99))
     status = status.sort_values(["_ord", "조"]).drop(columns="_ord")
-    status = status[status_cols].rename(columns={"년월": "당월", "영역": "공정"})
+    status = status[status_cols].rename(columns={"년월": "기준월", "영역": "공정"})
     return series, status.reset_index(drop=True), current_month, compare_month
 
 
@@ -148,8 +148,8 @@ def _team_avg_gap(status: pd.DataFrame, teams_all: list[str]) -> pd.DataFrame:
     if status.empty:
         return pd.DataFrame()
     g = status.groupby("조", as_index=False).agg(
-        비교월_일평균=("전월_일평균", "mean"),
-        기준월_일평균=("당월_일평균", "mean"),
+        비교월_일평균=("비교월_일평균", "mean"),
+        기준월_일평균=("기준월_일평균", "mean"),
         공정수=("공정", "nunique"),
     )
     g["비교월_일평균"] = g["비교월_일평균"].round(1)
@@ -174,15 +174,15 @@ def _team_avg_gap(status: pd.DataFrame, teams_all: list[str]) -> pd.DataFrame:
 
 
 def _status_base_view(status: pd.DataFrame, cur_m: str | None) -> pd.DataFrame:
-    """기준월 막대용. 내부 전월/당월 컬럼을 화면 이름으로 좁힌다."""
+    """기준월 막대용. 툴팁에 쓸 컬럼만 남긴다."""
     return pd.DataFrame(
         {
             "조": status["조"],
             "공정": status["공정"],
             "기준월": cur_m,
-            "일평균": status["당월_일평균"],
-            "작업일수": status["당월_작업일수"],
-            "인당실적": status["당월_인당실적"],
+            "일평균": status["기준월_일평균"],
+            "작업일수": status["기준월_작업일수"],
+            "인당실적": status["기준월_인당실적"],
         }
     )
 
@@ -242,7 +242,7 @@ def _signed_bar(df: pd.DataFrame, x: str, y: str, *, title: str, x_sort) -> None
                 scale=alt.Scale(domain=[True, False], range=["#7dcea0", "#f1948a"]),
                 legend=None,
             ),
-            tooltip=[c for c in work.columns if not str(c).startswith("_")],
+            tooltip=["조", x, y] if x != "조" else ["조", y],
         )
         .properties(height=300, title=title)
     )
@@ -427,10 +427,10 @@ def render() -> None:
     cur_label = f"기준월 {cur_m}" if cur_m else "기준월"
     cmp_rows = []
     for _, r in status.iterrows():
-        if pd.notna(r.get("당월_일평균")):
-            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": cur_label, "일평균": r["당월_일평균"]})
-        if pd.notna(r.get("전월_일평균")):
-            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": cmp_label, "일평균": r["전월_일평균"]})
+        if pd.notna(r.get("기준월_일평균")):
+            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": cur_label, "일평균": r["기준월_일평균"]})
+        if pd.notna(r.get("비교월_일평균")):
+            cmp_rows.append({"조": r["조"], "공정": r["공정"], "구분": cmp_label, "일평균": r["비교월_일평균"]})
     cmp_df = pd.DataFrame(cmp_rows)
     if not cmp_df.empty:
         st.markdown("##### 공정별 · 기준월 vs 비교월")
@@ -517,22 +517,11 @@ def render() -> None:
         )
 
     with st.expander("판정표 · 상세 숫자", expanded=False):
-        show = status.rename(
-            columns={
-                "전월": "비교월",
-                "당월": "기준월",
-                "전월_일평균": "비교월_일평균",
-                "당월_일평균": "기준월_일평균",
-                "전월대비%": "기준월대비%",
-                "당월_작업일수": "기준월_작업일수",
-                "당월_인당실적": "기준월_인당실적",
-            }
-        )
         try:
-            styled = show.style.map(_status_color, subset=["판정"])
+            styled = status.style.map(_status_color, subset=["판정"])
             st.dataframe(styled, use_container_width=True)
         except Exception:
-            st.dataframe(show, use_container_width=True)
+            st.dataframe(status, use_container_width=True)
         piv = status.pivot_table(index="조", columns="공정", values="판정", aggfunc="first")
         piv = piv.reindex(index=[t for t in teams_all if t in piv.index])
         piv = piv.reindex(columns=areas_all)
