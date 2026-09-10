@@ -539,49 +539,44 @@ def render() -> None:
         st.markdown("##### 공정별 · 기준월 vs 비교월")
         n_teams = int(cmp_df["조"].nunique())
         mean_title = f"{n_teams}개조 평균"
-        bars = (
-            alt.Chart(cmp_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("조:N", title="조", sort=teams_all),
-                y=alt.Y("일평균:Q", title="일평균 실적"),
+        plot_df = cmp_df.copy()
+        if n_teams >= 2:
+            gmean = plot_df.groupby(["공정", "구분"], as_index=False)["일평균"].mean()
+            gmean["조평균"] = gmean["일평균"].round(1)
+            gmean["평균라벨"] = gmean["조평균"].map(lambda v: f"{float(v):.1f}")
+            plot_df = plot_df.merge(gmean[["공정", "구분", "조평균", "평균라벨"]], on=["공정", "구분"], how="left")
+            last_team = teams_all[-1] if teams_all else None
+            plot_df["_라벨"] = plot_df["조"].astype(str) == str(last_team)
+        base = alt.Chart()
+        bars = base.mark_bar().encode(
+            x=alt.X("조:N", title="조", sort=teams_all),
+            y=alt.Y("일평균:Q", title="일평균 실적"),
+            color=alt.Color(
+                "구분:N",
+                title="월",
+                sort=[cur_label, cmp_label],
+                scale=alt.Scale(domain=[cur_label, cmp_label]),
+            ),
+            xOffset=alt.XOffset("구분:N", sort=[cur_label, cmp_label]),
+            tooltip=["조", "공정", "구분", "일평균"],
+        )
+        if n_teams >= 2:
+            rules = base.mark_rule(strokeDash=[6, 4], strokeWidth=2).encode(
+                y=alt.Y("조평균:Q"),
                 color=alt.Color(
                     "구분:N",
                     title="월",
                     sort=[cur_label, cmp_label],
                     scale=alt.Scale(domain=[cur_label, cmp_label]),
+                    legend=None,
                 ),
-                xOffset=alt.XOffset("구분:N", sort=[cur_label, cmp_label]),
-                tooltip=["조", "공정", "구분", "일평균"],
+                tooltip=["공정", "구분", alt.Tooltip("조평균:Q", title=mean_title)],
             )
-        )
-        layers: list[alt.Chart] = [bars]
-        if n_teams >= 2:
-            avg = cmp_df.groupby(["공정", "구분"], as_index=False)["일평균"].mean()
-            avg["일평균"] = avg["일평균"].round(1)
-            avg["평균라벨"] = avg["일평균"].map(lambda v: f"{float(v):.1f}")
-            avg["조"] = teams_all[-1] if teams_all else ""
-            layers.append(
-                alt.Chart(avg)
-                .mark_rule(strokeDash=[6, 4], strokeWidth=2)
-                .encode(
-                    y="일평균:Q",
-                    color=alt.Color(
-                        "구분:N",
-                        title="월",
-                        sort=[cur_label, cmp_label],
-                        scale=alt.Scale(domain=[cur_label, cmp_label]),
-                        legend=None,
-                    ),
-                    tooltip=["공정", "구분", alt.Tooltip("일평균:Q", title=mean_title)],
-                )
-            )
-            layers.append(
-                alt.Chart(avg)
-                .mark_text(dx=14, dy=-8, fontWeight="bold", fontSize=11)
+            texts = (
+                base.mark_text(dx=14, dy=-8, fontWeight="bold", fontSize=11)
                 .encode(
                     x=alt.X("조:N", sort=teams_all),
-                    y="일평균:Q",
+                    y=alt.Y("조평균:Q"),
                     text="평균라벨:N",
                     color=alt.Color(
                         "구분:N",
@@ -590,12 +585,14 @@ def render() -> None:
                         legend=None,
                     ),
                 )
+                .transform_filter(alt.FieldEqualPredicate(field="_라벨", equal=True))
             )
+            layered = alt.layer(bars, rules, texts, data=plot_df)
+        else:
+            layered = alt.layer(bars, data=plot_df)
         facet_chart = (
-            alt.layer(*layers)
-            .resolve_scale(color="independent")
-            .properties(height=380, width=520)
-            .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
+            layered.properties(height=380, width=520)
+            .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2, data=plot_df)
             .resolve_scale(y="independent")
         )
         st.altair_chart(facet_chart, use_container_width=True)
