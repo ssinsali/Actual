@@ -53,6 +53,29 @@ def master_dir():
     return folder
 
 
+def _list_master_paths(stem: str | None = None) -> list[Path]:
+    folder = master_dir()
+    stems = (stem,) if stem else MASTER_STEMS
+    files: list[Path] = []
+    for s in stems:
+        files.extend(folder.glob(f"{s}*.csv"))
+        files.extend(folder.glob(f"{s}*.xlsx"))
+        files.extend(folder.glob(f"{s}*.xls"))
+    return [p for p in files if not p.name.startswith("~$")]
+
+
+def _clear_master_files(stem: str | None = None) -> list[str]:
+    """운영 중 기준정보 파일을 지운다. stem 없으면 전부."""
+    deleted: list[str] = []
+    for path in _list_master_paths(stem):
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except OSError:
+            continue
+    return deleted
+
+
 def _push_master_github(filename: str, content: bytes) -> str:
     if not github_store_enabled():
         return ""
@@ -67,11 +90,15 @@ def _push_master_github(filename: str, content: bytes) -> str:
 
 def _sync_master_from_github(*, force: bool = False) -> list[str]:
     if not github_store_enabled():
-        return ["GitHub Secrets가 없어 로컬/업로드 파일만 사용합니다."]
+        return ["GitHub Secrets([github] token/repo)가 없어 로컬·업로드 파일만 사용합니다."]
     if not force and st.session_state.get("sim_gh_master_ok"):
         return list(st.session_state.get("sim_gh_master_notes") or [])
     notes: list[str] = []
     folder = master_dir()
+    if force:
+        cleared = _clear_master_files()
+        if cleared:
+            notes.append("로컬 기준정보 초기화: " + ", ".join(cleared))
     for stem in MASTER_STEMS:
         found_rel = None
         found_raw = None
@@ -93,6 +120,8 @@ def _sync_master_from_github(*, force: bool = False) -> list[str]:
             dest = folder / Path(found_rel).name
             if not dest.name.startswith(stem):
                 dest = folder / f"{stem}{Path(found_rel).suffix}"
+            # 같은 종류 옛 파일 제거 후 저장
+            _clear_master_files(stem)
             dest.write_bytes(found_raw)
             notes.append(f"GitHub에서 가져옴: {found_rel}")
         else:
@@ -103,12 +132,46 @@ def _sync_master_from_github(*, force: bool = False) -> list[str]:
 
 
 def _save_upload(uploaded, prefix: str):
+    """같은 종류 옛 파일을 지우고 새 파일만 운영한다."""
     name = canonical_master_name(uploaded.name, prefix)
+    _clear_master_files(prefix)
     dest = master_dir() / name
     data = uploaded.getvalue()
     dest.write_bytes(data)
     gh = _push_master_github(name, data)
     return dest, gh
+
+
+def _render_master_reset_ui() -> None:
+    flag = "sim_confirm_reset_master"
+    if flag not in st.session_state:
+        st.session_state[flag] = False
+    files = _list_master_paths()
+    if not files:
+        st.caption("초기화할 운영 기준정보가 없습니다.")
+        return
+    if not st.session_state[flag]:
+        if st.button("운영 기준정보 초기화", use_container_width=True, key="sim_btn_reset_master"):
+            st.session_state[flag] = True
+            st.rerun()
+        return
+    st.warning("지금 운영 중인 기준정보 파일을 모두 삭제합니다. 그다음 새로 업로드하면 됩니다.")
+    st.caption("삭제 대상: " + ", ".join(p.name for p in files))
+    yes, no = st.columns(2)
+    with yes:
+        if st.button("삭제", type="primary", use_container_width=True, key="sim_reset_master_yes"):
+            deleted = _clear_master_files()
+            st.session_state[flag] = False
+            st.session_state["sim_gh_master_ok"] = False
+            st.session_state.pop("sim_gh_master_notes", None)
+            for k in ("sim_eq_sig", "sim_man_sig", "sim_pr_sig", "sim_act_sig"):
+                st.session_state.pop(k, None)
+            st.session_state["sim_flash"] = "기준정보 초기화 완료: " + (", ".join(deleted) if deleted else "없음")
+            st.rerun()
+    with no:
+        if st.button("취소", use_container_width=True, key="sim_reset_master_no"):
+            st.session_state[flag] = False
+            st.rerun()
 
 
 def _active_master_files() -> list[dict[str, str]]:
@@ -174,8 +237,25 @@ def render() -> None:
     )
 
     records, rec_notes, _chosen = load_records()
-    gh_notes = _sync_master_from_github()
+
+    # GitHub 다시 가져오기 / 초기화 직후 메시지
+    force_gh = bool(st.session_state.pop("sim_gh_force_refresh", False))
+    if force_gh:
+        gh_notes = _sync_master_from_github(force=True)
+        st.session_state["sim_flash"] = "GitHub 기준정보 다시 가져오기 완료"
+        st.session_state["sim_flash_detail"] = gh_notes
+    else:
+        gh_notes = _sync_master_from_github()
+
     equip, manpower, products, product_actuals, master_notes = _load_master()
+
+    flash = st.session_state.pop("sim_flash", None)
+    flash_detail = st.session_state.pop("sim_flash_detail", None)
+    if flash:
+        st.success(flash)
+        if flash_detail:
+            for n in flash_detail:
+                st.caption("· " + str(n))
 
     campus_sel: list[str] = []
     shift_sel: list[str] = []
@@ -231,18 +311,23 @@ def render() -> None:
         )
         if github_store_enabled():
             if st.button("GitHub에서 기준정보 다시 가져오기", use_container_width=True, key="sim_gh_refresh"):
+                st.session_state["sim_gh_force_refresh"] = True
                 st.session_state["sim_gh_master_ok"] = False
                 st.rerun()
+        else:
+            st.caption("GitHub Secrets([github] token/repo)가 없으면 다시 가져오기를 쓸 수 없습니다.")
 
         st.divider()
         st.header("기준정보 등록")
         st.caption(
             "파일명: 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx). "
-            "외관 등 수작업은 인력_기준정보에 인원을 넣으세요."
+            "외관 등 수작업은 인력_기준정보에 인원을 넣으세요. "
+            "새로 올리면 같은 종류의 이전 운영 파일은 자동으로 교체됩니다."
         )
         st.markdown("**지금 운영 중**")
         active_df = pd.DataFrame(_active_master_files())
         st.dataframe(active_df, use_container_width=True, hide_index=True)
+        _render_master_reset_ui()
         eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
         man_up = st.file_uploader("② 인력_기준정보 (외관 등)", type=["csv", "xlsx"], key="sim_up_man")
         pr_up = st.file_uploader("③ 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
@@ -255,25 +340,25 @@ def render() -> None:
             path, gh = _save_upload(eq_up, "설비_기준정보")
             st.session_state["sim_eq_sig"] = eq_sig
             st.session_state["sim_gh_master_ok"] = False
-            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
+            st.session_state["sim_flash"] = f"설비 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if man_up is not None and man_sig != st.session_state.get("sim_man_sig"):
             path, gh = _save_upload(man_up, "인력_기준정보")
             st.session_state["sim_man_sig"] = man_sig
             st.session_state["sim_gh_master_ok"] = False
-            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
+            st.session_state["sim_flash"] = f"인력 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if pr_up is not None and pr_sig != st.session_state.get("sim_pr_sig"):
             path, gh = _save_upload(pr_up, "제품_기준정보")
             st.session_state["sim_pr_sig"] = pr_sig
             st.session_state["sim_gh_master_ok"] = False
-            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
+            st.session_state["sim_flash"] = f"제품 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if act_up is not None and act_sig != st.session_state.get("sim_act_sig"):
             path, gh = _save_upload(act_up, "제품별_실적")
             st.session_state["sim_act_sig"] = act_sig
             st.session_state["sim_gh_master_ok"] = False
-            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
+            st.session_state["sim_flash"] = f"제품별 실적 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         st.subheader("양식 받기")
         st.caption("엑셀에서 한글이 깨지면 xlsx를 받으세요.")
