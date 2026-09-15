@@ -21,6 +21,7 @@ from sim_engine import (
     DAY_MINUTES,
     EQUIP_COLUMNS,
     MASTER_STEMS,
+    PRODUCT_ACTUAL_COLUMNS,
     PRODUCT_COLUMNS,
     canonical_master_name,
     csv_bytes,
@@ -201,84 +202,11 @@ def render() -> None:
                 st.rerun()
 
         st.divider()
-        st.header("기준정보 양식")
-        st.caption("엑셀에서 한글이 깨지면 **xlsx** 양식을 받으세요. CSV는 UTF-8(BOM)입니다.")
-        st.download_button(
-            "제품 기준정보 엑셀 양식 (권장)",
-            data=xlsx_bytes(product_template(), "제품"),
-            file_name="제품_기준정보.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="sim_dl_pr_xlsx",
-        )
-        st.download_button(
-            "제품 기준정보 빈 엑셀",
-            data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
-            file_name="제품_기준정보_빈양식.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="sim_dl_pr_xlsx_empty",
-        )
-        st.download_button(
-            "설비 기준정보 엑셀 양식 (권장)",
-            data=xlsx_bytes(equipment_template(), "설비"),
-            file_name="설비_기준정보.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="sim_dl_eq_xlsx",
-        )
-        st.download_button(
-            "설비 기준정보 빈 엑셀",
-            data=empty_xlsx_bytes(EQUIP_COLUMNS, "설비"),
-            file_name="설비_기준정보_빈양식.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="sim_dl_eq_xlsx_empty",
-        )
-        with st.expander("CSV 양식 (UTF-8)"):
-            st.download_button(
-                "설비 기준정보 CSV (예시)",
-                data=csv_bytes(equipment_template()),
-                file_name="설비_기준정보.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="sim_dl_eq_ex",
-            )
-            st.download_button(
-                "설비 기준정보 빈 CSV",
-                data=empty_csv_bytes(EQUIP_COLUMNS),
-                file_name="설비_기준정보_빈양식.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="sim_dl_eq_empty",
-            )
-            st.download_button(
-                "제품 기준정보 CSV (예시)",
-                data=csv_bytes(product_template()),
-                file_name="제품_기준정보.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="sim_dl_pr_ex",
-            )
-            st.download_button(
-                "제품 기준정보 빈 CSV",
-                data=empty_csv_bytes(PRODUCT_COLUMNS),
-                file_name="제품_기준정보_빈양식.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="sim_dl_pr_empty",
-            )
-            st.download_button(
-                "제품별 실적 CSV (선택)",
-                data=csv_bytes(product_actual_template()),
-                file_name="제품별_실적.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="sim_dl_act",
-            )
-        eq_up = st.file_uploader("설비_기준정보 업로드", type=["csv", "xlsx"], key="sim_up_eq")
-        pr_up = st.file_uploader("제품_기준정보 업로드", type=["csv", "xlsx"], key="sim_up_pr")
-        act_up = st.file_uploader("제품별_실적 업로드 (선택)", type=["csv", "xlsx"], key="sim_up_act")
+        st.header("기준정보 등록")
+        st.caption("파일명: 설비_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx)")
+        eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
+        pr_up = st.file_uploader("② 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
+        act_up = st.file_uploader("③ 제품별_실적", type=["csv", "xlsx"], key="sim_up_act")
         eq_sig = (eq_up.name, int(getattr(eq_up, "size", 0) or 0)) if eq_up else None
         pr_sig = (pr_up.name, int(getattr(pr_up, "size", 0) or 0)) if pr_up else None
         act_sig = (act_up.name, int(getattr(act_up, "size", 0) or 0)) if act_up else None
@@ -300,6 +228,81 @@ def render() -> None:
             st.session_state["sim_gh_master_ok"] = False
             st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
             st.rerun()
+        st.subheader("양식 받기")
+        st.caption("엑셀에서 한글이 깨지면 xlsx를 받으세요.")
+        st.download_button(
+            "제품 기준정보 엑셀",
+            data=xlsx_bytes(product_template(), "제품"),
+            file_name="제품_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_pr_xlsx",
+        )
+        st.download_button(
+            "설비 기준정보 엑셀",
+            data=xlsx_bytes(equipment_template(), "설비"),
+            file_name="설비_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_eq_xlsx",
+        )
+        st.download_button(
+            "제품별_실적 엑셀",
+            data=xlsx_bytes(product_actual_template(), "제품실적"),
+            file_name="제품별_실적.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_act_xlsx",
+        )
+        with st.expander("빈 양식 · CSV"):
+            st.download_button(
+                "제품 기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
+                file_name="제품_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_pr_xlsx_empty",
+            )
+            st.download_button(
+                "설비 기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(EQUIP_COLUMNS, "설비"),
+                file_name="설비_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_eq_xlsx_empty",
+            )
+            st.download_button(
+                "제품별_실적 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_ACTUAL_COLUMNS, "제품실적"),
+                file_name="제품별_실적_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_act_xlsx_empty",
+            )
+            st.download_button(
+                "설비 기준정보 CSV",
+                data=csv_bytes(equipment_template()),
+                file_name="설비_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_eq_ex",
+            )
+            st.download_button(
+                "제품 기준정보 CSV",
+                data=csv_bytes(product_template()),
+                file_name="제품_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_pr_ex",
+            )
+            st.download_button(
+                "제품별_실적 CSV",
+                data=csv_bytes(product_actual_template()),
+                file_name="제품별_실적.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_act",
+            )
 
     for n in gh_notes:
         st.caption("· " + n)
