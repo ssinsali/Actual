@@ -20,6 +20,7 @@ from stats_engine import AREAS, SHIFTS, add_calendar_parts
 from sim_engine import (
     DAY_MINUTES,
     EQUIP_COLUMNS,
+    MANPOWER_COLUMNS,
     MASTER_STEMS,
     PRODUCT_ACTUAL_COLUMNS,
     PRODUCT_COLUMNS,
@@ -29,10 +30,12 @@ from sim_engine import (
     empty_csv_bytes,
     empty_xlsx_bytes,
     equipment_template,
+    manpower_template,
     master_github_paths,
     mix_simulation,
     newest_matching,
     normalize_equipment,
+    normalize_manpower,
     normalize_product_actuals,
     normalize_products,
     process_standard_times,
@@ -108,20 +111,27 @@ def _save_upload(uploaded, prefix: str):
     return dest, gh
 
 
-def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
     folder = master_dir()
     notes: list[str] = []
     eq_path = newest_matching(folder, "설비_기준정보")
+    man_path = newest_matching(folder, "인력_기준정보")
     pr_path = newest_matching(folder, "제품_기준정보")
     act_path = newest_matching(folder, "제품별_실적")
     equip = pd.DataFrame()
+    manpower = pd.DataFrame()
     products = pd.DataFrame()
     actuals = pd.DataFrame()
     if eq_path:
         equip = normalize_equipment(read_csv_table(eq_path))
         notes.append(f"설비: {eq_path.name} ({len(equip)}행)")
     else:
-        notes.append("설비 기준정보가 없습니다. GitHub templates/ 또는 업로드하세요.")
+        notes.append("설비 기준정보가 없습니다. (설비 공정용)")
+    if man_path:
+        manpower = normalize_manpower(read_csv_table(man_path))
+        notes.append(f"인력: {man_path.name} ({len(manpower)}행)")
+    else:
+        notes.append("인력 기준정보가 없습니다. (외관 등 수작업 공정용)")
     if pr_path:
         products = normalize_products(read_csv_table(pr_path))
         notes.append(f"제품: {pr_path.name} ({len(products)}행)")
@@ -130,21 +140,20 @@ def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]
     if act_path:
         actuals = normalize_product_actuals(read_csv_table(act_path))
         notes.append(f"제품별 실적: {act_path.name} ({len(actuals)}행)")
-    return equip, products, actuals, notes
+    return equip, manpower, products, actuals, notes
 
 
 def render() -> None:
     st.title("설비 운영 시뮬레이션")
     st.caption(
-        "보유 설비와 제품 기준정보로 하루 1440분 동안 몇 매를 할 수 있는지 보고, "
-        "실적과 비교해 인당 시간을 얼마나 썼는지 계산합니다. "
-        "GitHub `templates/` 폴더에 설비_기준정보 / 제품_기준정보 / 제품별_실적 "
-        "(csv 또는 xlsx)을 올리면 자동으로 가져옵니다."
+        "보유 설비·인력과 제품 택트로 하루 능력을 보고, 실적 대비 인당 시간 활용률을 계산합니다. "
+        "외관처럼 설비 없이 사람이 하는 공정은 `인력_기준정보`에 넣습니다. "
+        "GitHub `templates/`에 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적을 올리면 자동으로 가져옵니다."
     )
 
     records, rec_notes, _chosen = load_records()
     gh_notes = _sync_master_from_github()
-    equip, products, product_actuals, master_notes = _load_master()
+    equip, manpower, products, product_actuals, master_notes = _load_master()
 
     campus_sel: list[str] = []
     shift_sel: list[str] = []
@@ -161,6 +170,8 @@ def render() -> None:
         campus_opts = []
         if not equip.empty:
             campus_opts = sorted(equip["캠퍼스"].dropna().unique().tolist())
+        if not manpower.empty and "캠퍼스" in manpower.columns:
+            campus_opts = sorted(set(campus_opts) | set(manpower["캠퍼스"].dropna().unique().tolist()))
         if records is not None and not records.empty and "캠퍼스" in records.columns:
             campus_opts = sorted(set(campus_opts) | set(records["캠퍼스"].dropna().unique().tolist()))
         if not campus_opts:
@@ -203,16 +214,27 @@ def render() -> None:
 
         st.divider()
         st.header("기준정보 등록")
-        st.caption("파일명: 설비_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx)")
+        st.caption(
+            "파일명: 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx). "
+            "외관 등 수작업은 인력_기준정보에 인원을 넣으세요."
+        )
         eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
-        pr_up = st.file_uploader("② 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
-        act_up = st.file_uploader("③ 제품별_실적", type=["csv", "xlsx"], key="sim_up_act")
+        man_up = st.file_uploader("② 인력_기준정보 (외관 등)", type=["csv", "xlsx"], key="sim_up_man")
+        pr_up = st.file_uploader("③ 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
+        act_up = st.file_uploader("④ 제품별_실적", type=["csv", "xlsx"], key="sim_up_act")
         eq_sig = (eq_up.name, int(getattr(eq_up, "size", 0) or 0)) if eq_up else None
+        man_sig = (man_up.name, int(getattr(man_up, "size", 0) or 0)) if man_up else None
         pr_sig = (pr_up.name, int(getattr(pr_up, "size", 0) or 0)) if pr_up else None
         act_sig = (act_up.name, int(getattr(act_up, "size", 0) or 0)) if act_up else None
         if eq_up is not None and eq_sig != st.session_state.get("sim_eq_sig"):
             path, gh = _save_upload(eq_up, "설비_기준정보")
             st.session_state["sim_eq_sig"] = eq_sig
+            st.session_state["sim_gh_master_ok"] = False
+            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
+            st.rerun()
+        if man_up is not None and man_sig != st.session_state.get("sim_man_sig"):
+            path, gh = _save_upload(man_up, "인력_기준정보")
+            st.session_state["sim_man_sig"] = man_sig
             st.session_state["sim_gh_master_ok"] = False
             st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
             st.rerun()
@@ -230,6 +252,14 @@ def render() -> None:
             st.rerun()
         st.subheader("양식 받기")
         st.caption("엑셀에서 한글이 깨지면 xlsx를 받으세요.")
+        st.download_button(
+            "인력 기준정보 엑셀 (외관 등)",
+            data=xlsx_bytes(manpower_template(), "인력"),
+            file_name="인력_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_man_xlsx",
+        )
         st.download_button(
             "제품 기준정보 엑셀",
             data=xlsx_bytes(product_template(), "제품"),
@@ -256,6 +286,14 @@ def render() -> None:
         )
         with st.expander("빈 양식 · CSV"):
             st.download_button(
+                "인력 기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(MANPOWER_COLUMNS, "인력"),
+                file_name="인력_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_man_xlsx_empty",
+            )
+            st.download_button(
                 "제품 기준정보 빈 엑셀",
                 data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
                 file_name="제품_기준정보_빈양식.xlsx",
@@ -278,6 +316,14 @@ def render() -> None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key="sim_dl_act_xlsx_empty",
+            )
+            st.download_button(
+                "인력 기준정보 CSV",
+                data=csv_bytes(manpower_template()),
+                file_name="인력_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_man_ex",
             )
             st.download_button(
                 "설비 기준정보 CSV",
@@ -310,11 +356,16 @@ def render() -> None:
         st.caption("· " + n)
 
     eq_view = equip.copy()
+    man_view = manpower.copy()
     pr_view = products.copy()
     if campus_sel and not eq_view.empty:
         eq_view = eq_view[eq_view["캠퍼스"].isin(campus_sel) | (eq_view["캠퍼스"] == "")]
+    if campus_sel and not man_view.empty:
+        man_view = man_view[man_view["캠퍼스"].isin(campus_sel) | (man_view["캠퍼스"] == "")]
     if area_sel and not eq_view.empty:
         eq_view = eq_view[eq_view["공정"].isin(area_sel)]
+    if area_sel and not man_view.empty:
+        man_view = man_view[man_view["공정"].isin(area_sel)]
     if area_sel and not pr_view.empty:
         pr_view = pr_view[pr_view["공정"].isin(area_sel)]
     if product_sel and not pr_view.empty:
@@ -326,13 +377,24 @@ def render() -> None:
         st.subheader("현재 적용 중인 기준")
         st.markdown("**설비** — 가동여부가 Y/가동/1 이면 시뮬레이션에 포함합니다.")
         if eq_view.empty:
-            st.info("설비 기준정보를 업로드하세요.")
+            st.info("설비 기준정보를 업로드하세요. (종합측정실·치수·Hole 등)")
         else:
             st.dataframe(eq_view.drop(columns=["가동"], errors="ignore"), use_container_width=True)
             by = eq_view[eq_view["가동"]].groupby(["캠퍼스", "공정"], as_index=False)["대수"].sum()
             st.caption("가동 대수 합계")
             st.dataframe(by, use_container_width=True)
-        st.markdown("**제품** — `매당_설비분`은 설비 1대로 1매 도는 시간(분), `매당_인시분`은 사람 1명이 쓰는 시간입니다.")
+        st.markdown(
+            "**인력** — 외관처럼 설비 없이 사람이 하는 공정. "
+            "일가능매수 = 인원 × 가용분 ÷ 매당_인시분."
+        )
+        if man_view.empty:
+            st.info("인력 기준정보를 업로드하세요. (외관 등 수작업)")
+        else:
+            st.dataframe(man_view.drop(columns=["가동"], errors="ignore"), use_container_width=True)
+        st.markdown(
+            "**제품** — `제약유형`이 설비가면 매당_설비분, 인력이면 매당_인시분을 씁니다. "
+            "외관은 제약유형=인력, 설비코드는 비워 두면 됩니다."
+        )
         if pr_view.empty:
             st.info("제품 기준정보를 업로드하세요.")
         else:
@@ -344,19 +406,23 @@ def render() -> None:
             st.dataframe(product_actuals, use_container_width=True)
 
     with tab_sim:
-        st.subheader("하루 1440분 능력")
+        st.subheader("하루 능력 (설비·인력)")
         st.caption(
-            "일가능매수 = 가동 대수 × 1440 ÷ 매당_설비분. "
-            "그 제품만 하루 종일 돌린다고 가정한 이론 값입니다. "
+            "설비 공정: 일가능매수 = 가동 대수 × 1440 ÷ 매당_설비분. "
+            "인력 공정(외관 등): 일가능매수 = 보유 인원 × 가용분 ÷ 매당_인시분. "
             "제품별 병목은 공정 중 가장 낮은 일가능매수입니다."
         )
         campus_for_cap = campus_sel[0] if len(campus_sel) == 1 else None
         if len(campus_sel) != 1:
-            st.caption("캠퍼스를 하나만 켜면 그 캠퍼스 설비만으로 계산합니다. 여러 개면 켠 캠퍼스를 합칩니다.")
-        cap_equip = eq_view if len(campus_sel) != 1 else eq_view
-        cap = daily_capacity(pr_view, cap_equip, campus=campus_for_cap if len(campus_sel) == 1 else None)
+            st.caption("캠퍼스를 하나만 켜면 그 캠퍼스 자원만으로 계산합니다. 여러 개면 켠 캠퍼스를 합칩니다.")
+        cap = daily_capacity(
+            pr_view,
+            eq_view,
+            campus=campus_for_cap if len(campus_sel) == 1 else None,
+            manpower=man_view,
+        )
         if cap.empty:
-            st.warning("제품·설비 기준정보가 있어야 시뮬레이션할 수 있습니다.")
+            st.warning("제품 기준정보와 설비 또는 인력 기준정보가 있어야 시뮬레이션할 수 있습니다.")
         else:
             k1, k2, k3 = st.columns(3)
             with k1:
@@ -373,16 +439,27 @@ def render() -> None:
                 .mark_bar()
                 .encode(
                     x=alt.X("공정:N", title="공정", sort=list(AREAS)),
-                    y=alt.Y("일가능매수:Q", title="일가능매수 (1440분)"),
+                    y=alt.Y("일가능매수:Q", title="일가능매수"),
                     color=alt.Color("제품코드:N", title="제품"),
                     xOffset="제품코드:N",
-                    tooltip=["제품코드", "제품명", "공정", "가동대수", "매당_설비분", "일가능매수", "병목공정"],
+                    tooltip=[
+                        "제품코드",
+                        "제품명",
+                        "공정",
+                        "제약유형",
+                        "가동대수",
+                        "보유인원",
+                        "매당_설비분",
+                        "매당_인시분",
+                        "일가능매수",
+                        "병목공정",
+                    ],
                 )
                 .properties(height=340, title="제품·공정별 일 가능 매수")
             )
             st.altair_chart(bar, use_container_width=True)
 
-            st.markdown("##### 믹스 가동 (설비 시간을 비중으로 나눔)")
+            st.markdown("##### 믹스 가동 (자원 시간을 비중으로 나눔)")
             codes = sorted(pr_view["제품코드"].unique().tolist())
             mix_default = pd.DataFrame({"제품코드": codes, "비중": [round(100 / len(codes), 1)] * len(codes)})
             mix_edit = st.data_editor(
@@ -395,7 +472,13 @@ def render() -> None:
                     "비중": st.column_config.NumberColumn(min_value=0, step=1),
                 },
             )
-            mixed = mix_simulation(pr_view, cap_equip, mix_edit, campus=campus_for_cap if len(campus_sel) == 1 else None)
+            mixed = mix_simulation(
+                pr_view,
+                eq_view,
+                mix_edit,
+                campus=campus_for_cap if len(campus_sel) == 1 else None,
+                manpower=man_view,
+            )
             if mixed.empty:
                 st.caption("비중을 넣으면 공정별로 나눠 돌린 매수가 나옵니다.")
             else:
