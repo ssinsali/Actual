@@ -24,6 +24,11 @@
       "password_hash": "pbkdf2_sha256$260000$3fe32aaacaa0ffa27892f6ea1c50ec37$8fc9fc1891566949124cff94166b93880f6bbeb97fd8aec20ba09a03d0ba41dc",
       "display_name": "경세현",
       "role": "user"
+    },
+    "2180403": {
+      "password_hash": "pbkdf2_sha256$260000$eb04a4a534bf1f842dbef46f28fce1d4$765e33e96d86da3005384a87eed4ed5e0f41b5a30d6560e7b61fb5dd2b7450f2",
+      "display_name": "박민종",
+      "role": "user"
     }
   }
 }
