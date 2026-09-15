@@ -126,26 +126,35 @@ def _github_auth_cfg() -> tuple[str, str, str]:
 
 
 def _github_cfg(path_override: str | None = None) -> tuple[str, str, str, str]:
+    """users.json 등 Secrets path용. path_override가 있으면 한글 파일 경로도 허용."""
     token, repo, branch = _github_auth_cfg()
     path = (path_override or _github_secret("path") or "data/users.json").strip().lstrip("/")
-    try:
-        path.encode("ascii")
-    except UnicodeEncodeError as e:
-        raise RuntimeError(
-            "Secrets [github].path 에는 영문·숫자만 사용하세요."
-        ) from e
+    # Secrets에 적힌 기본 path만 ASCII 검사 (users.json). 기준정보 한글 파일명은 override로 들어온다.
+    if path_override is None:
+        try:
+            path.encode("ascii")
+        except UnicodeEncodeError as e:
+            raise RuntimeError(
+                "Secrets [github].path 에는 영문·숫자만 사용하세요. "
+                "예: data/users.json  (설비·제품 기준정보는 templates/ 에 별도로 올립니다.)"
+            ) from e
     return token, repo, path, branch
 
 
 def github_file_get(path: str) -> tuple[bytes | None, str | None]:
-    token, repo, file_path, branch = _github_cfg(path)
+    """저장소 파일 읽기. 한글 경로(templates/설비_기준정보.csv)도 가능."""
+    token, repo, branch = _github_auth_cfg()
+    file_path = path.strip().lstrip("/")
     url = _contents_url(repo, file_path, branch)
     try:
         info = _github_request("GET", url, token)
     except RuntimeError as e:
-        if "404" in str(e):
+        msg = str(e)
+        if "404" in msg:
             return None, None
         raise
+    if isinstance(info, list):
+        return None, None
     content_b64 = str(info.get("content") or "").replace("\n", "")
     sha = str(info.get("sha") or "") or None
     if not content_b64:
@@ -154,7 +163,9 @@ def github_file_get(path: str) -> tuple[bytes | None, str | None]:
 
 
 def github_file_put(path: str, content: bytes, message: str, sha: str | None) -> str | None:
-    token, repo, file_path, branch = _github_cfg(path)
+    """저장소 파일 쓰기. 한글 경로도 가능."""
+    token, repo, branch = _github_auth_cfg()
+    file_path = path.strip().lstrip("/")
     url = _contents_url(repo, file_path)
     body: dict[str, Any] = {
         "message": message,
