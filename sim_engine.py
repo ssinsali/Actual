@@ -9,14 +9,16 @@ import pandas as pd
 from stats_engine import AREAS
 
 DAY_MINUTES = 1440
-MASTER_STEMS = ("설비_기준정보", "제품_기준정보", "제품별_실적")
+MASTER_STEMS = ("설비_기준정보", "인력_기준정보", "제품_기준정보", "제품별_실적")
 MASTER_GH_FOLDERS = ("templates", "data/master", "data")
 
 EQUIP_COLUMNS = ("캠퍼스", "공정", "설비코드", "설비명", "대수", "가동여부", "비고")
+MANPOWER_COLUMNS = ("캠퍼스", "공정", "인원", "가용분", "가동여부", "비고")
 PRODUCT_COLUMNS = (
     "제품코드",
     "제품명",
     "공정",
+    "제약유형",
     "설비코드",
     "매당_설비분",
     "매당_인시분",
@@ -51,16 +53,15 @@ def _num(v: Any, default: float = 0.0) -> float:
 
 
 def equipment_template() -> pd.DataFrame:
+    """설비 공정만 예시. 외관처럼 사람만 하는 공정은 인력_기준정보에 넣습니다."""
     rows = []
     samples = [
         ("천안", "종합측정실", "CMM-01", "3차원측정기", 1),
         ("천안", "치수", "DIM-01", "2.5D 치수기", 2),
         ("천안", "Hole", "HOLE-01", "홀검사기", 1),
-        ("천안", "외관", "AOI-01", "외관검사기", 2),
         ("아산", "종합측정실", "CMM-A1", "3차원측정기", 1),
         ("아산", "치수", "DIM-A1", "2.5D 치수기", 1),
         ("아산", "Hole", "HOLE-A1", "홀검사기", 1),
-        ("아산", "외관", "AOI-A1", "외관검사기", 1),
     ]
     for campus, area, code, name, qty in samples:
         rows.append(
@@ -77,6 +78,23 @@ def equipment_template() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=list(EQUIP_COLUMNS))
 
 
+def manpower_template() -> pd.DataFrame:
+    """인력 기준 — 외관처럼 설비 없이 사람이 하는 공정용."""
+    rows = []
+    for campus, people in (("천안", 4), ("아산", 2)):
+        rows.append(
+            {
+                "캠퍼스": campus,
+                "공정": "외관",
+                "인원": people,
+                "가용분": DAY_MINUTES,
+                "가동여부": "Y",
+                "비고": "설비 없음 — 인원×가용분÷매당_인시분",
+            }
+        )
+    return pd.DataFrame(rows, columns=list(MANPOWER_COLUMNS))
+
+
 def product_template() -> pd.DataFrame:
     specs = [
         ("P-A", "제품A", {"종합측정실": 4.0, "치수": 0.9, "Hole": 2.4, "외관": 1.6}),
@@ -84,25 +102,27 @@ def product_template() -> pd.DataFrame:
         ("P-C", "제품C", {"종합측정실": 3.5, "치수": 0.7, "Hole": 2.0, "외관": 1.3}),
     ]
     equip = {
-        "종합측정실": "CMM-01",
-        "치수": "DIM-01",
-        "Hole": "HOLE-01",
-        "외관": "AOI-01",
+        "종합측정실": ("설비", "CMM-01"),
+        "치수": ("설비", "DIM-01"),
+        "Hole": ("설비", "HOLE-01"),
+        "외관": ("인력", ""),
     }
     rows = []
     for code, name, times in specs:
         for area in AREAS:
             t = times[area]
+            kind, eq = equip[area]
             rows.append(
                 {
                     "제품코드": code,
                     "제품명": name,
                     "공정": area,
-                    "설비코드": equip[area],
-                    "매당_설비분": t,
+                    "제약유형": kind,
+                    "설비코드": eq,
+                    "매당_설비분": t if kind == "설비" else 0,
                     "매당_인시분": t,
                     "필요인원": 1,
-                    "비고": "예시 — 자사 택트로 수정",
+                    "비고": "예시 - 자사 택트로 수정" if kind == "설비" else "외관: 인력 기준",
                 }
             )
     return pd.DataFrame(rows, columns=list(PRODUCT_COLUMNS))
@@ -170,7 +190,7 @@ def _rename_by_alias(df: pd.DataFrame, aliases: dict[str, tuple[str, ...]]) -> p
 
 def normalize_equipment(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=list(EQUIP_COLUMNS))
+        return pd.DataFrame(columns=list(EQUIP_COLUMNS) + ["가동"])
     work = _rename_by_alias(
         df.dropna(how="all").copy(),
         {
@@ -197,6 +217,32 @@ def normalize_equipment(df: pd.DataFrame) -> pd.DataFrame:
     return work.reset_index(drop=True)
 
 
+def normalize_manpower(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(MANPOWER_COLUMNS) + ["가동"])
+    work = _rename_by_alias(
+        df.dropna(how="all").copy(),
+        {
+            "캠퍼스": ("캠퍼스", "campus", "공장"),
+            "공정": ("공정", "영역", "공정명"),
+            "인원": ("인원", "인력", "보유인원", "명수"),
+            "가용분": ("가용분", "분", "가용시간분", "근무분"),
+            "가동여부": ("가동여부", "상태", "사용"),
+            "비고": ("비고", "메모"),
+        },
+    )
+    for c in MANPOWER_COLUMNS:
+        if c not in work.columns:
+            work[c] = DAY_MINUTES if c == "가용분" else ("" if c not in ("인원",) else 0)
+    work["캠퍼스"] = work["캠퍼스"].map(_norm)
+    work["공정"] = work["공정"].map(_norm)
+    work["인원"] = work["인원"].map(lambda v: _num(v, 0))
+    work["가용분"] = work["가용분"].map(lambda v: _num(v, DAY_MINUTES) or DAY_MINUTES)
+    work["가동"] = work["가동여부"].map(_is_running)
+    work = work[(work["공정"] != "") & (work["인원"] > 0)]
+    return work.reset_index(drop=True)
+
+
 def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=list(PRODUCT_COLUMNS))
@@ -206,6 +252,7 @@ def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
             "제품코드": ("제품코드", "품번", "item"),
             "제품명": ("제품명", "품명"),
             "공정": ("공정", "영역"),
+            "제약유형": ("제약유형", "유형", "기준유형", "타입"),
             "설비코드": ("설비코드", "설비id"),
             "매당_설비분": ("매당설비분", "설비택트", "ct", "분매", "cycle"),
             "매당_인시분": ("매당인시분", "인시택트", "공수", "인당분"),
@@ -220,11 +267,20 @@ def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
     work["제품명"] = work["제품명"].map(_norm)
     work["공정"] = work["공정"].map(_norm)
     work["설비코드"] = work["설비코드"].map(_norm)
+    work["제약유형"] = work["제약유형"].map(_norm)
     work["매당_설비분"] = work["매당_설비분"].map(lambda v: _num(v, 0))
     work["매당_인시분"] = work["매당_인시분"].map(lambda v: _num(v, 0))
     work["필요인원"] = work["필요인원"].map(lambda v: _num(v, 1) or 1)
     work.loc[work["매당_인시분"] <= 0, "매당_인시분"] = work["매당_설비분"]
-    work = work[(work["제품코드"] != "") & (work["공정"] != "") & (work["매당_설비분"] > 0)]
+    # 제약유형 비어 있으면 자동: 설비코드/설비분 있으면 설비, 아니면 인력
+    empty_kind = work["제약유형"] == ""
+    work.loc[empty_kind & ((work["설비코드"] != "") | (work["매당_설비분"] > 0)), "제약유형"] = "설비"
+    work.loc[empty_kind & (work["제약유형"] == ""), "제약유형"] = "인력"
+    work["제약유형"] = work["제약유형"].map(lambda x: "인력" if "인력" in str(x) or "사람" in str(x) or "수작업" in str(x) else "설비")
+    # 설비 공정은 설비분, 인력 공정은 인시분 필수
+    ok_eq = (work["제약유형"] == "설비") & (work["매당_설비분"] > 0)
+    ok_man = (work["제약유형"] == "인력") & (work["매당_인시분"] > 0)
+    work = work[(work["제품코드"] != "") & (work["공정"] != "") & (ok_eq | ok_man)]
     return work.reset_index(drop=True)
 
 
@@ -242,32 +298,76 @@ def running_qty(equip: pd.DataFrame, *, campus: str | None, area: str, equip_cod
     return float(work["대수"].sum()) if not work.empty else 0.0
 
 
+def running_manpower(
+    manpower: pd.DataFrame,
+    *,
+    campus: str | None,
+    area: str,
+) -> tuple[float, float]:
+    """(인원 합, 인원가중 평균 가용분)."""
+    if manpower is None or manpower.empty:
+        return 0.0, float(DAY_MINUTES)
+    work = manpower[manpower["가동"]].copy()
+    if campus:
+        work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
+    work = work[work["공정"] == area]
+    if work.empty:
+        return 0.0, float(DAY_MINUTES)
+    people = float(work["인원"].sum())
+    avail = float((work["인원"] * work["가용분"]).sum() / people) if people else float(DAY_MINUTES)
+    return people, avail
+
+
 def daily_capacity(
     products: pd.DataFrame,
     equip: pd.DataFrame,
     *,
     campus: str | None = None,
     day_minutes: float = DAY_MINUTES,
+    manpower: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """제품×공정 일 1440분 기준 가능 매수."""
+    """제품×공정 일 능력. 설비 공정=대수×분÷설비택트, 인력 공정=인원×가용분÷인시택트."""
     if products.empty:
         return pd.DataFrame()
+    man = manpower if manpower is not None else pd.DataFrame()
     rows = []
     for _, r in products.iterrows():
-        qty = running_qty(equip, campus=campus, area=str(r["공정"]), equip_code=str(r.get("설비코드") or ""))
-        tact = float(r["매당_설비분"])
-        sheets = round(qty * day_minutes / tact, 1) if tact > 0 else 0.0
-        people = qty * float(r["필요인원"])
+        kind = str(r.get("제약유형") or "설비")
+        eq_qty = running_qty(
+            equip, campus=campus, area=str(r["공정"]), equip_code=str(r.get("설비코드") or "")
+        )
+        man_qty, man_avail = running_manpower(man, campus=campus, area=str(r["공정"]))
+        eq_tact = float(r["매당_설비분"])
+        man_tact = float(r["매당_인시분"]) or eq_tact
+
+        if kind == "인력" or (eq_qty <= 0 and man_qty > 0 and man_tact > 0):
+            resource = man_qty
+            minutes = man_avail if man_avail else day_minutes
+            tact = man_tact
+            mode = "인력"
+            sheets = round(resource * minutes / tact, 1) if tact > 0 else 0.0
+            need_people = round(resource, 1)
+        else:
+            resource = eq_qty
+            minutes = day_minutes
+            tact = eq_tact if eq_tact > 0 else man_tact
+            mode = "설비"
+            sheets = round(resource * minutes / tact, 1) if tact > 0 else 0.0
+            need_people = round(resource * float(r["필요인원"]), 1)
+
         rows.append(
             {
                 "제품코드": r["제품코드"],
                 "제품명": r["제품명"],
                 "공정": r["공정"],
+                "제약유형": mode,
                 "설비코드": r.get("설비코드") or "",
-                "가동대수": qty,
-                "매당_설비분": tact,
-                "매당_인시분": float(r["매당_인시분"]),
-                "필요인원": round(people, 1),
+                "가동대수": eq_qty if mode == "설비" else 0,
+                "보유인원": man_qty if mode == "인력" else need_people,
+                "가용분": round(minutes, 1),
+                "매당_설비분": eq_tact,
+                "매당_인시분": man_tact,
+                "필요인원": need_people,
                 "일가능매수": sheets,
             }
         )
@@ -296,16 +396,15 @@ def mix_simulation(
     *,
     campus: str | None = None,
     day_minutes: float = DAY_MINUTES,
+    manpower: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """제품 비중(합=100)으로 설비 시간을 나눠 일 가능 매수를 계산."""
+    """제품 비중으로 설비·인력 가용분을 나눠 일 가능 매수를 계산."""
     if products.empty or mix is None or mix.empty:
         return pd.DataFrame()
     work = mix.copy()
-    if "제품코드" not in work.columns:
+    if "제품코드" not in work.columns or "비중" not in work.columns:
         return pd.DataFrame()
-    share_col = "비중" if "비중" in work.columns else None
-    if share_col is None:
-        return pd.DataFrame()
+    man = manpower if manpower is not None else pd.DataFrame()
     work["비중"] = pd.to_numeric(work["비중"], errors="coerce").fillna(0)
     total = float(work["비중"].sum())
     if total <= 0:
@@ -313,25 +412,40 @@ def mix_simulation(
     work["비중"] = work["비중"] / total
     rows = []
     for area in AREAS:
-        qty = running_qty(equip, campus=campus, area=area)
-        minutes_total = qty * day_minutes
+        eq_qty = running_qty(equip, campus=campus, area=area)
+        man_qty, man_avail = running_manpower(man, campus=campus, area=area)
         for _, m in work.iterrows():
             code = _norm(m["제품코드"])
             spec = products[(products["제품코드"] == code) & (products["공정"] == area)]
             if spec.empty:
                 continue
-            tact = float(spec.iloc[0]["매당_설비분"])
+            row = spec.iloc[0]
+            kind = str(row.get("제약유형") or "설비")
+            eq_tact = float(row["매당_설비분"])
+            man_tact = float(row["매당_인시분"]) or eq_tact
+            use_man = kind == "인력" or (eq_qty <= 0 and man_qty > 0 and man_tact > 0)
+            if use_man:
+                minutes_total = man_qty * (man_avail or day_minutes)
+                tact = man_tact
+                mode = "인력"
+                resource = man_qty
+            else:
+                minutes_total = eq_qty * day_minutes
+                tact = eq_tact if eq_tact > 0 else man_tact
+                mode = "설비"
+                resource = eq_qty
             mins = minutes_total * float(m["비중"])
             sheets = round(mins / tact, 1) if tact > 0 else 0.0
             rows.append(
                 {
                     "제품코드": code,
-                    "제품명": spec.iloc[0]["제품명"],
+                    "제품명": row["제품명"],
                     "공정": area,
+                    "제약유형": mode,
                     "배분분": round(mins, 1),
-                    "매당_설비분": tact,
+                    "매당분": tact,
                     "일가능매수": sheets,
-                    "가동대수": qty,
+                    "자원수": resource,
                 }
             )
     return pd.DataFrame(rows)
