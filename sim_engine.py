@@ -9,6 +9,8 @@ import pandas as pd
 from stats_engine import AREAS
 
 DAY_MINUTES = 1440
+MASTER_STEMS = ("설비_기준정보", "제품_기준정보", "제품별_실적")
+MASTER_GH_FOLDERS = ("templates", "data/master", "data")
 
 EQUIP_COLUMNS = ("캠퍼스", "공정", "설비코드", "설비명", "대수", "가동여부", "비고")
 PRODUCT_COLUMNS = (
@@ -360,11 +362,18 @@ def utilization_from_actuals(
     available_min: float = DAY_MINUTES,
 ) -> pd.DataFrame:
     """실적 × 매당인시분 / (인력 × 가용분) × 100."""
-    if actuals.empty or standards.empty or "영역" not in actuals.columns:
+    if actuals.empty:
         return pd.DataFrame()
     work = actuals.copy()
-    std = standards.rename(columns={"공정": "영역"})
-    work = work.merge(std[["영역", "매당_인시분"]], on="영역", how="left")
+    if "영역" not in work.columns and "공정" in work.columns:
+        work = work.rename(columns={"공정": "영역"})
+    if "영역" not in work.columns:
+        return pd.DataFrame()
+    if "매당_인시분" not in work.columns:
+        if standards is None or standards.empty:
+            return pd.DataFrame()
+        std = standards.rename(columns={"공정": "영역"})
+        work = work.merge(std[["영역", "매당_인시분"]], on="영역", how="left")
     work = work[work["매당_인시분"].notna() & (work["매당_인시분"] > 0)]
     if work.empty:
         return pd.DataFrame()
@@ -390,6 +399,7 @@ def utilization_from_actuals(
             "캠퍼스",
             "조",
             "주야",
+            "제품코드",
             "영역",
             "인력",
             "실적",
@@ -422,6 +432,24 @@ def read_csv_table(path: Path) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def master_github_paths(stem: str) -> list[str]:
+    """저장소에서 찾을 기준정보 경로. 파일명은 설비_기준정보 / 제품_기준정보 / 제품별_실적."""
+    paths: list[str] = []
+    for folder in MASTER_GH_FOLDERS:
+        for ext in (".xlsx", ".csv", ".xls"):
+            paths.append(f"{folder}/{stem}{ext}")
+    for ext in (".xlsx", ".csv", ".xls"):
+        paths.append(f"{stem}{ext}")
+    return paths
+
+
+def canonical_master_name(filename: str, prefix: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix not in (".csv", ".xlsx", ".xls"):
+        suffix = ".csv"
+    return f"{prefix}{suffix}"
+
+
 def newest_matching(folder: Path, prefix: str) -> Path | None:
     files = (
         list(folder.glob(f"{prefix}*.csv"))
@@ -431,3 +459,29 @@ def newest_matching(folder: Path, prefix: str) -> Path | None:
     files = [p for p in files if not p.name.startswith("~$")]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
+
+
+def normalize_product_actuals(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(PRODUCT_ACTUAL_COLUMNS))
+    work = _rename_by_alias(
+        df.dropna(how="all").copy(),
+        {
+            "일자": ("일자", "날짜", "date"),
+            "캠퍼스": ("캠퍼스", "campus"),
+            "조": ("조", "team"),
+            "주야": ("주야", "shift"),
+            "제품코드": ("제품코드", "품번"),
+            "공정": ("공정", "영역"),
+            "인력": ("인력", "인원"),
+            "실적": ("실적", "수량", "매수"),
+        },
+    )
+    for c in PRODUCT_ACTUAL_COLUMNS:
+        if c not in work.columns:
+            work[c] = None
+    work["제품코드"] = work["제품코드"].map(_norm)
+    work["공정"] = work["공정"].map(_norm)
+    work["인력"] = work["인력"].map(lambda v: _num(v, 0))
+    work["실적"] = work["실적"].map(lambda v: _num(v, 0))
+    return work[(work["제품코드"] != "") & (work["공정"] != "")].reset_index(drop=True)
