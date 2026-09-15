@@ -111,6 +111,28 @@ def _save_upload(uploaded, prefix: str):
     return dest, gh
 
 
+def _active_master_files() -> list[dict[str, str]]:
+    """지금 운영에 쓰는 기준정보 파일 목록."""
+    folder = master_dir()
+    rows: list[dict[str, str]] = []
+    for label, stem in (
+        ("설비", "설비_기준정보"),
+        ("인력", "인력_기준정보"),
+        ("제품", "제품_기준정보"),
+        ("제품별 실적", "제품별_실적"),
+    ):
+        path = newest_matching(folder, stem)
+        if path is None:
+            rows.append({"구분": label, "파일": "(없음)", "상태": "미등록"})
+            continue
+        try:
+            mtime = pd.Timestamp(path.stat().st_mtime, unit="s").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            mtime = "-"
+        rows.append({"구분": label, "파일": path.name, "상태": f"운영중 · {mtime}"})
+    return rows
+
+
 def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
     folder = master_dir()
     notes: list[str] = []
@@ -218,6 +240,9 @@ def render() -> None:
             "파일명: 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx). "
             "외관 등 수작업은 인력_기준정보에 인원을 넣으세요."
         )
+        st.markdown("**지금 운영 중**")
+        active_df = pd.DataFrame(_active_master_files())
+        st.dataframe(active_df, use_container_width=True, hide_index=True)
         eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
         man_up = st.file_uploader("② 인력_기준정보 (외관 등)", type=["csv", "xlsx"], key="sim_up_man")
         pr_up = st.file_uploader("③ 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
