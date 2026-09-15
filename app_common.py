@@ -112,13 +112,21 @@ def data_dir() -> Path:
     return _DATA_DIR
 
 
+_PROTECTED_DATA_NAMES = {"users.json", "README.txt"}
+_MASTER_NAME_PREFIXES = ("설비_기준정보", "인력_기준정보", "제품_기준정보", "제품별_실적")
+
+
+def _is_master_filename(name: str) -> bool:
+    return str(name).startswith(_MASTER_NAME_PREFIXES)
+
+
 def default_files() -> list[Path]:
     files = (
         sorted(_DATA_DIR.glob("*.xlsx"))
         + sorted(_DATA_DIR.glob("*.xls"))
         + sorted(_DATA_DIR.glob("*.csv"))
     )
-    return [p for p in files if not p.name.startswith("~$")]
+    return [p for p in files if not p.name.startswith("~$") and not _is_master_filename(p.name)]
 
 
 def newest_data_names() -> list[str]:
@@ -136,9 +144,6 @@ def select_analysis_files(names: list[str]) -> None:
     for key in list(st.session_state.keys()):
         if "file_select" in str(key):
             st.session_state.pop(key, None)
-
-
-_PROTECTED_DATA_NAMES = {"users.json", "README.txt"}
 
 
 def _upload_nonce() -> int:
