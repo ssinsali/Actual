@@ -13,20 +13,26 @@ from app_common import (
     render_slicer,
     team_stack_order,
 )
-from auth import render_logout_controls
+from pathlib import Path
+
+from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
 from stats_engine import AREAS, SHIFTS, add_calendar_parts
 from sim_engine import (
     DAY_MINUTES,
     EQUIP_COLUMNS,
+    MASTER_STEMS,
     PRODUCT_COLUMNS,
+    canonical_master_name,
     csv_bytes,
     daily_capacity,
     empty_csv_bytes,
     empty_xlsx_bytes,
     equipment_template,
+    master_github_paths,
     mix_simulation,
     newest_matching,
     normalize_equipment,
+    normalize_product_actuals,
     normalize_products,
     process_standard_times,
     product_actual_template,
@@ -43,33 +49,87 @@ def master_dir():
     return folder
 
 
+def _push_master_github(filename: str, content: bytes) -> str:
+    if not github_store_enabled():
+        return ""
+    rel = f"templates/{filename}"
+    try:
+        _, sha = github_file_get(rel)
+        github_file_put(rel, content, f"chore: update {filename}", sha)
+        return f"GitHub 반영: {rel}"
+    except Exception as e:
+        return f"GitHub 저장 실패: {e}"
+
+
+def _sync_master_from_github(*, force: bool = False) -> list[str]:
+    if not github_store_enabled():
+        return ["GitHub Secrets가 없어 로컬/업로드 파일만 사용합니다."]
+    if not force and st.session_state.get("sim_gh_master_ok"):
+        return list(st.session_state.get("sim_gh_master_notes") or [])
+    notes: list[str] = []
+    folder = master_dir()
+    for stem in MASTER_STEMS:
+        found_rel = None
+        found_raw = None
+        for rel in master_github_paths(stem):
+            try:
+                raw, _sha = github_file_get(rel)
+            except Exception as e:
+                if "404" in str(e):
+                    continue
+                notes.append(f"{stem}: GitHub 오류 ({e})")
+                found_rel = "__error__"
+                break
+            if raw:
+                found_rel, found_raw = rel, raw
+                break
+        if found_rel == "__error__":
+            continue
+        if found_rel and found_raw:
+            dest = folder / Path(found_rel).name
+            if not dest.name.startswith(stem):
+                dest = folder / f"{stem}{Path(found_rel).suffix}"
+            dest.write_bytes(found_raw)
+            notes.append(f"GitHub에서 가져옴: {found_rel}")
+        else:
+            notes.append(f"{stem}: 저장소에 없음 (templates/{stem}.csv 또는 .xlsx)")
+    st.session_state["sim_gh_master_ok"] = True
+    st.session_state["sim_gh_master_notes"] = notes
+    return notes
+
+
 def _save_upload(uploaded, prefix: str):
-    name = uploaded.name
-    if not str(name).startswith(prefix):
-        name = f"{prefix}_{name}"
+    name = canonical_master_name(uploaded.name, prefix)
     dest = master_dir() / name
-    dest.write_bytes(uploaded.getvalue())
-    return dest
+    data = uploaded.getvalue()
+    dest.write_bytes(data)
+    gh = _push_master_github(name, data)
+    return dest, gh
 
 
-def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
     folder = master_dir()
     notes: list[str] = []
     eq_path = newest_matching(folder, "설비_기준정보")
     pr_path = newest_matching(folder, "제품_기준정보")
+    act_path = newest_matching(folder, "제품별_실적")
     equip = pd.DataFrame()
     products = pd.DataFrame()
+    actuals = pd.DataFrame()
     if eq_path:
         equip = normalize_equipment(read_csv_table(eq_path))
         notes.append(f"설비: {eq_path.name} ({len(equip)}행)")
     else:
-        notes.append("설비 기준정보가 없습니다. 양식을 받아 업로드하세요.")
+        notes.append("설비 기준정보가 없습니다. GitHub templates/ 또는 업로드하세요.")
     if pr_path:
         products = normalize_products(read_csv_table(pr_path))
         notes.append(f"제품: {pr_path.name} ({len(products)}행)")
     else:
-        notes.append("제품 기준정보가 없습니다. 양식을 받아 업로드하세요.")
-    return equip, products, notes
+        notes.append("제품 기준정보가 없습니다. GitHub templates/ 또는 업로드하세요.")
+    if act_path:
+        actuals = normalize_product_actuals(read_csv_table(act_path))
+        notes.append(f"제품별 실적: {act_path.name} ({len(actuals)}행)")
+    return equip, products, actuals, notes
 
 
 def render() -> None:
@@ -77,11 +137,13 @@ def render() -> None:
     st.caption(
         "보유 설비와 제품 기준정보로 하루 1440분 동안 몇 매를 할 수 있는지 보고, "
         "실적과 비교해 인당 시간을 얼마나 썼는지 계산합니다. "
-        "기준정보는 CSV로 올리면 바로 반영됩니다."
+        "GitHub `templates/` 폴더에 설비_기준정보 / 제품_기준정보 / 제품별_실적 "
+        "(csv 또는 xlsx)을 올리면 자동으로 가져옵니다."
     )
 
     records, rec_notes, _chosen = load_records()
-    equip, products, master_notes = _load_master()
+    gh_notes = _sync_master_from_github()
+    equip, products, product_actuals, master_notes = _load_master()
 
     campus_sel: list[str] = []
     shift_sel: list[str] = []
@@ -133,6 +195,10 @@ def render() -> None:
                 help="이론 능력은 설비×1440분. 활용률은 인력×이 값으로 나눕니다. 24시간 기준이면 1440.",
             )
         )
+        if github_store_enabled():
+            if st.button("GitHub에서 기준정보 다시 가져오기", use_container_width=True, key="sim_gh_refresh"):
+                st.session_state["sim_gh_master_ok"] = False
+                st.rerun()
 
         st.divider()
         st.header("기준정보 양식")
@@ -210,21 +276,33 @@ def render() -> None:
                 use_container_width=True,
                 key="sim_dl_act",
             )
-        eq_up = st.file_uploader("설비 기준정보 업로드", type=["csv", "xlsx"], key="sim_up_eq")
-        pr_up = st.file_uploader("제품 기준정보 업로드", type=["csv", "xlsx"], key="sim_up_pr")
+        eq_up = st.file_uploader("설비_기준정보 업로드", type=["csv", "xlsx"], key="sim_up_eq")
+        pr_up = st.file_uploader("제품_기준정보 업로드", type=["csv", "xlsx"], key="sim_up_pr")
+        act_up = st.file_uploader("제품별_실적 업로드 (선택)", type=["csv", "xlsx"], key="sim_up_act")
         eq_sig = (eq_up.name, int(getattr(eq_up, "size", 0) or 0)) if eq_up else None
         pr_sig = (pr_up.name, int(getattr(pr_up, "size", 0) or 0)) if pr_up else None
+        act_sig = (act_up.name, int(getattr(act_up, "size", 0) or 0)) if act_up else None
         if eq_up is not None and eq_sig != st.session_state.get("sim_eq_sig"):
-            path = _save_upload(eq_up, "설비_기준정보")
+            path, gh = _save_upload(eq_up, "설비_기준정보")
             st.session_state["sim_eq_sig"] = eq_sig
-            st.success(f"저장: {path.name}")
+            st.session_state["sim_gh_master_ok"] = False
+            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
             st.rerun()
         if pr_up is not None and pr_sig != st.session_state.get("sim_pr_sig"):
-            path = _save_upload(pr_up, "제품_기준정보")
+            path, gh = _save_upload(pr_up, "제품_기준정보")
             st.session_state["sim_pr_sig"] = pr_sig
-            st.success(f"저장: {path.name}")
+            st.session_state["sim_gh_master_ok"] = False
+            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
+            st.rerun()
+        if act_up is not None and act_sig != st.session_state.get("sim_act_sig"):
+            path, gh = _save_upload(act_up, "제품별_실적")
+            st.session_state["sim_act_sig"] = act_sig
+            st.session_state["sim_gh_master_ok"] = False
+            st.success(f"저장: {path.name}" + (f" · {gh}" if gh else ""))
             st.rerun()
 
+    for n in gh_notes:
+        st.caption("· " + n)
     for n in master_notes:
         st.caption("· " + n)
 
@@ -256,6 +334,11 @@ def render() -> None:
             st.info("제품 기준정보를 업로드하세요.")
         else:
             st.dataframe(pr_view, use_container_width=True)
+        st.markdown("**제품별 실적** — 있으면 활용률을 제품 택트 기준으로 계산합니다.")
+        if product_actuals.empty:
+            st.caption("없으면 기존 공정 실적 파일로 계산합니다.")
+        else:
+            st.dataframe(product_actuals, use_container_width=True)
 
     with tab_sim:
         st.subheader("하루 1440분 능력")
@@ -334,9 +417,29 @@ def render() -> None:
             f"인당시간활용률(%) = (실적 × 매당_인시분) ÷ (인력 × {available_min:g}분) × 100. "
             "100%면 기준 택트만큼 시간을 다 쓴 것이고, 낮으면 여유·대기·다른 일이 있는 쪽으로 봅니다."
         )
-        if records.empty:
-            st.info("실적 CSV/엑셀을 홈 화면 데이터에서 올린 뒤 이 탭을 보면 됩니다.")
+        util = pd.DataFrame()
+        pa = product_actuals.copy()
+        if not pa.empty:
+            if campus_sel and "캠퍼스" in pa.columns:
+                pa = pa[pa["캠퍼스"].isin(campus_sel) | (pa["캠퍼스"].fillna("") == "")]
+            if area_sel and "공정" in pa.columns:
+                pa = pa[pa["공정"].isin(area_sel)]
+            if team_sel and "조" in pa.columns:
+                pa = pa[pa["조"].isin(team_sel)]
+            if shift_sel and "주야" in pa.columns:
+                pa = pa[pa["주야"].isin(shift_sel)]
+            if product_sel and "제품코드" in pa.columns:
+                pa = pa[pa["제품코드"].isin(product_sel)]
+        if not pa.empty and not pr_view.empty:
+            tact = pr_view[["제품코드", "공정", "매당_인시분"]].drop_duplicates()
+            merged = pa.merge(tact, on=["제품코드", "공정"], how="left")
+            util = utilization_from_actuals(merged, pd.DataFrame(), available_min=available_min)
+            st.caption("제품별_실적 파일과 제품 택트로 계산합니다.")
+        elif records.empty:
+            util = pd.DataFrame()
+            st.info("제품별_실적 또는 홈 화면 실적 파일이 있어야 활용률을 봅니다.")
         elif pr_view.empty:
+            util = pd.DataFrame()
             st.warning("제품 기준정보의 매당_인시분이 있어야 활용률을 계산합니다.")
         else:
             filtered = apply_basic_filters(
@@ -348,61 +451,61 @@ def render() -> None:
                 mode="전체",
             )
             if filtered.empty:
+                util = pd.DataFrame()
                 st.warning("선택 조건에 해당하는 실적이 없습니다.")
             else:
                 std = process_standard_times(pr_view, product_sel or None)
                 util = utilization_from_actuals(filtered, std, available_min=available_min)
-                if util.empty:
-                    st.warning("실적 공정과 제품 기준정보의 공정이 맞지 않습니다.")
-                else:
-                    avg_u = float(pd.to_numeric(util["인당시간활용률"], errors="coerce").mean())
-                    c1, c2, c3 = st.columns(3)
-                    with c1:
-                        st.metric("평균 인당시간활용률", f"{avg_u:.1f}%")
-                    with c2:
-                        st.metric("실적 합", f"{pd.to_numeric(util['실적'], errors='coerce').sum():,.0f}매")
-                    with c3:
-                        st.metric("인력 합(행)", f"{pd.to_numeric(util['인력'], errors='coerce').sum():,.0f}명")
-                    st.dataframe(util, use_container_width=True)
-                    by_area = (
-                        util.groupby("공정", as_index=False)
-                        .agg(인당시간활용률=("인당시간활용률", "mean"), 실적=("실적", "sum"), 인력=("인력", "sum"))
-                        .round(1)
+                st.caption("공정 실적 파일과 제품 평균 택트로 계산합니다.")
+        if not pa.empty and not pr_view.empty and util.empty:
+            st.warning("제품별 실적과 기준정보의 제품코드·공정이 맞지 않습니다.")
+        elif not util.empty:
+            avg_u = float(pd.to_numeric(util["인당시간활용률"], errors="coerce").mean())
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("평균 인당시간활용률", f"{avg_u:.1f}%")
+            with c2:
+                st.metric("실적 합", f"{pd.to_numeric(util['실적'], errors='coerce').sum():,.0f}매")
+            with c3:
+                st.metric("인력 합(행)", f"{pd.to_numeric(util['인력'], errors='coerce').sum():,.0f}명")
+            st.dataframe(util, use_container_width=True)
+            by_area = (
+                util.groupby("공정", as_index=False)
+                .agg(인당시간활용률=("인당시간활용률", "mean"), 실적=("실적", "sum"), 인력=("인력", "sum"))
+                .round(1)
+            )
+            st.altair_chart(
+                alt.Chart(by_area)
+                .mark_bar()
+                .encode(
+                    x=alt.X("공정:N", sort=list(AREAS), title="공정"),
+                    y=alt.Y("인당시간활용률:Q", title="평균 활용률 %"),
+                    tooltip=list(by_area.columns),
+                )
+                .properties(height=300, title="공정별 평균 인당 시간 활용률"),
+                use_container_width=True,
+            )
+            if "조" in util.columns:
+                teams_all = team_stack_order(sorted(util["조"].dropna().unique().tolist()))
+                by_team = util.groupby("조", as_index=False)["인당시간활용률"].mean().round(1)
+                st.altair_chart(
+                    alt.Chart(by_team)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("조:N", sort=teams_all),
+                        y=alt.Y("인당시간활용률:Q", title="평균 활용률 %"),
+                        tooltip=["조", "인당시간활용률"],
                     )
-                    st.altair_chart(
-                        alt.Chart(by_area)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("공정:N", sort=list(AREAS), title="공정"),
-                            y=alt.Y("인당시간활용률:Q", title="평균 활용률 %"),
-                            tooltip=list(by_area.columns),
-                        )
-                        .properties(height=300, title="공정별 평균 인당 시간 활용률"),
-                        use_container_width=True,
-                    )
-                    if "조" in util.columns:
-                        teams_all = team_stack_order(sorted(util["조"].dropna().unique().tolist()))
-                        by_team = (
-                            util.groupby("조", as_index=False)["인당시간활용률"].mean().round(1)
-                        )
-                        st.altair_chart(
-                            alt.Chart(by_team)
-                            .mark_bar()
-                            .encode(
-                                x=alt.X("조:N", sort=teams_all),
-                                y=alt.Y("인당시간활용률:Q", title="평균 활용률 %"),
-                                tooltip=["조", "인당시간활용률"],
-                            )
-                            .properties(height=280, title="조별 평균 인당 시간 활용률"),
-                            use_container_width=True,
-                        )
-                    st.download_button(
-                        "활용률 계산 CSV",
-                        data=util.to_csv(index=False).encode("utf-8-sig"),
-                        file_name="인당시간활용률.csv",
-                        mime="text/csv",
-                        key="sim_dl_util",
-                    )
+                    .properties(height=280, title="조별 평균 인당 시간 활용률"),
+                    use_container_width=True,
+                )
+            st.download_button(
+                "활용률 계산 CSV",
+                data=util.to_csv(index=False).encode("utf-8-sig"),
+                file_name="인당시간활용률.csv",
+                mime="text/csv",
+                key="sim_dl_util",
+            )
 
         with st.expander("로드된 실적 파일", expanded=False):
             for n in rec_notes:
