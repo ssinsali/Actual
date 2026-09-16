@@ -33,6 +33,7 @@ PRODUCT_COLUMNS = (
 )
 PRODUCT_ACTUAL_COLUMNS = ("일자", "캠퍼스", "조", "주야", "제품코드", "공정", "인력", "실적")
 DEFAULT_MONTHLY_TARGETS = (("CEL", 700.0), ("Ring", 15000.0), ("Wafer", 3000.0))
+PLAN_PRODUCT_FAMILIES = tuple(k for k, _ in DEFAULT_MONTHLY_TARGETS)
 DEFAULT_WORK_DAYS = 20
 MONTHLY_PLAN_COLUMNS = ("제품코드", "월목표매수")
 
@@ -886,6 +887,43 @@ def normalize_monthly_plan(df: pd.DataFrame) -> pd.DataFrame:
     work["월목표매수"] = pd.to_numeric(work["월목표매수"], errors="coerce").fillna(0)
     work = work[(work["제품코드"] != "") & (work["월목표매수"] > 0)]
     return work.drop_duplicates("제품코드", keep="last").reset_index(drop=True)
+
+
+def monthly_plan_family_stats(
+    plan: pd.DataFrame,
+    products: pd.DataFrame,
+) -> pd.DataFrame:
+    """업로드 월 계획 — 합계·CEL·Ring·Wafer별 품목 수·월목표 합계."""
+    empty = pd.DataFrame(columns=["구분", "계획품목수", "월목표합계"])
+    work = normalize_monthly_plan(plan)
+    if work.empty:
+        return empty
+
+    fam_map: dict[str, str] = {}
+    if not products.empty and "제품코드" in products.columns:
+        pc = products[["제품코드", "제품군"]].drop_duplicates("제품코드")
+        fam_map = {
+            _norm(c): _infer_product_family(g)
+            for c, g in zip(pc["제품코드"], pc["제품군"])
+            if _norm(c)
+        }
+
+    tagged = work.copy()
+    tagged["제품군"] = tagged["제품코드"].map(
+        lambda c: fam_map.get(_norm(c), _infer_product_family(c))
+    )
+
+    def _row(label: str, sub: pd.DataFrame) -> dict[str, Any]:
+        return {
+            "구분": label,
+            "계획품목수": int(len(sub)),
+            "월목표합계": float(sub["월목표매수"].sum()) if not sub.empty else 0.0,
+        }
+
+    rows = [_row("합계", tagged)]
+    for fam in PLAN_PRODUCT_FAMILIES:
+        rows.append(_row(fam, tagged[tagged["제품군"] == fam]))
+    return pd.DataFrame(rows)
 
 
 def _product_process_spec(products: pd.DataFrame, code: str, area: str) -> dict[str, Any] | None:
