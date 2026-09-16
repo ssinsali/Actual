@@ -999,13 +999,13 @@ def monthly_plan_daily_avg(
     shift_teams: int = DEFAULT_SHIFT_TEAMS,
     working_teams: int = DEFAULT_WORKING_TEAMS,
 ) -> dict[str, float]:
-    """일평균 매수 — 치수 CEL · 치수 Ring · 외관.
+    """일평균 매수 — 치수 CEL · 치수 Ring · Hole · 외관.
 
     campus가 있으면 공정 자원 비중(설비/인력)으로 Total 일평균을 배분.
     """
     days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
     tagged = _tagged_monthly_plan(plan, products)
-    zero = {"치수_CEL": 0.0, "치수_Ring": 0.0, "외관": 0.0}
+    zero = {"치수_CEL": 0.0, "치수_Ring": 0.0, "Hole": 0.0, "외관": 0.0}
     if tagged.empty:
         return zero
 
@@ -1015,6 +1015,7 @@ def monthly_plan_daily_avg(
     out = {
         "치수_CEL": round(cel / days, 1),
         "치수_Ring": round(ring / days, 1),
+        "Hole": round(total / days, 1),
         "외관": round(total / days, 1),
     }
     if not campus:
@@ -1022,6 +1023,14 @@ def monthly_plan_daily_avg(
 
     dim_share = _campus_resource_share(
         area="치수",
+        campus=campus,
+        equip=equip,
+        manpower=manpower,
+        shift_teams=shift_teams,
+        working_teams=working_teams,
+    )
+    hole_share = _campus_resource_share(
+        area="Hole",
         campus=campus,
         equip=equip,
         manpower=manpower,
@@ -1039,6 +1048,7 @@ def monthly_plan_daily_avg(
     return {
         "치수_CEL": round(out["치수_CEL"] * dim_share, 1),
         "치수_Ring": round(out["치수_Ring"] * dim_share, 1),
+        "Hole": round(out["Hole"] * hole_share, 1),
         "외관": round(out["외관"] * app_share, 1),
     }
 
