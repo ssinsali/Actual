@@ -15,6 +15,8 @@ from app_common import (
 )
 from pathlib import Path
 
+from io import BytesIO
+
 from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
 from stats_engine import AREAS, SHIFTS, add_calendar_parts
 from sim_engine import (
@@ -25,21 +27,23 @@ from sim_engine import (
     EQUIP_COLUMNS,
     MANPOWER_COLUMNS,
     MASTER_STEMS,
+    MONTHLY_PLAN_COLUMNS,
     PRODUCT_ACTUAL_COLUMNS,
     PRODUCT_COLUMNS,
     canonical_master_name,
     csv_bytes,
-    daily_capacity,
-    default_monthly_targets,
+    daily_operation_plan,
     empty_csv_bytes,
     empty_xlsx_bytes,
     equipment_template,
     manpower_template,
     master_github_paths,
-    monthly_mix_feasibility,
+    monthly_plan_feasibility,
+    monthly_plan_template,
     newest_matching,
     normalize_equipment,
     normalize_manpower,
+    normalize_monthly_plan,
     normalize_product_actuals,
     normalize_products,
     process_standard_times,
@@ -51,83 +55,13 @@ from sim_engine import (
 )
 
 
-def _eq_running_count(equip: pd.DataFrame, campus: str | None = None) -> int:
-    if equip is None or equip.empty or "대수" not in equip.columns:
-        return 0
-    work = equip.copy()
-    if "가동" in work.columns:
-        work = work[work["가동"]]
-    if campus:
-        work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
-    return int(float(work["대수"].sum())) if not work.empty else 0
-
-
-SUMMARY_PROCESS_AREAS = ("치수", "Hole", "외관")
-
-
-def _process_sheets(cap_df: pd.DataFrame, area: str) -> float:
-    if cap_df is None or cap_df.empty or "일가능매수" not in cap_df.columns:
-        return 0.0
-    hit = cap_df[cap_df["공정"] == area]
-    return float(hit["일가능매수"].sum()) if not hit.empty else 0.0
-
-
-def _render_summary_row(
-    campus_scopes: list[tuple[str, str | None]],
-    caps: dict[str, pd.DataFrame],
-    eq_view: pd.DataFrame,
-) -> None:
-    """Total / 천안 / 아산 요약 — Streamlit metric으로 테마 대비 보장."""
-    cols = st.columns(len(campus_scopes), gap="medium")
-    for col, (label, camp) in zip(cols, campus_scopes):
-        cdf = caps.get(label, pd.DataFrame())
-        eq_n = _eq_running_count(eq_view, camp)
-        prod_n = int(cdf["제품코드"].nunique()) if not cdf.empty and "제품코드" in cdf.columns else 0
-        with col:
-            st.markdown(f"### {label}")
-            top = st.columns(2)
-            with top[0]:
-                st.metric("가동 대수", f"{eq_n}대")
-            with top[1]:
-                st.metric("제품 수", f"{prod_n}종")
-            proc_cols = st.columns(len(SUMMARY_PROCESS_AREAS))
-            for pc, area in zip(proc_cols, SUMMARY_PROCESS_AREAS):
-                sheets = _process_sheets(cdf, area)
-                with pc:
-                    st.metric(area, f"{sheets:,.0f}", help="일가능매수")
-            # 값이 바뀌면 위젯이 확실히 갱신되도록 데이터 지문
-            st.caption(
-                f"반영: 대수 {eq_n} · "
-                + " · ".join(f"{a} {_process_sheets(cdf, a):,.0f}" for a in SUMMARY_PROCESS_AREAS)
-            )
-
-
-def _capacity_bar_chart(df: pd.DataFrame, title: str):
-    """공정×제품 일가능매수 막대 + 상단 수치."""
-    if df is None or df.empty or "일가능매수" not in df.columns:
-        return None
-    chart_df = (
-        df.groupby(["제품코드", "제품명", "공정"], as_index=False)["일가능매수"]
-        .sum()
-    )
-    chart_df["라벨"] = chart_df["일가능매수"].map(lambda v: f"{v:,.0f}")
-    y_max = float(chart_df["일가능매수"].max() or 0) * 1.15
-    if y_max <= 0:
-        y_max = 1.0
-    base = alt.Chart(chart_df).encode(
-        x=alt.X("공정:N", title="공정", sort=list(AREAS)),
-        xOffset=alt.XOffset("제품코드:N"),
-        color=alt.Color("제품코드:N", title="제품"),
-    )
-    bars = base.mark_bar().encode(
-        y=alt.Y("일가능매수:Q", title="일가능매수", scale=alt.Scale(domain=[0, y_max])),
-        tooltip=["제품코드", "제품명", "공정", "일가능매수"],
-    )
-    texts = base.mark_text(dy=-8, fontSize=11).encode(
-        y=alt.Y("일가능매수:Q", scale=alt.Scale(domain=[0, y_max])),
-        text=alt.Text("라벨:N"),
-    )
-    return (bars + texts).properties(height=320, title=title)
+def _read_plan_csv(raw: bytes) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return pd.read_csv(BytesIO(raw), encoding=enc).dropna(how="all")
+        except UnicodeDecodeError:
+            continue
+    return pd.DataFrame()
 
 
 def master_dir():
@@ -633,11 +567,9 @@ def render() -> None:
             st.dataframe(product_actuals, use_container_width=True)
 
     with tab_sim:
-        st.subheader("하루 능력 (설비·인력)")
+        st.subheader("월 생산 계획")
         st.caption(
-            "설비: 설비별 일가능매수. "
-            "총인원·근무인원은 **캠퍼스+공정 단위**(설비코드별 배분 없음)라서 "
-            "같은 공정의 두 번째 설비부터는 비워 둡니다(합산하면 안 됨). "
+            "**제품코드 + 월목표매수** CSV를 업로드하면 일목표·공정별 시간 배분·하루 운영안·달성 여부를 계산합니다. "
             f"근무인원 = 총인원 × ({working_teams}/{shift_teams})."
         )
 
@@ -646,7 +578,6 @@ def render() -> None:
             if campus_sel and c not in campus_sel:
                 continue
             campus_scopes.append((c, c))
-        # 사이드바에 없는 캠퍼스도 데이터에 있으면 추가
         extra = []
         if not eq_view.empty and "캠퍼스" in eq_view.columns:
             extra.extend(eq_view["캠퍼스"].dropna().unique().tolist())
@@ -658,48 +589,9 @@ def render() -> None:
                     continue
                 campus_scopes.append((c, c))
 
-        caps: dict[str, pd.DataFrame] = {}
-        for label, camp in campus_scopes:
-            caps[label] = daily_capacity(
-                pr_view,
-                eq_view,
-                campus=camp,
-                manpower=man_view,
-                shift_teams=shift_teams,
-                working_teams=working_teams,
-            )
-
-        if all(df.empty for df in caps.values()):
-            st.warning("제품 기준정보와 설비 또는 인력 기준정보가 있어야 시뮬레이션할 수 있습니다.")
+        if pr_view.empty or (eq_view.empty and man_view.empty):
+            st.warning("제품·설비·인력 기준정보를 먼저 올려 주세요.")
         else:
-            st.markdown("##### 요약 (Total / 캠퍼스)")
-            _render_summary_row(campus_scopes, caps, eq_view)
-
-            cap = caps.get("Total")
-            if cap is None or cap.empty:
-                cap = next((df for df in caps.values() if not df.empty), pd.DataFrame())
-            show_cap = cap.drop(columns=["병목가능매수", "병목공정"], errors="ignore")
-            st.caption(
-                "표 안내: 치수에 DIM·HCAH처럼 설비가 여러 종이어도 "
-                "총인원/근무인원은 공정 공유 인원입니다. 첫 행에만 표시합니다."
-            )
-            st.dataframe(show_cap, use_container_width=True)
-
-            st.markdown("##### 공정별 일 가능 매수")
-            for label, _camp in campus_scopes:
-                cdf = caps[label]
-                chart = _capacity_bar_chart(cdf, f"{label} — 제품·공정별 일 가능 매수")
-                if chart is None:
-                    st.caption(f"{label}: 표시할 능력이 없습니다.")
-                else:
-                    st.altair_chart(chart, use_container_width=True)
-
-            st.markdown("##### 월 생산 믹스 (CEL / Ring / Wafer)")
-            st.caption(
-                "제품군(제품명)별 **월 목표 매수**를 넣으면, 현재 설비·인력을 목표 비중으로 나눠 "
-                "월·일 가능 매수와 달성 여부(OK/부족)를 봅니다. "
-                "택트는 해당 제품군 품목의 공정 평균값을 씁니다."
-            )
             work_days = int(
                 st.number_input(
                     "월 작업일수",
@@ -711,84 +603,141 @@ def render() -> None:
                     help="일목표 = 월목표 ÷ 작업일수",
                 )
             )
-            mix_default = default_monthly_targets(pr_view)
-            mix_edit = st.data_editor(
-                mix_default,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="dynamic",
-                key="sim_monthly_mix_editor",
-                column_config={
-                    "제품군": st.column_config.TextColumn("제품군 (CEL/Ring/Wafer)", required=True),
-                    "월목표매수": st.column_config.NumberColumn("월목표매수", min_value=0, step=100, format="%.0f"),
-                },
-            )
-            for label, camp in campus_scopes:
-                detail, summary = monthly_mix_feasibility(
-                    pr_view,
-                    eq_view,
-                    mix_edit,
-                    campus=camp,
-                    work_days=work_days,
-                    manpower=man_view,
-                    shift_teams=shift_teams,
-                    working_teams=working_teams,
+            plan_dl, plan_up = st.columns(2)
+            with plan_dl:
+                st.download_button(
+                    "월 생산계획 양식 CSV",
+                    data=csv_bytes(monthly_plan_template()),
+                    file_name="월_생산계획.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="sim_dl_plan_csv",
                 )
-                st.markdown(f"**월 믹스 · {label}**")
-                if summary.empty:
-                    st.caption(
-                        "제품군 이름과 제품 기준정보의 제품명/제품군이 맞는지 확인하세요. "
-                        "(예: 제품명이 CEL, Ring, Wafer)"
+            with plan_up:
+                plan_file = st.file_uploader(
+                    "월 생산계획 CSV 업로드",
+                    type=["csv"],
+                    key="sim_plan_upload",
+                    help="열: 제품코드, 월목표매수",
+                )
+            if plan_file is not None:
+                sig = (plan_file.name, int(getattr(plan_file, "size", 0) or 0))
+                if sig != st.session_state.get("sim_plan_sig"):
+                    try:
+                        uploaded = _read_plan_csv(plan_file.getvalue())
+                    except Exception:
+                        uploaded = pd.DataFrame()
+                    if uploaded.empty:
+                        st.error("CSV를 읽지 못했습니다. 인코딩·열 이름을 확인하세요.")
+                    else:
+                        st.session_state["sim_plan_upload_df"] = uploaded
+                        st.session_state["sim_plan_sig"] = sig
+                        st.session_state["sim_plan_fname"] = plan_file.name
+                        st.rerun()
+
+            plan_raw = st.session_state.get("sim_plan_upload_df")
+            plan_for_calc = normalize_monthly_plan(plan_raw) if plan_raw is not None else pd.DataFrame()
+
+            if plan_raw is None:
+                st.info("월 생산계획 CSV를 업로드하세요. (제품코드, 월목표매수)")
+            elif plan_for_calc.empty:
+                st.warning("유효한 행이 없습니다. 제품코드와 월목표매수(>0)를 확인하세요.")
+            else:
+                fname = st.session_state.get("sim_plan_fname", "업로드 파일")
+                st.caption(f"적용 중: **{fname}** · {len(plan_for_calc)}종")
+                st.dataframe(plan_for_calc, use_container_width=True, hide_index=True)
+                for label, camp in campus_scopes:
+                    detail, summary, missing = monthly_plan_feasibility(
+                        pr_view,
+                        eq_view,
+                        plan_for_calc,
+                        campus=camp,
+                        work_days=work_days,
+                        manpower=man_view,
+                        shift_teams=shift_teams,
+                        working_teams=working_teams,
                     )
-                    continue
-                ok_n = int((summary["달성"] == "OK").sum())
-                ng_n = int((summary["달성"] != "OK").sum())
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.metric("목표 제품군", f"{len(summary)}종")
-                with c2:
-                    st.metric("달성 OK", f"{ok_n}")
-                with c3:
-                    st.metric("부족", f"{ng_n}")
-                st.dataframe(summary, use_container_width=True, hide_index=True)
-                with st.expander(f"{label} · 공정별 상세", expanded=(label == "Total")):
-                    st.dataframe(detail, use_container_width=True, hide_index=True)
-                    chart_df = summary.melt(
-                        id_vars=["제품군"],
-                        value_vars=["월목표매수", "월가능매수"],
-                        var_name="구분",
-                        value_name="매수",
-                    )
-                    chart_df["구분"] = chart_df["구분"].map(
-                        {"월목표매수": "월목표", "월가능매수": "월가능"}
-                    )
-                    chart_df["라벨"] = chart_df["매수"].map(lambda v: f"{v:,.0f}")
-                    y_max = float(chart_df["매수"].max() or 0) * 1.15 or 1.0
-                    bars = (
-                        alt.Chart(chart_df)
-                        .mark_bar()
-                        .encode(
-                            x=alt.X("제품군:N", title="제품군"),
-                            xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
-                            y=alt.Y("매수:Q", title="매수/월", scale=alt.Scale(domain=[0, y_max])),
-                            color=alt.Color("구분:N", sort=["월목표", "월가능"]),
-                            tooltip=["제품군", "구분", "매수"],
+                    st.markdown(f"**생산 계획 · {label}**")
+                    if missing:
+                        st.warning(
+                            "제품 기준정보에 없는 코드: "
+                            + ", ".join(missing[:20])
+                            + (" …" if len(missing) > 20 else "")
                         )
-                    )
-                    texts = (
-                        alt.Chart(chart_df)
-                        .mark_text(dy=-8, fontSize=11)
-                        .encode(
-                            x=alt.X("제품군:N"),
-                            xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
-                            y=alt.Y("매수:Q", scale=alt.Scale(domain=[0, y_max])),
-                            text=alt.Text("라벨:N"),
+                    if summary.empty:
+                        st.caption("계획에 유효한 제품코드가 없습니다. 기준정보와 코드를 맞춰 주세요.")
+                        continue
+                    ok_n = int((summary["달성"] == "OK").sum())
+                    ng_n = int((summary["달성"] != "OK").sum())
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric("계획 품목", f"{len(summary)}종")
+                    with c2:
+                        st.metric("달성 OK", f"{ok_n}")
+                    with c3:
+                        st.metric("부족", f"{ng_n}")
+                    with c4:
+                        st.metric("작업일", f"{work_days}일")
+                    st.markdown("**월·일 목표 vs 가능**")
+                    show_sum = summary[
+                        [
+                            c
+                            for c in (
+                                "제품코드",
+                                "제품명",
+                                "월목표매수",
+                                "일목표매수",
+                                "월가능매수",
+                                "일가능매수",
+                                "병목공정",
+                                "달성",
+                                "부족매수",
+                            )
+                            if c in summary.columns
+                        ]
+                    ]
+                    st.dataframe(show_sum, use_container_width=True, hide_index=True)
+                    daily = daily_operation_plan(detail, summary)
+                    st.markdown("**하루 운영안 (공정별 시간·매수 배분)**")
+                    st.dataframe(daily, use_container_width=True, hide_index=True)
+                    with st.expander(f"{label} · 공정별 상세", expanded=False):
+                        st.dataframe(detail, use_container_width=True, hide_index=True)
+                        chart_df = summary.melt(
+                            id_vars=["제품코드"],
+                            value_vars=["월목표매수", "월가능매수"],
+                            var_name="구분",
+                            value_name="매수",
                         )
-                    )
-                    st.altair_chart(
-                        (bars + texts).properties(height=280, title=f"{label} — 월목표 vs 월가능"),
-                        use_container_width=True,
-                    )
+                        chart_df["구분"] = chart_df["구분"].map(
+                            {"월목표매수": "월목표", "월가능매수": "월가능"}
+                        )
+                        chart_df["라벨"] = chart_df["매수"].map(lambda v: f"{v:,.0f}")
+                        y_max = float(chart_df["매수"].max() or 0) * 1.15 or 1.0
+                        bars = (
+                            alt.Chart(chart_df)
+                            .mark_bar()
+                            .encode(
+                                x=alt.X("제품코드:N", title="제품코드"),
+                                xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
+                                y=alt.Y("매수:Q", title="매수/월", scale=alt.Scale(domain=[0, y_max])),
+                                color=alt.Color("구분:N", sort=["월목표", "월가능"]),
+                                tooltip=["제품코드", "구분", "매수"],
+                            )
+                        )
+                        texts = (
+                            alt.Chart(chart_df)
+                            .mark_text(dy=-8, fontSize=10)
+                            .encode(
+                                x=alt.X("제품코드:N"),
+                                xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
+                                y=alt.Y("매수:Q", scale=alt.Scale(domain=[0, y_max])),
+                                text=alt.Text("라벨:N"),
+                            )
+                        )
+                        st.altair_chart(
+                            (bars + texts).properties(height=280, title=f"{label} — 월목표 vs 월가능"),
+                            use_container_width=True,
+                        )
 
     with tab_util:
         st.subheader("실적 기준 인당 시간 활용")
