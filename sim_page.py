@@ -49,6 +49,45 @@ from sim_engine import (
 )
 
 
+def _eq_running_count(equip: pd.DataFrame, campus: str | None = None) -> int:
+    if equip is None or equip.empty or "대수" not in equip.columns:
+        return 0
+    work = equip.copy()
+    if "가동" in work.columns:
+        work = work[work["가동"]]
+    if campus:
+        work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
+    return int(float(work["대수"].sum())) if not work.empty else 0
+
+
+def _capacity_bar_chart(df: pd.DataFrame, title: str):
+    """공정×제품 일가능매수 막대 + 상단 수치."""
+    if df is None or df.empty or "일가능매수" not in df.columns:
+        return None
+    chart_df = (
+        df.groupby(["제품코드", "제품명", "공정"], as_index=False)["일가능매수"]
+        .sum()
+    )
+    chart_df["라벨"] = chart_df["일가능매수"].map(lambda v: f"{v:,.0f}")
+    y_max = float(chart_df["일가능매수"].max() or 0) * 1.15
+    if y_max <= 0:
+        y_max = 1.0
+    base = alt.Chart(chart_df).encode(
+        x=alt.X("공정:N", title="공정", sort=list(AREAS)),
+        xOffset=alt.XOffset("제품코드:N"),
+        color=alt.Color("제품코드:N", title="제품"),
+    )
+    bars = base.mark_bar().encode(
+        y=alt.Y("일가능매수:Q", title="일가능매수", scale=alt.Scale(domain=[0, y_max])),
+        tooltip=["제품코드", "제품명", "공정", "일가능매수"],
+    )
+    texts = base.mark_text(dy=-8, fontSize=11).encode(
+        y=alt.Y("일가능매수:Q", scale=alt.Scale(domain=[0, y_max])),
+        text=alt.Text("라벨:N"),
+    )
+    return (bars + texts).properties(height=320, title=title)
+
+
 def master_dir():
     folder = data_dir() / "master"
     folder.mkdir(parents=True, exist_ok=True)
@@ -548,68 +587,73 @@ def render() -> None:
             f"인력 열(총인원·근무인원)은 전 공정 모두 인력_기준정보 ×({working_teams}/{shift_teams}). "
             "같은 공정 설비 능력은 합산 후, 제품 병목은 공정 간 최소값입니다."
         )
-        campus_for_cap = campus_sel[0] if len(campus_sel) == 1 else None
-        if len(campus_sel) != 1:
-            st.caption("캠퍼스를 하나만 켜면 그 캠퍼스 자원만으로 계산합니다. 여러 개면 켠 캠퍼스를 합칩니다.")
-        cap = daily_capacity(
-            pr_view,
-            eq_view,
-            campus=campus_for_cap if len(campus_sel) == 1 else None,
-            manpower=man_view,
-            shift_teams=shift_teams,
-            working_teams=working_teams,
-        )
-        if cap.empty:
+
+        campus_scopes: list[tuple[str, str | None]] = [("Total", None)]
+        for c in CAMPUSES:
+            if campus_sel and c not in campus_sel:
+                continue
+            campus_scopes.append((c, c))
+        # 사이드바에 없는 캠퍼스도 데이터에 있으면 추가
+        extra = []
+        if not eq_view.empty and "캠퍼스" in eq_view.columns:
+            extra.extend(eq_view["캠퍼스"].dropna().unique().tolist())
+        if not man_view.empty and "캠퍼스" in man_view.columns:
+            extra.extend(man_view["캠퍼스"].dropna().unique().tolist())
+        for c in sorted({str(x) for x in extra if str(x).strip()}):
+            if c and c not in {n for n, _ in campus_scopes}:
+                if campus_sel and c not in campus_sel:
+                    continue
+                campus_scopes.append((c, c))
+
+        caps: dict[str, pd.DataFrame] = {}
+        for label, camp in campus_scopes:
+            caps[label] = daily_capacity(
+                pr_view,
+                eq_view,
+                campus=camp,
+                manpower=man_view,
+                shift_teams=shift_teams,
+                working_teams=working_teams,
+            )
+
+        if all(df.empty for df in caps.values()):
             st.warning("제품 기준정보와 설비 또는 인력 기준정보가 있어야 시뮬레이션할 수 있습니다.")
         else:
-            eq_total = 0.0
-            if not eq_view.empty and "대수" in eq_view.columns:
-                running = eq_view["가동"] if "가동" in eq_view.columns else True
-                eq_total = float(eq_view.loc[running, "대수"].sum())
-            k1, k2, k3 = st.columns(3)
-            with k1:
-                st.metric("가동 대수", f"{int(eq_total)}대")
-            with k2:
-                bn = cap.drop_duplicates("제품코드")
-                st.metric("제품 수", f"{len(bn)}종")
-            with k3:
-                st.metric("병목 합(참고)", f"{bn['병목가능매수'].sum():,.0f}매")
+            st.markdown("##### 요약 (Total / 캠퍼스)")
+            metric_cols = st.columns(len(campus_scopes))
+            for col, (label, camp) in zip(metric_cols, campus_scopes):
+                cdf = caps[label]
+                eq_n = _eq_running_count(eq_view, camp)
+                prod_n = int(cdf["제품코드"].nunique()) if not cdf.empty else 0
+                bn_sum = 0.0
+                if not cdf.empty and "병목가능매수" in cdf.columns:
+                    bn_sum = float(cdf.drop_duplicates("제품코드")["병목가능매수"].sum())
+                with col:
+                    st.markdown(f"**{label}**")
+                    st.metric("가동 대수", f"{eq_n}대")
+                    st.metric("제품 수", f"{prod_n}종")
+                    st.metric("병목 합(참고)", f"{bn_sum:,.0f}매")
+
+            cap = caps.get("Total")
+            if cap is None or cap.empty:
+                # Total이 비면 첫 비어 있지 않은 결과
+                cap = next((df for df in caps.values() if not df.empty), pd.DataFrame())
             st.dataframe(cap, use_container_width=True)
-            chart_df = (
-                cap.groupby(["제품코드", "제품명", "공정"], as_index=False)["일가능매수"]
-                .sum()
-            )
-            bar = (
-                alt.Chart(chart_df)
-                .mark_bar()
-                .encode(
-                    x=alt.X("공정:N", title="공정", sort=list(AREAS)),
-                    y=alt.Y("일가능매수:Q", title="일가능매수"),
-                    color=alt.Color("제품코드:N", title="제품"),
-                    xOffset="제품코드:N",
-                    tooltip=[
-                        "제품코드",
-                        "제품명",
-                        "공정",
-                        "캠퍼스",
-                        "제약유형",
-                        "설비코드",
-                        "가동대수",
-                        "총인원",
-                        "근무인원",
-                        "매당_설비분",
-                        "매당_인시분",
-                        "일가능매수",
-                        "병목공정",
-                    ],
-                )
-                .properties(height=340, title="제품·공정별 일 가능 매수")
-            )
-            st.altair_chart(bar, use_container_width=True)
+
+            st.markdown("##### 공정별 일 가능 매수")
+            for label, _camp in campus_scopes:
+                cdf = caps[label]
+                chart = _capacity_bar_chart(cdf, f"{label} — 제품·공정별 일 가능 매수")
+                if chart is None:
+                    st.caption(f"{label}: 표시할 능력이 없습니다.")
+                else:
+                    st.altair_chart(chart, use_container_width=True)
 
             st.markdown("##### 믹스 가동 (자원 시간을 비중으로 나눔)")
-            codes = sorted(pr_view["제품코드"].unique().tolist())
-            mix_default = pd.DataFrame({"제품코드": codes, "비중": [round(100 / len(codes), 1)] * len(codes)})
+            codes = sorted(pr_view["제품코드"].unique().tolist()) if not pr_view.empty else []
+            mix_default = pd.DataFrame(
+                {"제품코드": codes, "비중": [round(100 / len(codes), 1)] * len(codes)}
+            ) if codes else pd.DataFrame(columns=["제품코드", "비중"])
             mix_edit = st.data_editor(
                 mix_default,
                 use_container_width=True,
@@ -620,32 +664,42 @@ def render() -> None:
                     "비중": st.column_config.NumberColumn(min_value=0, step=1),
                 },
             )
-            mixed = mix_simulation(
-                pr_view,
-                eq_view,
-                mix_edit,
-                campus=campus_for_cap if len(campus_sel) == 1 else None,
-                manpower=man_view,
-                shift_teams=shift_teams,
-                working_teams=working_teams,
-            )
-            if mixed.empty:
-                st.caption("비중을 넣으면 공정별로 나눠 돌린 매수가 나옵니다.")
-            else:
-                st.dataframe(mixed, use_container_width=True)
-                st.altair_chart(
-                    alt.Chart(mixed)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("공정:N", sort=list(AREAS), title="공정"),
-                        y=alt.Y("일가능매수:Q"),
-                        color="제품코드:N",
-                        xOffset="제품코드:N",
-                        tooltip=list(mixed.columns),
-                    )
-                    .properties(height=300, title="믹스 기준 일 가능 매수"),
-                    use_container_width=True,
+            for label, camp in campus_scopes:
+                mixed = mix_simulation(
+                    pr_view,
+                    eq_view,
+                    mix_edit,
+                    campus=camp,
+                    manpower=man_view,
+                    shift_teams=shift_teams,
+                    working_teams=working_teams,
                 )
+                st.markdown(f"**믹스 · {label}**")
+                if mixed.empty:
+                    st.caption("비중을 넣으면 공정별로 나눠 돌린 매수가 나옵니다.")
+                else:
+                    st.dataframe(mixed, use_container_width=True)
+                    mix_chart_df = mixed.copy()
+                    mix_chart_df["라벨"] = mix_chart_df["일가능매수"].map(lambda v: f"{v:,.0f}")
+                    mix_base = alt.Chart(mix_chart_df).encode(
+                        x=alt.X("공정:N", sort=list(AREAS), title="공정"),
+                        xOffset=alt.XOffset("제품코드:N"),
+                        color=alt.Color("제품코드:N", title="제품"),
+                    )
+                    mix_bars = mix_base.mark_bar().encode(
+                        y=alt.Y("일가능매수:Q"),
+                        tooltip=["제품코드", "공정", "일가능매수", "제약유형"],
+                    )
+                    mix_texts = mix_base.mark_text(dy=-8, fontSize=11).encode(
+                        y=alt.Y("일가능매수:Q"),
+                        text=alt.Text("라벨:N"),
+                    )
+                    st.altair_chart(
+                        (mix_bars + mix_texts).properties(
+                            height=280, title=f"{label} — 믹스 기준 일 가능 매수"
+                        ),
+                        use_container_width=True,
+                    )
 
     with tab_util:
         st.subheader("실적 기준 인당 시간 활용")
