@@ -33,12 +33,12 @@ from sim_engine import (
     canonical_master_name,
     csv_bytes,
     daily_operation_plan,
+    effective_daily_headcount,
     empty_csv_bytes,
     empty_xlsx_bytes,
     equipment_template,
     manpower_template,
     master_github_paths,
-    monthly_plan_daily_avg,
     monthly_plan_family_stats,
     monthly_plan_feasibility,
     monthly_plan_template,
@@ -52,9 +52,68 @@ from sim_engine import (
     product_actual_template,
     product_template,
     read_csv_table,
+    running_manpower,
+    running_qty,
     xlsx_bytes,
     utilization_from_actuals,
 )
+
+
+def _daily_avg_from_family_stats(stats: pd.DataFrame, work_days: float) -> dict[str, float]:
+    """계획 요약(월목표) → 일평균 치수 CEL/Ring · 외관."""
+    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
+    by: dict[str, float] = {}
+    if stats is not None and not stats.empty:
+        for _, row in stats.iterrows():
+            by[str(row["구분"])] = float(row["월목표합계"])
+    return {
+        "치수_CEL": round(by.get("CEL", 0.0) / days, 1),
+        "치수_Ring": round(by.get("Ring", 0.0) / days, 1),
+        "외관": round(by.get("합계", 0.0) / days, 1),
+    }
+
+
+def _campus_share_for_area(
+    area: str,
+    campus: str,
+    equip: pd.DataFrame,
+    manpower: pd.DataFrame,
+    *,
+    shift_teams: int,
+    working_teams: int,
+) -> float:
+    """캠퍼스 자원 비중 (치수=설비, 외관=인력)."""
+    if area == "외관":
+        total_h, _ = running_manpower(manpower, campus=None, area=area)
+        camp_h, _ = running_manpower(manpower, campus=campus, area=area)
+        total_n = effective_daily_headcount(
+            total_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        camp_n = effective_daily_headcount(
+            camp_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        return (float(camp_n) / float(total_n)) if total_n > 0 else 0.0
+    total_q = running_qty(equip, campus=None, area=area, equip_code="")
+    camp_q = running_qty(equip, campus=campus, area=area, equip_code="")
+    if total_q > 0:
+        return float(camp_q) / float(total_q)
+    total_h, _ = running_manpower(manpower, campus=None, area=area)
+    camp_h, _ = running_manpower(manpower, campus=campus, area=area)
+    total_n = effective_daily_headcount(
+        total_h, shift_teams=shift_teams, working_teams=working_teams
+    )
+    camp_n = effective_daily_headcount(
+        camp_h, shift_teams=shift_teams, working_teams=working_teams
+    )
+    return (float(camp_n) / float(total_n)) if total_n > 0 else 0.0
+
+
+def _scale_daily_avg(avg: dict[str, float], dim_share: float, app_share: float) -> dict[str, float]:
+    return {
+        "치수_CEL": round(float(avg.get("치수_CEL", 0)) * dim_share, 1),
+        "치수_Ring": round(float(avg.get("치수_Ring", 0)) * dim_share, 1),
+        "외관": round(float(avg.get("외관", 0)) * app_share, 1),
+    }
 
 
 def _render_plan_family_summary(stats: pd.DataFrame) -> None:
@@ -670,34 +729,56 @@ def render() -> None:
                 st.markdown("**계획 요약**")
                 _render_plan_family_summary(plan_stats)
 
-                total_avg = monthly_plan_daily_avg(
-                    plan_for_calc,
-                    pr_view,
-                    work_days=work_days,
+                total_avg = _daily_avg_from_family_stats(plan_stats, work_days)
+                st.divider()
+                st.markdown("### 일평균 (매/일)")
+                st.caption(
+                    f"계산: 월목표 ÷ 작업일({work_days}일) · "
+                    f"치수 CEL {total_avg['치수_CEL']:,.1f} / "
+                    f"치수 Ring {total_avg['치수_Ring']:,.1f} / "
+                    f"외관 {total_avg['외관']:,.1f}"
                 )
-                st.markdown("**일평균**")
-                st.caption("일평균 = 월목표 ÷ 작업일 · 치수 CEL/Ring은 제품군별, 외관은 전체 합계")
                 _render_daily_avg_row("전체", total_avg)
 
                 camp_names = [c for c in ("천안", "아산") if not campus_sel or c in campus_sel]
                 if camp_names:
-                    campus_cols = st.columns(len(camp_names))
-                    for col, camp_name in zip(campus_cols, camp_names):
-                        camp_avg = monthly_plan_daily_avg(
-                            plan_for_calc,
-                            pr_view,
-                            work_days=work_days,
-                            campus=camp_name,
-                            equip=eq_view,
-                            manpower=man_view,
+                    dim_shares = {
+                        c: _campus_share_for_area(
+                            "치수",
+                            c,
+                            eq_view,
+                            man_view,
                             shift_teams=shift_teams,
                             working_teams=working_teams,
+                        )
+                        for c in camp_names
+                    }
+                    app_shares = {
+                        c: _campus_share_for_area(
+                            "외관",
+                            c,
+                            eq_view,
+                            man_view,
+                            shift_teams=shift_teams,
+                            working_teams=working_teams,
+                        )
+                        for c in camp_names
+                    }
+                    # 비중 합이 0이면 균등 배분
+                    if sum(dim_shares.values()) <= 0:
+                        dim_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                    if sum(app_shares.values()) <= 0:
+                        app_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                    campus_cols = st.columns(len(camp_names))
+                    for col, camp_name in zip(campus_cols, camp_names):
+                        camp_avg = _scale_daily_avg(
+                            total_avg, dim_shares[camp_name], app_shares[camp_name]
                         )
                         with col:
                             _render_daily_avg_row(camp_name, camp_avg)
                     st.caption(
-                        "천안/아산 일평균은 전체 일평균을 공정 자원 비중으로 나눈 값입니다. "
-                        "(치수=가동 설비 대수, 외관=근무인원)"
+                        "천안/아산은 전체 일평균을 공정 자원 비중으로 나눈 값 "
+                        "(치수=가동 설비 대수, 외관=근무인원)."
                     )
 
                 st.caption(f"적용 파일: **{fname}**")
