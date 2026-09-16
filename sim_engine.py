@@ -470,38 +470,52 @@ def daily_capacity(
                 continue
             specs = psub[psub["공정"].map(_norm) == area]
             kind0 = _norm(specs["제약유형"].iloc[0]) if "제약유형" in specs.columns else "설비"
-            man_total, man_avail = running_manpower(man, campus=campus, area=area)
-            man_qty = effective_daily_headcount(
-                man_total, shift_teams=shift_teams, working_teams=working_teams
-            )
             eq_work = _equip_slice(eq, campus=campus, area=area, equip_code="")
-            use_man = kind0 == "인력" or (eq_work.empty and man_qty > 0)
+            man_probe, _ = running_manpower(man, campus=campus, area=area)
+            use_man = kind0 == "인력" or (eq_work.empty and man_probe > 0)
 
             if use_man:
                 _, man_tact = _spec_tact(specs, "")
                 if man_tact <= 0:
                     man_tact = float(specs["매당_인시분"].iloc[0] or 0)
-                minutes = man_avail if man_avail else DEFAULT_SHIFT_MINUTES
-                sheets = round(man_qty * minutes / man_tact, 1) if man_tact > 0 else 0.0
-                rows.append(
-                    {
-                        "제품코드": code,
-                        "제품명": pname,
-                        "공정": area,
-                        "캠퍼스": campus or "합산",
-                        "제약유형": "인력",
-                        "설비코드": "",
-                        "가동대수": 0.0,
-                        "총인원": round(man_total, 1),
-                        "근무인원": round(man_qty, 1),
-                        "조보정": round(factor, 4),
-                        "가용분": round(minutes, 1),
-                        "매당_설비분": float(specs["매당_설비분"].iloc[0] or 0),
-                        "매당_인시분": man_tact,
-                        "필요인원": round(man_qty, 1),
-                        "일가능매수": sheets,
-                    }
-                )
+                # 캠퍼스별 인력 행으로 펼침 (Total일 때 합산 한 줄로 뭉개지 않음)
+                if campus:
+                    man_campuses: list[str | None] = [campus]
+                elif not man.empty and "캠퍼스" in man.columns:
+                    hit = man[man["가동"] & (man["공정"].map(_norm) == area)] if "가동" in man.columns else man[man["공정"].map(_norm) == area]
+                    man_campuses = sorted({_norm(c) for c in hit["캠퍼스"].tolist() if _norm(c)})
+                    if not man_campuses:
+                        man_campuses = [None]
+                else:
+                    man_campuses = [None]
+                for mc in man_campuses:
+                    man_total, man_avail = running_manpower(man, campus=mc, area=area)
+                    man_qty = effective_daily_headcount(
+                        man_total, shift_teams=shift_teams, working_teams=working_teams
+                    )
+                    if man_qty <= 0 and man_total <= 0:
+                        continue
+                    minutes = man_avail if man_avail else DEFAULT_SHIFT_MINUTES
+                    sheets = round(man_qty * minutes / man_tact, 1) if man_tact > 0 else 0.0
+                    rows.append(
+                        {
+                            "제품코드": code,
+                            "제품명": pname,
+                            "공정": area,
+                            "캠퍼스": mc or "합산",
+                            "제약유형": "인력",
+                            "설비코드": "",
+                            "가동대수": 0.0,
+                            "총인원": round(man_total, 1),
+                            "근무인원": round(man_qty, 1),
+                            "조보정": round(factor, 4),
+                            "가용분": round(minutes, 1),
+                            "매당_설비분": float(specs["매당_설비분"].iloc[0] or 0),
+                            "매당_인시분": man_tact,
+                            "필요인원": round(man_qty, 1),
+                            "일가능매수": sheets,
+                        }
+                    )
                 continue
 
             default_eq, default_man = _spec_tact(specs, "")
@@ -513,6 +527,14 @@ def daily_capacity(
                 if man_tact <= 0:
                     man_tact = default_man or eq_tact
                 qty = float(eqr.get("대수") or 0)
+                # 설비 행 캠퍼스 기준으로 인력 조회 (Total에서도 천안=천안 인원)
+                row_campus = _norm(eqr.get("캠퍼스")) or campus
+                man_total, _man_avail = running_manpower(
+                    man, campus=row_campus if row_campus else None, area=area
+                )
+                man_qty = effective_daily_headcount(
+                    man_total, shift_teams=shift_teams, working_teams=working_teams
+                )
                 sheets = round(qty * day_minutes / eq_tact, 1) if eq_tact > 0 else 0.0
                 need = round(qty * float(specs["필요인원"].iloc[0] or 1), 1)
                 rows.append(
@@ -520,7 +542,7 @@ def daily_capacity(
                         "제품코드": code,
                         "제품명": pname,
                         "공정": area,
-                        "캠퍼스": _norm(eqr.get("캠퍼스")) or (campus or ""),
+                        "캠퍼스": row_campus or (campus or ""),
                         "제약유형": "설비",
                         "설비코드": eq_code,
                         "가동대수": qty,
