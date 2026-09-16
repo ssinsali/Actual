@@ -18,7 +18,9 @@ from pathlib import Path
 from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
 from stats_engine import AREAS, SHIFTS, add_calendar_parts
 from sim_engine import (
-    DAY_MINUTES,
+    DEFAULT_SHIFT_MINUTES,
+    DEFAULT_SHIFT_TEAMS,
+    DEFAULT_WORKING_TEAMS,
     EQUIP_COLUMNS,
     MANPOWER_COLUMNS,
     MASTER_STEMS,
@@ -232,6 +234,7 @@ def render() -> None:
     st.title("설비 운영 시뮬레이션")
     st.caption(
         "보유 설비·인력과 제품 택트로 하루 능력을 보고, 실적 대비 인당 시간 활용률을 계산합니다. "
+        "인력 기준정보의 인원은 **3개조 합계**로 두고, 하루 능력은 근무조(기본 2/3)만 반영합니다. "
         "외관처럼 설비 없이 사람이 하는 공정은 `인력_기준정보`에 넣습니다. "
         "GitHub `templates/`에 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적을 올리면 자동으로 가져옵니다."
     )
@@ -262,7 +265,9 @@ def render() -> None:
     area_sel = list(AREAS)
     team_sel: list[str] = []
     product_sel: list[str] = []
-    available_min = float(DAY_MINUTES)
+    available_min = float(DEFAULT_SHIFT_MINUTES)
+    shift_teams = DEFAULT_SHIFT_TEAMS
+    working_teams = DEFAULT_WORKING_TEAMS
 
     with st.sidebar:
         st.header("계정")
@@ -299,14 +304,41 @@ def render() -> None:
             )
             teams = sorted(records["조"].dropna().unique().tolist()) if "조" in records.columns else []
             team_sel = render_slicer("조", teams, key="sim_team", default_on=True) if teams else []
+        st.markdown("**교대·인원 환산 (능력 계산)**")
+        shift_teams = int(
+            st.number_input(
+                "총 조 수",
+                min_value=1,
+                max_value=6,
+                value=DEFAULT_SHIFT_TEAMS,
+                step=1,
+                help="인력 기준정보의 인원에 포함된 조 수. 3조 2교대면 3.",
+                key="sim_shift_teams",
+            )
+        )
+        working_teams = int(
+            st.number_input(
+                "하루 근무 조 수",
+                min_value=1,
+                max_value=shift_teams,
+                value=min(DEFAULT_WORKING_TEAMS, shift_teams),
+                step=1,
+                help="하루 실제로 근무하는 조 수. 3조 2교대면 2 (주·야), 1조는 휴무.",
+                key="sim_working_teams",
+            )
+        )
+        st.caption(
+            f"근무인원 = 총인원 × ({working_teams}/{shift_teams}) = 총인원 × {working_teams / shift_teams:.4g}. "
+            "설비 능력(대수×1440)에는 적용하지 않습니다."
+        )
         available_min = float(
             st.number_input(
                 "인당 가용 분 (활용률 분모)",
                 min_value=60,
                 max_value=1440,
-                value=1440,
+                value=DEFAULT_SHIFT_MINUTES,
                 step=60,
-                help="이론 능력은 설비×1440분. 활용률은 인력×이 값으로 나눕니다. 24시간 기준이면 1440.",
+                help="실적 활용률 분모. 1인 1교대 기준이면 보통 720(12시간). 설비 이론능력은 대수×1440.",
             )
         )
         if github_store_enabled():
@@ -495,7 +527,8 @@ def render() -> None:
             st.dataframe(by, use_container_width=True)
         st.markdown(
             "**인력** — 외관처럼 설비 없이 사람이 하는 공정. "
-            "일가능매수 = 인원 × 가용분 ÷ 매당_인시분."
+            "`인원`은 3개조 합계, `가용분`은 1인 1교대 분(권장 720). "
+            f"일가능매수 = 총인원×({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분."
         )
         if man_view.empty:
             st.info("인력 기준정보를 업로드하세요. (외관 등 수작업)")
@@ -518,8 +551,8 @@ def render() -> None:
     with tab_sim:
         st.subheader("하루 능력 (설비·인력)")
         st.caption(
-            "설비 공정: 일가능매수 = 가동 대수 × 1440 ÷ 매당_설비분. "
-            "인력 공정(외관 등): 일가능매수 = 보유 인원 × 가용분 ÷ 매당_인시분. "
+            "설비 공정: 일가능매수 = 가동 대수 × 1440 ÷ 매당_설비분 (2교대 연속 가동). "
+            f"인력 공정: 일가능매수 = 총인원 × ({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분. "
             "제품별 병목은 공정 중 가장 낮은 일가능매수입니다."
         )
         campus_for_cap = campus_sel[0] if len(campus_sel) == 1 else None
@@ -530,6 +563,8 @@ def render() -> None:
             eq_view,
             campus=campus_for_cap if len(campus_sel) == 1 else None,
             manpower=man_view,
+            shift_teams=shift_teams,
+            working_teams=working_teams,
         )
         if cap.empty:
             st.warning("제품 기준정보와 설비 또는 인력 기준정보가 있어야 시뮬레이션할 수 있습니다.")
@@ -558,7 +593,8 @@ def render() -> None:
                         "공정",
                         "제약유형",
                         "가동대수",
-                        "보유인원",
+                        "총인원",
+                        "근무인원",
                         "매당_설비분",
                         "매당_인시분",
                         "일가능매수",
@@ -588,6 +624,8 @@ def render() -> None:
                 mix_edit,
                 campus=campus_for_cap if len(campus_sel) == 1 else None,
                 manpower=man_view,
+                shift_teams=shift_teams,
+                working_teams=working_teams,
             )
             if mixed.empty:
                 st.caption("비중을 넣으면 공정별로 나눠 돌린 매수가 나옵니다.")
@@ -611,6 +649,7 @@ def render() -> None:
         st.subheader("실적 기준 인당 시간 활용")
         st.caption(
             f"인당시간활용률(%) = (실적 × 매당_인시분) ÷ (인력 × {available_min:g}분) × 100. "
+            "여기서 인력은 실적에 적힌 당일·당조 인원입니다(전 조 합계에 2/3를 또 적용하지 않음). "
             "100%면 기준 택트만큼 시간을 다 쓴 것이고, 낮으면 여유·대기·다른 일이 있는 쪽으로 봅니다."
         )
         util = pd.DataFrame()
