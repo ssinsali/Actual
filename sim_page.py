@@ -245,21 +245,17 @@ def render() -> None:
     # GitHub 다시 가져오기 / 초기화 직후 메시지
     force_gh = bool(st.session_state.pop("sim_gh_force_refresh", False))
     if force_gh:
-        gh_notes = _sync_master_from_github(force=True)
+        _sync_master_from_github(force=True)
         st.session_state["sim_flash"] = "GitHub 기준정보 다시 가져오기 완료"
-        st.session_state["sim_flash_detail"] = gh_notes
     else:
-        gh_notes = _sync_master_from_github()
+        _sync_master_from_github()
 
-    equip, manpower, products, product_actuals, master_notes = _load_master()
+    equip, manpower, products, product_actuals, _master_notes = _load_master()
 
     flash = st.session_state.pop("sim_flash", None)
-    flash_detail = st.session_state.pop("sim_flash_detail", None)
+    st.session_state.pop("sim_flash_detail", None)
     if flash:
         st.success(flash)
-        if flash_detail:
-            for n in flash_detail:
-                st.caption("· " + str(n))
 
     campus_sel: list[str] = []
     shift_sel: list[str] = []
@@ -493,11 +489,6 @@ def render() -> None:
                 use_container_width=True,
                 key="sim_dl_act",
             )
-
-    for n in gh_notes:
-        st.caption("· " + n)
-    for n in master_notes:
-        st.caption("· " + n)
 
     eq_view = equip.copy()
     man_view = manpower.copy()
