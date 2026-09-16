@@ -451,7 +451,7 @@ def daily_capacity(
     - 설비: 설비_기준정보의 해당 공정 가동 설비를 캠퍼스 합산해 행으로 펼침
       (제품 설비코드는 택트 매칭용. 코드가 달라도 공정이 같으면 대수에 포함)
     - 인력: 근무인원 × 가용분 ÷ 매당_인시분
-    - 병목: 같은 제품·공정 안 설비 능력은 합산 후, 공정 간 최소
+    - 공정은 개별 능력(병목 없음)
     """
     if products.empty:
         return pd.DataFrame()
@@ -536,28 +536,6 @@ def daily_capacity(
                 )
 
     out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-
-    # 병목: 동일 제품·공정은 능력 합산(병렬 설비) 후, 공정 간 최소
-    proc_cap = (
-        out.groupby(["제품코드", "공정"], as_index=False)["일가능매수"]
-        .sum()
-        .rename(columns={"일가능매수": "공정가능매수"})
-    )
-    bottleneck = (
-        proc_cap.groupby("제품코드", as_index=False)["공정가능매수"]
-        .min()
-        .rename(columns={"공정가능매수": "병목가능매수"})
-    )
-    bn_proc = (
-        proc_cap.sort_values("공정가능매수")
-        .groupby("제품코드", as_index=False)
-        .first()[["제품코드", "공정"]]
-        .rename(columns={"공정": "병목공정"})
-    )
-    out = out.merge(bottleneck, on="제품코드", how="left")
-    out = out.merge(bn_proc, on="제품코드", how="left")
     return out
 
 
