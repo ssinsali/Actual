@@ -60,6 +60,90 @@ def _eq_running_count(equip: pd.DataFrame, campus: str | None = None) -> int:
     return int(float(work["대수"].sum())) if not work.empty else 0
 
 
+SUMMARY_PROCESS_AREAS = ("치수", "Hole", "외관")
+
+
+def _process_sheets(cap_df: pd.DataFrame, area: str) -> float:
+    if cap_df is None or cap_df.empty or "일가능매수" not in cap_df.columns:
+        return 0.0
+    hit = cap_df[cap_df["공정"] == area]
+    return float(hit["일가능매수"].sum()) if not hit.empty else 0.0
+
+
+def _render_summary_row(
+    campus_scopes: list[tuple[str, str | None]],
+    caps: dict[str, pd.DataFrame],
+    eq_view: pd.DataFrame,
+) -> None:
+    """Total / 천안 / 아산 요약 — 큰 글씨, 가로 배치, 공정별 일가능매수."""
+    st.markdown(
+        """
+        <style>
+        .sim-sum-card {
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 12px;
+            padding: 1rem 1.1rem 1.15rem;
+            background: rgba(250, 250, 250, 0.55);
+            min-height: 11rem;
+        }
+        .sim-sum-title { font-size: 1.75rem; font-weight: 700; margin: 0 0 0.75rem 0; line-height: 1.2; }
+        .sim-sum-row { display: flex; gap: 0.75rem; margin-bottom: 0.85rem; }
+        .sim-sum-item { flex: 1; }
+        .sim-sum-label { font-size: 0.95rem; color: rgba(49, 51, 63, 0.7); margin-bottom: 0.15rem; }
+        .sim-sum-value { font-size: 1.55rem; font-weight: 700; line-height: 1.15; }
+        .sim-sum-proc-row { display: flex; gap: 0.6rem; }
+        .sim-sum-proc {
+            flex: 1;
+            text-align: center;
+            background: rgba(255,255,255,0.85);
+            border-radius: 8px;
+            padding: 0.55rem 0.35rem;
+            border: 1px solid rgba(49, 51, 63, 0.12);
+        }
+        .sim-sum-proc-name { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.2rem; }
+        .sim-sum-proc-val { font-size: 1.45rem; font-weight: 700; }
+        .sim-sum-proc-unit { font-size: 0.8rem; color: rgba(49, 51, 63, 0.55); }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(len(campus_scopes), gap="medium")
+    for col, (label, camp) in zip(cols, campus_scopes):
+        cdf = caps.get(label, pd.DataFrame())
+        eq_n = _eq_running_count(eq_view, camp)
+        prod_n = int(cdf["제품코드"].nunique()) if not cdf.empty and "제품코드" in cdf.columns else 0
+        proc_html = "".join(
+            (
+                f'<div class="sim-sum-proc">'
+                f'<div class="sim-sum-proc-name">{area}</div>'
+                f'<div class="sim-sum-proc-val">{_process_sheets(cdf, area):,.0f}</div>'
+                f'<div class="sim-sum-proc-unit">일가능매수</div>'
+                f"</div>"
+            )
+            for area in SUMMARY_PROCESS_AREAS
+        )
+        with col:
+            st.markdown(
+                f"""
+                <div class="sim-sum-card">
+                  <div class="sim-sum-title">{label}</div>
+                  <div class="sim-sum-row">
+                    <div class="sim-sum-item">
+                      <div class="sim-sum-label">가동 대수</div>
+                      <div class="sim-sum-value">{eq_n}대</div>
+                    </div>
+                    <div class="sim-sum-item">
+                      <div class="sim-sum-label">제품 수</div>
+                      <div class="sim-sum-value">{prod_n}종</div>
+                    </div>
+                  </div>
+                  <div class="sim-sum-proc-row">{proc_html}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
 def _capacity_bar_chart(df: pd.DataFrame, title: str):
     """공정×제품 일가능매수 막대 + 상단 수치."""
     if df is None or df.empty or "일가능매수" not in df.columns:
@@ -585,7 +669,7 @@ def render() -> None:
         st.caption(
             "설비: 설비_기준정보의 해당 공정 가동 설비를 캠퍼스 합산(제품 설비코드는 택트 매칭). "
             f"인력 열(총인원·근무인원)은 전 공정 모두 인력_기준정보 ×({working_teams}/{shift_teams}). "
-            "같은 공정 설비 능력은 합산 후, 제품 병목은 공정 간 최소값입니다."
+            "공정은 개별 능력으로 보며, 치수·Hole·외관 일가능매수를 각각 표시합니다."
         )
 
         campus_scopes: list[tuple[str, str | None]] = [("Total", None)]
@@ -620,25 +704,13 @@ def render() -> None:
             st.warning("제품 기준정보와 설비 또는 인력 기준정보가 있어야 시뮬레이션할 수 있습니다.")
         else:
             st.markdown("##### 요약 (Total / 캠퍼스)")
-            metric_cols = st.columns(len(campus_scopes))
-            for col, (label, camp) in zip(metric_cols, campus_scopes):
-                cdf = caps[label]
-                eq_n = _eq_running_count(eq_view, camp)
-                prod_n = int(cdf["제품코드"].nunique()) if not cdf.empty else 0
-                bn_sum = 0.0
-                if not cdf.empty and "병목가능매수" in cdf.columns:
-                    bn_sum = float(cdf.drop_duplicates("제품코드")["병목가능매수"].sum())
-                with col:
-                    st.markdown(f"**{label}**")
-                    st.metric("가동 대수", f"{eq_n}대")
-                    st.metric("제품 수", f"{prod_n}종")
-                    st.metric("병목 합(참고)", f"{bn_sum:,.0f}매")
+            _render_summary_row(campus_scopes, caps, eq_view)
 
             cap = caps.get("Total")
             if cap is None or cap.empty:
-                # Total이 비면 첫 비어 있지 않은 결과
                 cap = next((df for df in caps.values() if not df.empty), pd.DataFrame())
-            st.dataframe(cap, use_container_width=True)
+            show_cap = cap.drop(columns=["병목가능매수", "병목공정"], errors="ignore")
+            st.dataframe(show_cap, use_container_width=True)
 
             st.markdown("##### 공정별 일 가능 매수")
             for label, _camp in campus_scopes:
