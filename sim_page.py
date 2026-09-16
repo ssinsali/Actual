@@ -287,7 +287,6 @@ def render() -> None:
     shift_sel: list[str] = []
     area_sel = list(AREAS)
     team_sel: list[str] = []
-    product_name_sel: list[str] = []
     available_min = float(DEFAULT_SHIFT_MINUTES)
     shift_teams = DEFAULT_SHIFT_TEAMS
     working_teams = DEFAULT_WORKING_TEAMS
@@ -314,10 +313,6 @@ def render() -> None:
             default_on=True,
         )
         area_sel = render_slicer("공정", list(AREAS), key="sim_area", default_on=True)
-        names = sorted(products["제품명"].dropna().unique().tolist()) if not products.empty and "제품명" in products.columns else []
-        product_name_sel = (
-            render_slicer("제품명", names, key="sim_product_name", default_on=True) if names else []
-        )
         if not records.empty:
             shifts = sorted(records["주야"].dropna().unique().tolist()) if "주야" in records.columns else list(SHIFTS)
             prefer_s = [s for s in SHIFTS if s in shifts]
@@ -527,8 +522,6 @@ def render() -> None:
         man_view = man_view[man_view["공정"].isin(area_sel)]
     if area_sel and not pr_view.empty:
         pr_view = pr_view[pr_view["공정"].isin(area_sel)]
-    if product_name_sel and not pr_view.empty and "제품명" in pr_view.columns:
-        pr_view = pr_view[pr_view["제품명"].isin(product_name_sel)]
 
     tab_sim, tab_master, tab_util = st.tabs(["운영 시뮬레이션", "기준정보", "실적 시간 활용"])
 
@@ -757,12 +750,6 @@ def render() -> None:
                 pa = pa[pa["조"].isin(team_sel)]
             if shift_sel and "주야" in pa.columns:
                 pa = pa[pa["주야"].isin(shift_sel)]
-            if product_name_sel:
-                if "제품명" in pa.columns:
-                    pa = pa[pa["제품명"].isin(product_name_sel)]
-                elif "제품코드" in pa.columns and not products.empty and "제품명" in products.columns:
-                    codes = products.loc[products["제품명"].isin(product_name_sel), "제품코드"]
-                    pa = pa[pa["제품코드"].isin(codes)]
         if not pa.empty and not pr_view.empty:
             tact = pr_view[["제품코드", "공정", "매당_인시분"]].drop_duplicates()
             merged = pa.merge(tact, on=["제품코드", "공정"], how="left")
