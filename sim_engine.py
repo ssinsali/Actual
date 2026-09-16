@@ -36,6 +36,32 @@ def _norm(v: Any) -> str:
     return str(v).strip()
 
 
+_BLANK_CODES = {
+    "",
+    "-",
+    "--",
+    "—",
+    "–",
+    ".",
+    "/",
+    "x",
+    "없음",
+    "무",
+    "n/a",
+    "na",
+    "none",
+    "null",
+}
+
+
+def _code_or_blank(v: Any) -> str:
+    """설비코드 '-', 없음 등은 빈 값으로 취급."""
+    t = _norm(v)
+    if t.lower().replace(" ", "") in _BLANK_CODES:
+        return ""
+    return t
+
+
 def _is_running(v: Any) -> bool:
     t = _norm(v).lower().replace(" ", "")
     if not t:
@@ -266,17 +292,24 @@ def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
     work["제품코드"] = work["제품코드"].map(_norm)
     work["제품명"] = work["제품명"].map(_norm)
     work["공정"] = work["공정"].map(_norm)
-    work["설비코드"] = work["설비코드"].map(_norm)
+    work["설비코드"] = work["설비코드"].map(_code_or_blank)
     work["제약유형"] = work["제약유형"].map(_norm)
     work["매당_설비분"] = work["매당_설비분"].map(lambda v: _num(v, 0))
     work["매당_인시분"] = work["매당_인시분"].map(lambda v: _num(v, 0))
     work["필요인원"] = work["필요인원"].map(lambda v: _num(v, 1) or 1)
     work.loc[work["매당_인시분"] <= 0, "매당_인시분"] = work["매당_설비분"]
-    # 제약유형 비어 있으면 자동: 설비코드/설비분 있으면 설비, 아니면 인력
+    # 제약유형 비어 있으면 자동 판별
+    # (외관처럼 설비코드='-'·설비분 공란·인시분만 있는 행은 인력)
     empty_kind = work["제약유형"] == ""
-    work.loc[empty_kind & ((work["설비코드"] != "") | (work["매당_설비분"] > 0)), "제약유형"] = "설비"
+    man_like = (work["매당_설비분"] <= 0) & (work["매당_인시분"] > 0)
+    eq_like = (work["매당_설비분"] > 0) | (work["설비코드"] != "")
+    work.loc[empty_kind & work["공정"].str.contains("외관", na=False), "제약유형"] = "인력"
+    work.loc[empty_kind & (work["제약유형"] == "") & man_like, "제약유형"] = "인력"
+    work.loc[empty_kind & (work["제약유형"] == "") & eq_like, "제약유형"] = "설비"
     work.loc[empty_kind & (work["제약유형"] == ""), "제약유형"] = "인력"
-    work["제약유형"] = work["제약유형"].map(lambda x: "인력" if "인력" in str(x) or "사람" in str(x) or "수작업" in str(x) else "설비")
+    work["제약유형"] = work["제약유형"].map(
+        lambda x: "인력" if ("인력" in str(x) or "사람" in str(x) or "수작업" in str(x)) else "설비"
+    )
     # 설비 공정은 설비분, 인력 공정은 인시분 필수
     ok_eq = (work["제약유형"] == "설비") & (work["매당_설비분"] > 0)
     ok_man = (work["제약유형"] == "인력") & (work["매당_인시분"] > 0)
