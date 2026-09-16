@@ -926,6 +926,123 @@ def monthly_plan_family_stats(
     return pd.DataFrame(rows)
 
 
+def _tagged_monthly_plan(plan: pd.DataFrame, products: pd.DataFrame) -> pd.DataFrame:
+    """월 계획에 제품군을 붙인 표."""
+    work = normalize_monthly_plan(plan)
+    if work.empty:
+        return work
+    fam_map: dict[str, str] = {}
+    if not products.empty and "제품코드" in products.columns and "제품군" in products.columns:
+        pc = products[["제품코드", "제품군"]].drop_duplicates("제품코드")
+        fam_map = {
+            _norm(c): _infer_product_family(g)
+            for c, g in zip(pc["제품코드"], pc["제품군"])
+            if _norm(c)
+        }
+    out = work.copy()
+    out["제품군"] = out["제품코드"].map(
+        lambda c: fam_map.get(_norm(c), _infer_product_family(c))
+    )
+    return out
+
+
+def _campus_resource_share(
+    *,
+    area: str,
+    campus: str,
+    equip: pd.DataFrame | None = None,
+    manpower: pd.DataFrame | None = None,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
+) -> float:
+    """캠퍼스가 해당 공정에서 차지하는 자원 비중 (0~1)."""
+    eq = equip if equip is not None else pd.DataFrame()
+    man = manpower if manpower is not None else pd.DataFrame()
+    if area == "외관":
+        total_h, _ = running_manpower(man, campus=None, area=area)
+        camp_h, _ = running_manpower(man, campus=campus, area=area)
+        total_n = effective_daily_headcount(
+            total_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        camp_n = effective_daily_headcount(
+            camp_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        if total_n <= 0:
+            return 0.0
+        return float(camp_n) / float(total_n)
+    total_q = running_qty(eq, campus=None, area=area, equip_code="")
+    camp_q = running_qty(eq, campus=campus, area=area, equip_code="")
+    if total_q <= 0:
+        # 설비 없으면 인력 비중으로
+        total_h, _ = running_manpower(man, campus=None, area=area)
+        camp_h, _ = running_manpower(man, campus=campus, area=area)
+        total_n = effective_daily_headcount(
+            total_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        camp_n = effective_daily_headcount(
+            camp_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        if total_n <= 0:
+            return 0.0
+        return float(camp_n) / float(total_n)
+    return float(camp_q) / float(total_q)
+
+
+def monthly_plan_daily_avg(
+    plan: pd.DataFrame,
+    products: pd.DataFrame,
+    *,
+    work_days: float = DEFAULT_WORK_DAYS,
+    campus: str | None = None,
+    equip: pd.DataFrame | None = None,
+    manpower: pd.DataFrame | None = None,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
+) -> dict[str, float]:
+    """일평균 매수 — 치수 CEL · 치수 Ring · 외관.
+
+    campus가 있으면 공정 자원 비중(설비/인력)으로 Total 일평균을 배분.
+    """
+    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
+    tagged = _tagged_monthly_plan(plan, products)
+    zero = {"치수_CEL": 0.0, "치수_Ring": 0.0, "외관": 0.0}
+    if tagged.empty:
+        return zero
+
+    cel = float(tagged.loc[tagged["제품군"] == "CEL", "월목표매수"].sum())
+    ring = float(tagged.loc[tagged["제품군"] == "Ring", "월목표매수"].sum())
+    total = float(tagged["월목표매수"].sum())
+    out = {
+        "치수_CEL": round(cel / days, 1),
+        "치수_Ring": round(ring / days, 1),
+        "외관": round(total / days, 1),
+    }
+    if not campus:
+        return out
+
+    dim_share = _campus_resource_share(
+        area="치수",
+        campus=campus,
+        equip=equip,
+        manpower=manpower,
+        shift_teams=shift_teams,
+        working_teams=working_teams,
+    )
+    app_share = _campus_resource_share(
+        area="외관",
+        campus=campus,
+        equip=equip,
+        manpower=manpower,
+        shift_teams=shift_teams,
+        working_teams=working_teams,
+    )
+    return {
+        "치수_CEL": round(out["치수_CEL"] * dim_share, 1),
+        "치수_Ring": round(out["치수_Ring"] * dim_share, 1),
+        "외관": round(out["외관"] * app_share, 1),
+    }
+
+
 def _product_process_spec(products: pd.DataFrame, code: str, area: str) -> dict[str, Any] | None:
     """제품코드×공정 택트 (동일 공정 여러 설비코드면 평균)."""
     if products.empty:
