@@ -9,6 +9,11 @@ import pandas as pd
 from stats_engine import AREAS
 
 DAY_MINUTES = 1440
+# 3조 2교대: 기준정보의 인원은 전 조 합계 → 하루 근무인원 = 총인원 × (근무조/총조)
+DEFAULT_SHIFT_TEAMS = 3
+DEFAULT_WORKING_TEAMS = 2
+# 1인 1교대 권장 가용분 (12시간 기준). 설비 24시간 가동과는 별개.
+DEFAULT_SHIFT_MINUTES = 720
 MASTER_STEMS = ("설비_기준정보", "인력_기준정보", "제품_기준정보", "제품별_실적")
 MASTER_GH_FOLDERS = ("templates", "data/master", "data")
 
@@ -62,6 +67,42 @@ def _code_or_blank(v: Any) -> str:
     return t
 
 
+def effective_daily_headcount(
+    total_people: float,
+    *,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
+) -> float:
+    """총인원(전 조 합) → 하루 실제 근무 가능 인원.
+
+    3조 2교대: 하루 2개조 근무·1개조 휴무 → 총인원 × 2/3.
+    """
+    people = float(total_people or 0)
+    teams = int(shift_teams or 0)
+    working = int(working_teams or 0)
+    if people <= 0:
+        return 0.0
+    if teams <= 0 or working <= 0:
+        return people
+    if working >= teams:
+        return people
+    return people * working / teams
+
+
+def headcount_factor(
+    *,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
+) -> float:
+    teams = int(shift_teams or 0)
+    working = int(working_teams or 0)
+    if teams <= 0 or working <= 0:
+        return 1.0
+    if working >= teams:
+        return 1.0
+    return working / teams
+
+
 def _is_running(v: Any) -> bool:
     t = _norm(v).lower().replace(" ", "")
     if not t:
@@ -105,7 +146,9 @@ def equipment_template() -> pd.DataFrame:
 
 
 def manpower_template() -> pd.DataFrame:
-    """인력 기준 — 외관처럼 설비 없이 사람이 하는 공정용."""
+    """인력 기준 — 외관처럼 설비 없이 사람이 하는 공정용.
+    인원 = 3개조 합계. 계산 시 ×(2/3)로 하루 근무인원 환산. 가용분 = 1인 1교대 분.
+    """
     rows = []
     for campus, people in (("천안", 4), ("아산", 2)):
         rows.append(
@@ -113,9 +156,9 @@ def manpower_template() -> pd.DataFrame:
                 "캠퍼스": campus,
                 "공정": "외관",
                 "인원": people,
-                "가용분": DAY_MINUTES,
+                "가용분": DEFAULT_SHIFT_MINUTES,
                 "가동여부": "Y",
-                "비고": "설비 없음 — 인원×가용분÷매당_인시분",
+                "비고": "인원=전조합계 → 근무인원×가용분÷매당_인시분 (3조2교대)",
             }
         )
     return pd.DataFrame(rows, columns=list(MANPOWER_COLUMNS))
@@ -259,11 +302,11 @@ def normalize_manpower(df: pd.DataFrame) -> pd.DataFrame:
     )
     for c in MANPOWER_COLUMNS:
         if c not in work.columns:
-            work[c] = DAY_MINUTES if c == "가용분" else ("" if c not in ("인원",) else 0)
+            work[c] = DEFAULT_SHIFT_MINUTES if c == "가용분" else ("" if c not in ("인원",) else 0)
     work["캠퍼스"] = work["캠퍼스"].map(_norm)
     work["공정"] = work["공정"].map(_norm)
     work["인원"] = work["인원"].map(lambda v: _num(v, 0))
-    work["가용분"] = work["가용분"].map(lambda v: _num(v, DAY_MINUTES) or DAY_MINUTES)
+    work["가용분"] = work["가용분"].map(lambda v: _num(v, DEFAULT_SHIFT_MINUTES) or DEFAULT_SHIFT_MINUTES)
     work["가동"] = work["가동여부"].map(_is_running)
     work = work[(work["공정"] != "") & (work["인원"] > 0)]
     return work.reset_index(drop=True)
@@ -347,7 +390,7 @@ def running_manpower(
     if work.empty:
         return 0.0, float(DAY_MINUTES)
     people = float(work["인원"].sum())
-    avail = float((work["인원"] * work["가용분"]).sum() / people) if people else float(DAY_MINUTES)
+    avail = float((work["인원"] * work["가용분"]).sum() / people) if people else float(DEFAULT_SHIFT_MINUTES)
     return people, avail
 
 
@@ -358,18 +401,29 @@ def daily_capacity(
     campus: str | None = None,
     day_minutes: float = DAY_MINUTES,
     manpower: pd.DataFrame | None = None,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
 ) -> pd.DataFrame:
-    """제품×공정 일 능력. 설비 공정=대수×분÷설비택트, 인력 공정=인원×가용분÷인시택트."""
+    """제품×공정 일 능력.
+
+    설비: 대수 × 1440 ÷ 매당_설비분 (2교대로 설비는 하루 연속 가동 가정)
+    인력: 근무인원 × 가용분 ÷ 매당_인시분
+         근무인원 = 총인원(전 조) × (근무조/총조)  예: 3조2교대 → ×2/3
+    """
     if products.empty:
         return pd.DataFrame()
     man = manpower if manpower is not None else pd.DataFrame()
+    factor = headcount_factor(shift_teams=shift_teams, working_teams=working_teams)
     rows = []
     for _, r in products.iterrows():
         kind = str(r.get("제약유형") or "설비")
         eq_qty = running_qty(
             equip, campus=campus, area=str(r["공정"]), equip_code=str(r.get("설비코드") or "")
         )
-        man_qty, man_avail = running_manpower(man, campus=campus, area=str(r["공정"]))
+        man_total, man_avail = running_manpower(man, campus=campus, area=str(r["공정"]))
+        man_qty = effective_daily_headcount(
+            man_total, shift_teams=shift_teams, working_teams=working_teams
+        )
         eq_tact = float(r["매당_설비분"])
         man_tact = float(r["매당_인시분"]) or eq_tact
 
@@ -396,7 +450,9 @@ def daily_capacity(
                 "제약유형": mode,
                 "설비코드": r.get("설비코드") or "",
                 "가동대수": eq_qty if mode == "설비" else 0,
-                "보유인원": man_qty if mode == "인력" else need_people,
+                "총인원": round(man_total, 1) if mode == "인력" else need_people,
+                "근무인원": round(man_qty, 1) if mode == "인력" else need_people,
+                "조보정": round(factor, 4) if mode == "인력" else 1.0,
                 "가용분": round(minutes, 1),
                 "매당_설비분": eq_tact,
                 "매당_인시분": man_tact,
@@ -430,6 +486,8 @@ def mix_simulation(
     campus: str | None = None,
     day_minutes: float = DAY_MINUTES,
     manpower: pd.DataFrame | None = None,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
 ) -> pd.DataFrame:
     """제품 비중으로 설비·인력 가용분을 나눠 일 가능 매수를 계산."""
     if products.empty or mix is None or mix.empty:
@@ -446,7 +504,10 @@ def mix_simulation(
     rows = []
     for area in AREAS:
         eq_qty = running_qty(equip, campus=campus, area=area)
-        man_qty, man_avail = running_manpower(man, campus=campus, area=area)
+        man_total, man_avail = running_manpower(man, campus=campus, area=area)
+        man_qty = effective_daily_headcount(
+            man_total, shift_teams=shift_teams, working_teams=working_teams
+        )
         for _, m in work.iterrows():
             code = _norm(m["제품코드"])
             spec = products[(products["제품코드"] == code) & (products["공정"] == area)]
@@ -479,6 +540,7 @@ def mix_simulation(
                     "매당분": tact,
                     "일가능매수": sheets,
                     "자원수": resource,
+                    "총인원": round(man_total, 1) if mode == "인력" else resource,
                 }
             )
     return pd.DataFrame(rows)
