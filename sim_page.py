@@ -234,7 +234,8 @@ def render() -> None:
     st.title("설비 운영 시뮬레이션")
     st.caption(
         "보유 설비·인력과 제품 택트로 하루 능력을 보고, 실적 대비 인당 시간 활용률을 계산합니다. "
-        "인력 기준정보의 인원은 **3개조 합계**로 두고, 하루 능력은 근무조(기본 2/3)만 반영합니다. "
+        "인력 기준정보의 인원은 **전 공정·3개조 합계**로 두고, 하루 능력은 근무조(기본 2/3)만 반영합니다. "
+        "설비 대수는 설비_기준정보를 캠퍼스·공정으로 합산합니다. "
         "외관처럼 설비 없이 사람이 하는 공정은 `인력_기준정보`에 넣습니다. "
         "GitHub `templates/`에 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적을 올리면 자동으로 가져옵니다."
     )
@@ -354,6 +355,7 @@ def render() -> None:
         st.caption(
             "파일명: 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx). "
             "외관 등 수작업은 인력_기준정보에 인원을 넣으세요. "
+            "치수·Hole 등 설비 공정도 인력_기준정보에 공정별 인원을 넣으면 총인원/근무인원에 반영됩니다. "
             "새로 올리면 같은 종류의 이전 운영 파일은 자동으로 교체됩니다."
         )
         st.markdown("**지금 운영 중**")
@@ -526,12 +528,12 @@ def render() -> None:
             st.caption("가동 대수 합계")
             st.dataframe(by, use_container_width=True)
         st.markdown(
-            "**인력** — 외관처럼 설비 없이 사람이 하는 공정. "
+            "**인력** — 전 공정(종합측정실·치수·Hole·외관) 인원을 `인력_기준정보`에 둡니다. "
             "`인원`은 3개조 합계, `가용분`은 1인 1교대 분(권장 720). "
-            f"일가능매수 = 총인원×({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분."
+            f"인력 능력 = 총인원×({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분."
         )
         if man_view.empty:
-            st.info("인력 기준정보를 업로드하세요. (외관 등 수작업)")
+            st.info("인력 기준정보를 업로드하세요. (전 공정 인원)")
         else:
             st.dataframe(man_view.drop(columns=["가동"], errors="ignore"), use_container_width=True)
         st.markdown(
@@ -551,9 +553,9 @@ def render() -> None:
     with tab_sim:
         st.subheader("하루 능력 (설비·인력)")
         st.caption(
-            "설비 공정: 일가능매수 = 가동 대수 × 1440 ÷ 매당_설비분 (2교대 연속 가동). "
-            f"인력 공정: 일가능매수 = 총인원 × ({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분. "
-            "제품별 병목은 공정 중 가장 낮은 일가능매수입니다."
+            "설비: 설비_기준정보의 해당 공정 가동 설비를 캠퍼스 합산(제품 설비코드는 택트 매칭). "
+            f"인력 열(총인원·근무인원)은 전 공정 모두 인력_기준정보 ×({working_teams}/{shift_teams}). "
+            "같은 공정 설비 능력은 합산 후, 제품 병목은 공정 간 최소값입니다."
         )
         campus_for_cap = campus_sel[0] if len(campus_sel) == 1 else None
         if len(campus_sel) != 1:
@@ -569,16 +571,23 @@ def render() -> None:
         if cap.empty:
             st.warning("제품 기준정보와 설비 또는 인력 기준정보가 있어야 시뮬레이션할 수 있습니다.")
         else:
+            eq_total = 0.0
+            if not eq_view.empty and "대수" in eq_view.columns:
+                running = eq_view["가동"] if "가동" in eq_view.columns else True
+                eq_total = float(eq_view.loc[running, "대수"].sum())
             k1, k2, k3 = st.columns(3)
             with k1:
-                st.metric("가동 대수", f"{int(cap['가동대수'].sum())}대")
+                st.metric("가동 대수", f"{int(eq_total)}대")
             with k2:
                 bn = cap.drop_duplicates("제품코드")
                 st.metric("제품 수", f"{len(bn)}종")
             with k3:
                 st.metric("병목 합(참고)", f"{bn['병목가능매수'].sum():,.0f}매")
             st.dataframe(cap, use_container_width=True)
-            chart_df = cap.copy()
+            chart_df = (
+                cap.groupby(["제품코드", "제품명", "공정"], as_index=False)["일가능매수"]
+                .sum()
+            )
             bar = (
                 alt.Chart(chart_df)
                 .mark_bar()
@@ -591,7 +600,9 @@ def render() -> None:
                         "제품코드",
                         "제품명",
                         "공정",
+                        "캠퍼스",
                         "제약유형",
+                        "설비코드",
                         "가동대수",
                         "총인원",
                         "근무인원",
