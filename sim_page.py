@@ -38,6 +38,7 @@ from sim_engine import (
     equipment_template,
     manpower_template,
     master_github_paths,
+    monthly_plan_daily_avg,
     monthly_plan_family_stats,
     monthly_plan_feasibility,
     monthly_plan_template,
@@ -69,6 +70,18 @@ def _render_plan_family_summary(stats: pd.DataFrame) -> None:
                 st.metric("계획 품목", f"{int(row['계획품목수'])}종")
             with m2:
                 st.metric("월목표 합계", f"{float(row['월목표합계']):,.0f}")
+
+
+def _render_daily_avg_row(title: str, avg: dict[str, float]) -> None:
+    """일평균 치수 CEL · 치수 Ring · 외관."""
+    st.markdown(f"**{title}**")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("치수 CEL", f"{avg.get('치수_CEL', 0):,.1f}매/일")
+    with c2:
+        st.metric("치수 Ring", f"{avg.get('치수_Ring', 0):,.1f}매/일")
+    with c3:
+        st.metric("외관", f"{avg.get('외관', 0):,.1f}매/일")
 
 
 def _read_plan_csv(raw: bytes) -> pd.DataFrame:
@@ -656,6 +669,37 @@ def render() -> None:
                 plan_stats = monthly_plan_family_stats(plan_for_calc, pr_view)
                 st.markdown("**계획 요약**")
                 _render_plan_family_summary(plan_stats)
+
+                total_avg = monthly_plan_daily_avg(
+                    plan_for_calc,
+                    pr_view,
+                    work_days=work_days,
+                )
+                st.markdown("**일평균**")
+                st.caption("일평균 = 월목표 ÷ 작업일 · 치수 CEL/Ring은 제품군별, 외관은 전체 합계")
+                _render_daily_avg_row("전체", total_avg)
+
+                camp_names = [c for c in ("천안", "아산") if not campus_sel or c in campus_sel]
+                if camp_names:
+                    campus_cols = st.columns(len(camp_names))
+                    for col, camp_name in zip(campus_cols, camp_names):
+                        camp_avg = monthly_plan_daily_avg(
+                            plan_for_calc,
+                            pr_view,
+                            work_days=work_days,
+                            campus=camp_name,
+                            equip=eq_view,
+                            manpower=man_view,
+                            shift_teams=shift_teams,
+                            working_teams=working_teams,
+                        )
+                        with col:
+                            _render_daily_avg_row(camp_name, camp_avg)
+                    st.caption(
+                        "천안/아산 일평균은 전체 일평균을 공정 자원 비중으로 나눈 값입니다. "
+                        "(치수=가동 설비 대수, 외관=근무인원)"
+                    )
+
                 st.caption(f"적용 파일: **{fname}**")
                 with st.expander("업로드 계획 목록", expanded=False):
                     st.dataframe(plan_for_calc, use_container_width=True, hide_index=True)
