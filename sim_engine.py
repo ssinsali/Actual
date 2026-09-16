@@ -146,21 +146,24 @@ def equipment_template() -> pd.DataFrame:
 
 
 def manpower_template() -> pd.DataFrame:
-    """인력 기준 — 외관처럼 설비 없이 사람이 하는 공정용.
-    인원 = 3개조 합계. 계산 시 ×(2/3)로 하루 근무인원 환산. 가용분 = 1인 1교대 분.
-    """
+    """인력 기준 — 전 공정. 인원=3개조 합계, 계산 시 ×(2/3), 가용분=1인 1교대 분."""
     rows = []
-    for campus, people in (("천안", 4), ("아산", 2)):
-        rows.append(
-            {
-                "캠퍼스": campus,
-                "공정": "외관",
-                "인원": people,
-                "가용분": DEFAULT_SHIFT_MINUTES,
-                "가동여부": "Y",
-                "비고": "인원=전조합계 → 근무인원×가용분÷매당_인시분 (3조2교대)",
-            }
-        )
+    samples = {
+        "천안": {"종합측정실": 3, "치수": 6, "Hole": 4, "외관": 4},
+        "아산": {"종합측정실": 2, "치수": 3, "Hole": 2, "외관": 2},
+    }
+    for campus, areas in samples.items():
+        for area, people in areas.items():
+            rows.append(
+                {
+                    "캠퍼스": campus,
+                    "공정": area,
+                    "인원": people,
+                    "가용분": DEFAULT_SHIFT_MINUTES,
+                    "가동여부": "Y",
+                    "비고": "인원=전조합계 (3조2교대 → 근무인원 ×2/3)",
+                }
+            )
     return pd.DataFrame(rows, columns=list(MANPOWER_COLUMNS))
 
 
@@ -360,9 +363,15 @@ def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
     return work.reset_index(drop=True)
 
 
-def running_qty(equip: pd.DataFrame, *, campus: str | None, area: str, equip_code: str = "") -> float:
-    if equip.empty:
-        return 0.0
+def _equip_slice(
+    equip: pd.DataFrame,
+    *,
+    campus: str | None,
+    area: str,
+    equip_code: str = "",
+) -> pd.DataFrame:
+    if equip is None or equip.empty:
+        return pd.DataFrame()
     work = equip[equip["가동"]].copy()
     if campus:
         work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
@@ -370,7 +379,20 @@ def running_qty(equip: pd.DataFrame, *, campus: str | None, area: str, equip_cod
     if equip_code:
         hit = work[work["설비코드"] == equip_code]
         if not hit.empty:
-            work = hit
+            return hit
+    return work
+
+
+def running_qty(equip: pd.DataFrame, *, campus: str | None, area: str, equip_code: str = "") -> float:
+    """가동 대수. 설비코드가 있으면 우선 매칭, 없으면(또는 미스) 해당 공정 전체 합."""
+    work = _equip_slice(equip, campus=campus, area=area, equip_code=equip_code)
+    if work.empty:
+        return 0.0
+    # 코드 지정인데 매칭 실패 시 _equip_slice가 공정 전체로 떨어진 경우도 합산
+    if equip_code:
+        exact = work[work["설비코드"] == equip_code]
+        if not exact.empty:
+            work = exact
     return float(work["대수"].sum()) if not work.empty else 0.0
 
 
@@ -380,18 +402,37 @@ def running_manpower(
     campus: str | None,
     area: str,
 ) -> tuple[float, float]:
-    """(인원 합, 인원가중 평균 가용분)."""
+    """(인원 합, 인원가중 평균 가용분). 인력_기준정보 기준 — 전 공정 공통."""
     if manpower is None or manpower.empty:
-        return 0.0, float(DAY_MINUTES)
+        return 0.0, float(DEFAULT_SHIFT_MINUTES)
     work = manpower[manpower["가동"]].copy()
     if campus:
         work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
     work = work[work["공정"] == area]
     if work.empty:
-        return 0.0, float(DAY_MINUTES)
+        return 0.0, float(DEFAULT_SHIFT_MINUTES)
     people = float(work["인원"].sum())
     avail = float((work["인원"] * work["가용분"]).sum() / people) if people else float(DEFAULT_SHIFT_MINUTES)
     return people, avail
+
+
+def _spec_tact(specs: pd.DataFrame, equip_code: str) -> tuple[float, float]:
+    """제품 기준에서 설비코드 택트. 없으면 공정 평균."""
+    if specs is None or specs.empty:
+        return 0.0, 0.0
+    code = _norm(equip_code)
+    if code:
+        hit = specs[specs["설비코드"].map(_norm) == code]
+        if not hit.empty:
+            r = hit.iloc[0]
+            eq_t = float(r["매당_설비분"] or 0)
+            man_t = float(r["매당_인시분"] or 0) or eq_t
+            return eq_t, man_t
+    eq_t = float(pd.to_numeric(specs["매당_설비분"], errors="coerce").replace(0, pd.NA).mean() or 0)
+    man_t = float(pd.to_numeric(specs["매당_인시분"], errors="coerce").replace(0, pd.NA).mean() or 0) or eq_t
+    if eq_t <= 0:
+        eq_t = man_t
+    return eq_t, man_t
 
 
 def daily_capacity(
@@ -406,76 +447,118 @@ def daily_capacity(
 ) -> pd.DataFrame:
     """제품×공정 일 능력.
 
-    설비: 대수 × 1440 ÷ 매당_설비분 (2교대로 설비는 하루 연속 가동 가정)
-    인력: 근무인원 × 가용분 ÷ 매당_인시분
-         근무인원 = 총인원(전 조) × (근무조/총조)  예: 3조2교대 → ×2/3
+    - 총인원/근무인원: 항상 인력_기준정보 (전 공정, 3조2교대 → ×근무조/총조)
+    - 설비: 설비_기준정보의 해당 공정 가동 설비를 캠퍼스 합산해 행으로 펼침
+      (제품 설비코드는 택트 매칭용. 코드가 달라도 공정이 같으면 대수에 포함)
+    - 인력: 근무인원 × 가용분 ÷ 매당_인시분
+    - 병목: 같은 제품·공정 안 설비 능력은 합산 후, 공정 간 최소
     """
     if products.empty:
         return pd.DataFrame()
     man = manpower if manpower is not None else pd.DataFrame()
+    eq = equip if equip is not None else pd.DataFrame()
     factor = headcount_factor(shift_teams=shift_teams, working_teams=working_teams)
-    rows = []
-    for _, r in products.iterrows():
-        kind = str(r.get("제약유형") or "설비")
-        eq_qty = running_qty(
-            equip, campus=campus, area=str(r["공정"]), equip_code=str(r.get("설비코드") or "")
-        )
-        man_total, man_avail = running_manpower(man, campus=campus, area=str(r["공정"]))
-        man_qty = effective_daily_headcount(
-            man_total, shift_teams=shift_teams, working_teams=working_teams
-        )
-        eq_tact = float(r["매당_설비분"])
-        man_tact = float(r["매당_인시분"]) or eq_tact
+    rows: list[dict[str, Any]] = []
 
-        if kind == "인력" or (eq_qty <= 0 and man_qty > 0 and man_tact > 0):
-            resource = man_qty
-            minutes = man_avail if man_avail else day_minutes
-            tact = man_tact
-            mode = "인력"
-            sheets = round(resource * minutes / tact, 1) if tact > 0 else 0.0
-            need_people = round(resource, 1)
-        else:
-            resource = eq_qty
-            minutes = day_minutes
-            tact = eq_tact if eq_tact > 0 else man_tact
-            mode = "설비"
-            sheets = round(resource * minutes / tact, 1) if tact > 0 else 0.0
-            need_people = round(resource * float(r["필요인원"]), 1)
+    for code in products["제품코드"].map(_norm).unique():
+        if not code:
+            continue
+        psub = products[products["제품코드"].map(_norm) == code]
+        pname = _norm(psub["제품명"].iloc[0]) if "제품명" in psub.columns else code
+        for area in psub["공정"].map(_norm).unique():
+            if not area:
+                continue
+            specs = psub[psub["공정"].map(_norm) == area]
+            kind0 = _norm(specs["제약유형"].iloc[0]) if "제약유형" in specs.columns else "설비"
+            man_total, man_avail = running_manpower(man, campus=campus, area=area)
+            man_qty = effective_daily_headcount(
+                man_total, shift_teams=shift_teams, working_teams=working_teams
+            )
+            eq_work = _equip_slice(eq, campus=campus, area=area, equip_code="")
+            use_man = kind0 == "인력" or (eq_work.empty and man_qty > 0)
 
-        rows.append(
-            {
-                "제품코드": r["제품코드"],
-                "제품명": r["제품명"],
-                "공정": r["공정"],
-                "제약유형": mode,
-                "설비코드": r.get("설비코드") or "",
-                "가동대수": eq_qty if mode == "설비" else 0,
-                "총인원": round(man_total, 1) if mode == "인력" else need_people,
-                "근무인원": round(man_qty, 1) if mode == "인력" else need_people,
-                "조보정": round(factor, 4) if mode == "인력" else 1.0,
-                "가용분": round(minutes, 1),
-                "매당_설비분": eq_tact,
-                "매당_인시분": man_tact,
-                "필요인원": need_people,
-                "일가능매수": sheets,
-            }
-        )
+            if use_man:
+                _, man_tact = _spec_tact(specs, "")
+                if man_tact <= 0:
+                    man_tact = float(specs["매당_인시분"].iloc[0] or 0)
+                minutes = man_avail if man_avail else DEFAULT_SHIFT_MINUTES
+                sheets = round(man_qty * minutes / man_tact, 1) if man_tact > 0 else 0.0
+                rows.append(
+                    {
+                        "제품코드": code,
+                        "제품명": pname,
+                        "공정": area,
+                        "캠퍼스": campus or "합산",
+                        "제약유형": "인력",
+                        "설비코드": "",
+                        "가동대수": 0.0,
+                        "총인원": round(man_total, 1),
+                        "근무인원": round(man_qty, 1),
+                        "조보정": round(factor, 4),
+                        "가용분": round(minutes, 1),
+                        "매당_설비분": float(specs["매당_설비분"].iloc[0] or 0),
+                        "매당_인시분": man_tact,
+                        "필요인원": round(man_qty, 1),
+                        "일가능매수": sheets,
+                    }
+                )
+                continue
+
+            default_eq, default_man = _spec_tact(specs, "")
+            for _, eqr in eq_work.iterrows():
+                eq_code = _norm(eqr.get("설비코드"))
+                eq_tact, man_tact = _spec_tact(specs, eq_code)
+                if eq_tact <= 0:
+                    eq_tact = default_eq
+                if man_tact <= 0:
+                    man_tact = default_man or eq_tact
+                qty = float(eqr.get("대수") or 0)
+                sheets = round(qty * day_minutes / eq_tact, 1) if eq_tact > 0 else 0.0
+                need = round(qty * float(specs["필요인원"].iloc[0] or 1), 1)
+                rows.append(
+                    {
+                        "제품코드": code,
+                        "제품명": pname,
+                        "공정": area,
+                        "캠퍼스": _norm(eqr.get("캠퍼스")) or (campus or ""),
+                        "제약유형": "설비",
+                        "설비코드": eq_code,
+                        "가동대수": qty,
+                        "총인원": round(man_total, 1),
+                        "근무인원": round(man_qty, 1),
+                        "조보정": round(factor, 4),
+                        "가용분": round(day_minutes, 1),
+                        "매당_설비분": eq_tact,
+                        "매당_인시분": man_tact,
+                        "필요인원": need,
+                        "일가능매수": sheets,
+                    }
+                )
+
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    bottleneck = (
-        out.groupby("제품코드", as_index=False)["일가능매수"]
-        .min()
-        .rename(columns={"일가능매수": "병목가능매수"})
+
+    # 병목: 동일 제품·공정은 능력 합산(병렬 설비) 후, 공정 간 최소
+    proc_cap = (
+        out.groupby(["제품코드", "공정"], as_index=False)["일가능매수"]
+        .sum()
+        .rename(columns={"일가능매수": "공정가능매수"})
     )
-    out = out.merge(bottleneck, on="제품코드", how="left")
+    bottleneck = (
+        proc_cap.groupby("제품코드", as_index=False)["공정가능매수"]
+        .min()
+        .rename(columns={"공정가능매수": "병목가능매수"})
+    )
     bn_proc = (
-        out.sort_values("일가능매수")
+        proc_cap.sort_values("공정가능매수")
         .groupby("제품코드", as_index=False)
         .first()[["제품코드", "공정"]]
         .rename(columns={"공정": "병목공정"})
     )
-    return out.merge(bn_proc, on="제품코드", how="left")
+    out = out.merge(bottleneck, on="제품코드", how="left")
+    out = out.merge(bn_proc, on="제품코드", how="left")
+    return out
 
 
 def mix_simulation(
@@ -503,7 +586,7 @@ def mix_simulation(
     work["비중"] = work["비중"] / total
     rows = []
     for area in AREAS:
-        eq_qty = running_qty(equip, campus=campus, area=area)
+        eq_qty = running_qty(equip, campus=campus, area=area, equip_code="")
         man_total, man_avail = running_manpower(man, campus=campus, area=area)
         man_qty = effective_daily_headcount(
             man_total, shift_teams=shift_teams, working_teams=working_teams
@@ -540,7 +623,8 @@ def mix_simulation(
                     "매당분": tact,
                     "일가능매수": sheets,
                     "자원수": resource,
-                    "총인원": round(man_total, 1) if mode == "인력" else resource,
+                    "총인원": round(man_total, 1),
+                    "근무인원": round(man_qty, 1),
                 }
             )
     return pd.DataFrame(rows)
