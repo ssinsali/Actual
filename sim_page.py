@@ -75,116 +75,28 @@ def _render_summary_row(
     caps: dict[str, pd.DataFrame],
     eq_view: pd.DataFrame,
 ) -> None:
-    """Total / 천안 / 아산 요약 — 큰 글씨, 가로 배치, 공정별 일가능매수."""
-    st.markdown(
-        """
-        <style>
-        .sim-sum-card {
-            border: 1px solid #3d4a5c;
-            border-radius: 12px;
-            padding: 1rem 1.1rem 1.15rem;
-            background: #1a2332;
-            min-height: 11rem;
-            color: #f3f6fb;
-        }
-        .sim-sum-title {
-            font-size: 1.75rem;
-            font-weight: 700;
-            margin: 0 0 0.75rem 0;
-            line-height: 1.2;
-            color: #ffffff;
-        }
-        .sim-sum-row { display: flex; gap: 0.75rem; margin-bottom: 0.85rem; }
-        .sim-sum-item { flex: 1; }
-        .sim-sum-label {
-            font-size: 0.95rem;
-            color: #9aa8bc;
-            margin-bottom: 0.15rem;
-        }
-        .sim-sum-value {
-            font-size: 1.55rem;
-            font-weight: 700;
-            line-height: 1.15;
-            color: #ffffff;
-        }
-        .sim-sum-proc-row { display: flex; gap: 0.6rem; }
-        .sim-sum-proc {
-            flex: 1;
-            text-align: center;
-            background: #243044;
-            border-radius: 8px;
-            padding: 0.55rem 0.35rem;
-            border: 1px solid #455468;
-        }
-        .sim-sum-proc-name {
-            font-size: 1.05rem;
-            font-weight: 600;
-            margin-bottom: 0.2rem;
-            color: #d7e0ee;
-        }
-        .sim-sum-proc-val {
-            font-size: 1.45rem;
-            font-weight: 700;
-            color: #7dd3fc;
-        }
-        .sim-sum-proc-unit {
-            font-size: 0.8rem;
-            color: #8fa0b5;
-        }
-        /* 라이트 테마 */
-        [data-theme="light"] .sim-sum-card {
-            background: #f4f7fb;
-            border-color: #c9d4e3;
-            color: #1b2430;
-        }
-        [data-theme="light"] .sim-sum-title,
-        [data-theme="light"] .sim-sum-value { color: #152033; }
-        [data-theme="light"] .sim-sum-label { color: #5b6b7c; }
-        [data-theme="light"] .sim-sum-proc {
-            background: #ffffff;
-            border-color: #c5d0de;
-        }
-        [data-theme="light"] .sim-sum-proc-name { color: #243447; }
-        [data-theme="light"] .sim-sum-proc-val { color: #0369a1; }
-        [data-theme="light"] .sim-sum-proc-unit { color: #64748b; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """Total / 천안 / 아산 요약 — Streamlit metric으로 테마 대비 보장."""
     cols = st.columns(len(campus_scopes), gap="medium")
     for col, (label, camp) in zip(cols, campus_scopes):
         cdf = caps.get(label, pd.DataFrame())
         eq_n = _eq_running_count(eq_view, camp)
         prod_n = int(cdf["제품코드"].nunique()) if not cdf.empty and "제품코드" in cdf.columns else 0
-        proc_html = "".join(
-            (
-                f'<div class="sim-sum-proc">'
-                f'<div class="sim-sum-proc-name">{area}</div>'
-                f'<div class="sim-sum-proc-val">{_process_sheets(cdf, area):,.0f}</div>'
-                f'<div class="sim-sum-proc-unit">일가능매수</div>'
-                f"</div>"
-            )
-            for area in SUMMARY_PROCESS_AREAS
-        )
         with col:
-            st.markdown(
-                f"""
-                <div class="sim-sum-card">
-                  <div class="sim-sum-title">{label}</div>
-                  <div class="sim-sum-row">
-                    <div class="sim-sum-item">
-                      <div class="sim-sum-label">가동 대수</div>
-                      <div class="sim-sum-value">{eq_n}대</div>
-                    </div>
-                    <div class="sim-sum-item">
-                      <div class="sim-sum-label">제품 수</div>
-                      <div class="sim-sum-value">{prod_n}종</div>
-                    </div>
-                  </div>
-                  <div class="sim-sum-proc-row">{proc_html}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+            st.markdown(f"### {label}")
+            top = st.columns(2)
+            with top[0]:
+                st.metric("가동 대수", f"{eq_n}대")
+            with top[1]:
+                st.metric("제품 수", f"{prod_n}종")
+            proc_cols = st.columns(len(SUMMARY_PROCESS_AREAS))
+            for pc, area in zip(proc_cols, SUMMARY_PROCESS_AREAS):
+                sheets = _process_sheets(cdf, area)
+                with pc:
+                    st.metric(area, f"{sheets:,.0f}", help="일가능매수")
+            # 값이 바뀌면 위젯이 확실히 갱신되도록 데이터 지문
+            st.caption(
+                f"반영: 대수 {eq_n} · "
+                + " · ".join(f"{a} {_process_sheets(cdf, a):,.0f}" for a in SUMMARY_PROCESS_AREAS)
             )
 
 
@@ -258,6 +170,11 @@ def _push_master_github(filename: str, content: bytes) -> str:
 
 
 def _sync_master_from_github(*, force: bool = False) -> list[str]:
+    """GitHub templates → data/master.
+
+    - force=False: 로컬에 이미 있는 종류는 유지(업로드분 덮어쓰지 않음). 없는 종류만 가져옴.
+    - force=True: 로컬을 지우고 저장소에서 다시 받음.
+    """
     if not github_store_enabled():
         return ["GitHub Secrets([github] token/repo)가 없어 로컬·업로드 파일만 사용합니다."]
     if not force and st.session_state.get("sim_gh_master_ok"):
@@ -269,6 +186,10 @@ def _sync_master_from_github(*, force: bool = False) -> list[str]:
         if cleared:
             notes.append("로컬 기준정보 초기화: " + ", ".join(cleared))
     for stem in MASTER_STEMS:
+        local = newest_matching(folder, stem)
+        if local is not None and not force:
+            notes.append(f"{stem}: 로컬 유지 ({local.name})")
+            continue
         found_rel = None
         found_raw = None
         for rel in master_github_paths(stem):
@@ -289,7 +210,6 @@ def _sync_master_from_github(*, force: bool = False) -> list[str]:
             dest = folder / Path(found_rel).name
             if not dest.name.startswith(stem):
                 dest = folder / f"{stem}{Path(found_rel).suffix}"
-            # 같은 종류 옛 파일 제거 후 저장
             _clear_master_files(stem)
             dest.write_bytes(found_raw)
             notes.append(f"GitHub에서 가져옴: {found_rel}")
@@ -307,6 +227,9 @@ def _save_upload(uploaded, prefix: str):
     dest = master_dir() / name
     data = uploaded.getvalue()
     dest.write_bytes(data)
+    # 업로드분을 GitHub 재동기화가 덮어쓰지 않도록
+    st.session_state["sim_gh_master_ok"] = True
+    st.session_state.pop("sim_gh_master_notes", None)
     gh = _push_master_github(name, data)
     return dest, gh
 
@@ -536,25 +459,21 @@ def render() -> None:
         if eq_up is not None and eq_sig != st.session_state.get("sim_eq_sig"):
             path, gh = _save_upload(eq_up, "설비_기준정보")
             st.session_state["sim_eq_sig"] = eq_sig
-            st.session_state["sim_gh_master_ok"] = False
             st.session_state["sim_flash"] = f"설비 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if man_up is not None and man_sig != st.session_state.get("sim_man_sig"):
             path, gh = _save_upload(man_up, "인력_기준정보")
             st.session_state["sim_man_sig"] = man_sig
-            st.session_state["sim_gh_master_ok"] = False
             st.session_state["sim_flash"] = f"인력 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if pr_up is not None and pr_sig != st.session_state.get("sim_pr_sig"):
             path, gh = _save_upload(pr_up, "제품_기준정보")
             st.session_state["sim_pr_sig"] = pr_sig
-            st.session_state["sim_gh_master_ok"] = False
             st.session_state["sim_flash"] = f"제품 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if act_up is not None and act_sig != st.session_state.get("sim_act_sig"):
             path, gh = _save_upload(act_up, "제품별_실적")
             st.session_state["sim_act_sig"] = act_sig
-            st.session_state["sim_gh_master_ok"] = False
             st.session_state["sim_flash"] = f"제품별 실적 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         st.subheader("양식 받기")
