@@ -605,7 +605,8 @@ def render() -> None:
             st.caption("가동 대수 합계")
             st.dataframe(by, use_container_width=True)
         st.markdown(
-            "**인력** — 전 공정(종합측정실·치수·Hole·외관) 인원을 `인력_기준정보`에 둡니다. "
+            "**인력** — `인력_기준정보`는 **캠퍼스+공정** 단위로 둡니다. "
+            "치수처럼 설비가 2종이어도 인원을 설비별로 나누지 않습니다. "
             "`인원`은 3개조 합계, `가용분`은 1인 1교대 분(권장 720). "
             f"인력 능력 = 총인원×({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분."
         )
@@ -630,9 +631,10 @@ def render() -> None:
     with tab_sim:
         st.subheader("하루 능력 (설비·인력)")
         st.caption(
-            "설비: 설비_기준정보의 해당 공정 가동 설비를 캠퍼스 합산(제품 설비코드는 택트 매칭). "
-            f"인력 열(총인원·근무인원)은 전 공정 모두 인력_기준정보 ×({working_teams}/{shift_teams}). "
-            "공정은 개별 능력으로 보며, 치수·Hole·외관 일가능매수를 각각 표시합니다."
+            "설비: 설비별 일가능매수. "
+            "총인원·근무인원은 **캠퍼스+공정 단위**(설비코드별 배분 없음)라서 "
+            "같은 공정의 두 번째 설비부터는 비워 둡니다(합산하면 안 됨). "
+            f"근무인원 = 총인원 × ({working_teams}/{shift_teams})."
         )
 
         campus_scopes: list[tuple[str, str | None]] = [("Total", None)]
@@ -673,6 +675,10 @@ def render() -> None:
             if cap is None or cap.empty:
                 cap = next((df for df in caps.values() if not df.empty), pd.DataFrame())
             show_cap = cap.drop(columns=["병목가능매수", "병목공정"], errors="ignore")
+            st.caption(
+                "표 안내: 치수에 DIM·HCAH처럼 설비가 여러 종이어도 "
+                "총인원/근무인원은 공정 공유 인원입니다. 첫 행에만 표시합니다."
+            )
             st.dataframe(show_cap, use_container_width=True)
 
             st.markdown("##### 공정별 일 가능 매수")
