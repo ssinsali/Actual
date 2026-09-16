@@ -80,29 +80,73 @@ def _render_summary_row(
         """
         <style>
         .sim-sum-card {
-            border: 1px solid rgba(49, 51, 63, 0.2);
+            border: 1px solid #3d4a5c;
             border-radius: 12px;
             padding: 1rem 1.1rem 1.15rem;
-            background: rgba(250, 250, 250, 0.55);
+            background: #1a2332;
             min-height: 11rem;
+            color: #f3f6fb;
         }
-        .sim-sum-title { font-size: 1.75rem; font-weight: 700; margin: 0 0 0.75rem 0; line-height: 1.2; }
+        .sim-sum-title {
+            font-size: 1.75rem;
+            font-weight: 700;
+            margin: 0 0 0.75rem 0;
+            line-height: 1.2;
+            color: #ffffff;
+        }
         .sim-sum-row { display: flex; gap: 0.75rem; margin-bottom: 0.85rem; }
         .sim-sum-item { flex: 1; }
-        .sim-sum-label { font-size: 0.95rem; color: rgba(49, 51, 63, 0.7); margin-bottom: 0.15rem; }
-        .sim-sum-value { font-size: 1.55rem; font-weight: 700; line-height: 1.15; }
+        .sim-sum-label {
+            font-size: 0.95rem;
+            color: #9aa8bc;
+            margin-bottom: 0.15rem;
+        }
+        .sim-sum-value {
+            font-size: 1.55rem;
+            font-weight: 700;
+            line-height: 1.15;
+            color: #ffffff;
+        }
         .sim-sum-proc-row { display: flex; gap: 0.6rem; }
         .sim-sum-proc {
             flex: 1;
             text-align: center;
-            background: rgba(255,255,255,0.85);
+            background: #243044;
             border-radius: 8px;
             padding: 0.55rem 0.35rem;
-            border: 1px solid rgba(49, 51, 63, 0.12);
+            border: 1px solid #455468;
         }
-        .sim-sum-proc-name { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.2rem; }
-        .sim-sum-proc-val { font-size: 1.45rem; font-weight: 700; }
-        .sim-sum-proc-unit { font-size: 0.8rem; color: rgba(49, 51, 63, 0.55); }
+        .sim-sum-proc-name {
+            font-size: 1.05rem;
+            font-weight: 600;
+            margin-bottom: 0.2rem;
+            color: #d7e0ee;
+        }
+        .sim-sum-proc-val {
+            font-size: 1.45rem;
+            font-weight: 700;
+            color: #7dd3fc;
+        }
+        .sim-sum-proc-unit {
+            font-size: 0.8rem;
+            color: #8fa0b5;
+        }
+        /* 라이트 테마 */
+        [data-theme="light"] .sim-sum-card {
+            background: #f4f7fb;
+            border-color: #c9d4e3;
+            color: #1b2430;
+        }
+        [data-theme="light"] .sim-sum-title,
+        [data-theme="light"] .sim-sum-value { color: #152033; }
+        [data-theme="light"] .sim-sum-label { color: #5b6b7c; }
+        [data-theme="light"] .sim-sum-proc {
+            background: #ffffff;
+            border-color: #c5d0de;
+        }
+        [data-theme="light"] .sim-sum-proc-name { color: #243447; }
+        [data-theme="light"] .sim-sum-proc-val { color: #0369a1; }
+        [data-theme="light"] .sim-sum-proc-unit { color: #64748b; }
         </style>
         """,
         unsafe_allow_html=True,
