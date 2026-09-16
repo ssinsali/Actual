@@ -22,6 +22,7 @@ MANPOWER_COLUMNS = ("캠퍼스", "공정", "인원", "가용분", "가동여부"
 PRODUCT_COLUMNS = (
     "제품코드",
     "제품명",
+    "제품군",
     "공정",
     "제약유형",
     "설비코드",
@@ -31,6 +32,8 @@ PRODUCT_COLUMNS = (
     "비고",
 )
 PRODUCT_ACTUAL_COLUMNS = ("일자", "캠퍼스", "조", "주야", "제품코드", "공정", "인력", "실적")
+DEFAULT_MONTHLY_TARGETS = (("CEL", 700.0), ("Ring", 15000.0), ("Wafer", 3000.0))
+DEFAULT_WORK_DAYS = 20
 
 _YES = {"y", "yes", "1", "true", "가동", "사용", "o", "ㅇ", "예"}
 
@@ -169,9 +172,9 @@ def manpower_template() -> pd.DataFrame:
 
 def product_template() -> pd.DataFrame:
     specs = [
-        ("P-A", "제품A", {"종합측정실": 4.0, "치수": 0.9, "Hole": 2.4, "외관": 1.6}),
-        ("P-B", "제품B", {"종합측정실": 5.2, "치수": 1.1, "Hole": 3.0, "외관": 1.8}),
-        ("P-C", "제품C", {"종합측정실": 3.5, "치수": 0.7, "Hole": 2.0, "외관": 1.3}),
+        ("P-CEL", "CEL", "CEL", {"종합측정실": 4.0, "치수": 0.9, "Hole": 2.4, "외관": 1.6}),
+        ("P-RING", "Ring", "Ring", {"종합측정실": 5.2, "치수": 1.1, "Hole": 3.0, "외관": 1.8}),
+        ("P-WAFER", "Wafer", "Wafer", {"종합측정실": 3.5, "치수": 0.7, "Hole": 2.0, "외관": 1.3}),
     ]
     equip = {
         "종합측정실": ("설비", "CMM-01"),
@@ -180,7 +183,7 @@ def product_template() -> pd.DataFrame:
         "외관": ("인력", ""),
     }
     rows = []
-    for code, name, times in specs:
+    for code, name, family, times in specs:
         for area in AREAS:
             t = times[area]
             kind, eq = equip[area]
@@ -188,6 +191,7 @@ def product_template() -> pd.DataFrame:
                 {
                     "제품코드": code,
                     "제품명": name,
+                    "제품군": family,
                     "공정": area,
                     "제약유형": kind,
                     "설비코드": eq,
@@ -315,6 +319,21 @@ def normalize_manpower(df: pd.DataFrame) -> pd.DataFrame:
     return work.reset_index(drop=True)
 
 
+def _infer_product_family(name: Any) -> str:
+    """제품명/제품군에서 CEL·Ring·Wafer 등을 정규화."""
+    t = _norm(name)
+    if not t:
+        return ""
+    u = t.upper().replace(" ", "")
+    if "WAFER" in u or "웨이퍼" in t:
+        return "Wafer"
+    if "RING" in u or "링" == t:
+        return "Ring"
+    if "CEL" in u:
+        return "CEL"
+    return t
+
+
 def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=list(PRODUCT_COLUMNS))
@@ -323,6 +342,7 @@ def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
         {
             "제품코드": ("제품코드", "품번", "item"),
             "제품명": ("제품명", "품명"),
+            "제품군": ("제품군", "제품유형", "품종", "family", "type"),
             "공정": ("공정", "영역"),
             "제약유형": ("제약유형", "유형", "기준유형", "타입"),
             "설비코드": ("설비코드", "설비id"),
@@ -337,6 +357,9 @@ def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
             work[c] = "" if c not in ("매당_설비분", "매당_인시분", "필요인원") else 0
     work["제품코드"] = work["제품코드"].map(_norm)
     work["제품명"] = work["제품명"].map(_norm)
+    work["제품군"] = work["제품군"].map(_norm)
+    work.loc[work["제품군"] == "", "제품군"] = work["제품명"]
+    work["제품군"] = work["제품군"].map(_infer_product_family)
     work["공정"] = work["공정"].map(_norm)
     work["설비코드"] = work["설비코드"].map(_code_or_blank)
     work["제약유형"] = work["제약유형"].map(_norm)
@@ -634,6 +657,201 @@ def mix_simulation(
                 }
             )
     return pd.DataFrame(rows)
+
+
+def default_monthly_targets(products: pd.DataFrame | None = None) -> pd.DataFrame:
+    """월 목표 기본: CEL 700 / Ring 15000 / Wafer 3000."""
+    rows = [{"제품군": k, "월목표매수": float(v)} for k, v in DEFAULT_MONTHLY_TARGETS]
+    if products is not None and not products.empty:
+        col = "제품군" if "제품군" in products.columns else "제품명"
+        found = {_infer_product_family(x) for x in products[col].tolist()}
+        for fam in sorted(found):
+            if fam and fam not in {r["제품군"] for r in rows}:
+                rows.append({"제품군": fam, "월목표매수": 0.0})
+    return pd.DataFrame(rows)
+
+
+def _family_process_spec(products: pd.DataFrame, family: str, area: str) -> dict[str, Any] | None:
+    """제품군×공정의 대표 택트(평균)."""
+    if products.empty:
+        return None
+    fam_col = "제품군" if "제품군" in products.columns else "제품명"
+    fam_key = _infer_product_family(family)
+    sub = products[
+        (products[fam_col].map(_infer_product_family) == fam_key)
+        & (products["공정"].map(_norm) == area)
+    ]
+    if sub.empty:
+        return None
+    kind = "인력" if (sub["제약유형"].map(_norm) == "인력").mean() >= 0.5 else "설비"
+    eq_tact = float(pd.to_numeric(sub["매당_설비분"], errors="coerce").replace(0, pd.NA).mean() or 0)
+    man_tact = float(pd.to_numeric(sub["매당_인시분"], errors="coerce").replace(0, pd.NA).mean() or 0)
+    if man_tact <= 0:
+        man_tact = eq_tact
+    if eq_tact <= 0:
+        eq_tact = man_tact
+    return {
+        "제품군": _norm(family),
+        "공정": area,
+        "제약유형": kind,
+        "매당_설비분": eq_tact,
+        "매당_인시분": man_tact,
+        "품목수": int(sub["제품코드"].nunique()),
+    }
+
+
+def monthly_mix_feasibility(
+    products: pd.DataFrame,
+    equip: pd.DataFrame,
+    targets: pd.DataFrame,
+    *,
+    campus: str | None = None,
+    work_days: float = DEFAULT_WORK_DAYS,
+    day_minutes: float = DAY_MINUTES,
+    manpower: pd.DataFrame | None = None,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """제품군 월 목표 믹스가 현재 설비·인력으로 가능한지 계산.
+
+    반환: (공정별 상세, 제품군 요약)
+    - 일목표 = 월목표 ÷ 작업일수
+    - 필요분 = 일목표 × 택트 (제품군 평균)
+    - 가용분을 필요분 비중으로 나눠 일가능매수 산출
+    - 월가능매수 = 일가능매수 × 작업일수
+    """
+    empty_detail = pd.DataFrame()
+    empty_sum = pd.DataFrame()
+    if products.empty or targets is None or targets.empty:
+        return empty_detail, empty_sum
+    work = targets.copy()
+    if "제품군" not in work.columns:
+        return empty_detail, empty_sum
+    qty_col = "월목표매수" if "월목표매수" in work.columns else ("목표" if "목표" in work.columns else "")
+    if not qty_col:
+        return empty_detail, empty_sum
+    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
+    work["제품군"] = work["제품군"].map(_norm)
+    work["월목표매수"] = pd.to_numeric(work[qty_col], errors="coerce").fillna(0)
+    work = work[work["제품군"] != ""]
+    work = work[work["월목표매수"] > 0]
+    if work.empty:
+        return empty_detail, empty_sum
+    work["일목표매수"] = (work["월목표매수"] / days).round(2)
+    man = manpower if manpower is not None else pd.DataFrame()
+
+    detail_rows: list[dict[str, Any]] = []
+    for area in AREAS:
+        eq_qty = running_qty(equip, campus=campus, area=area, equip_code="")
+        man_total, man_avail = running_manpower(man, campus=campus, area=area)
+        man_qty = effective_daily_headcount(
+            man_total, shift_teams=shift_teams, working_teams=working_teams
+        )
+        needs: list[dict[str, Any]] = []
+        for _, t in work.iterrows():
+            fam = str(t["제품군"])
+            spec = _family_process_spec(products, fam, area)
+            if spec is None:
+                continue
+            kind = spec["제약유형"]
+            use_man = kind == "인력" or (eq_qty <= 0 and man_qty > 0 and spec["매당_인시분"] > 0)
+            tact = float(spec["매당_인시분"] if use_man else spec["매당_설비분"]) or float(spec["매당_인시분"])
+            if tact <= 0:
+                continue
+            daily = float(t["일목표매수"])
+            need_min = daily * tact
+            needs.append(
+                {
+                    "제품군": fam,
+                    "공정": area,
+                    "제약유형": "인력" if use_man else "설비",
+                    "품목수": spec["품목수"],
+                    "월목표매수": float(t["월목표매수"]),
+                    "일목표매수": daily,
+                    "매당분": round(tact, 4),
+                    "필요분": round(need_min, 1),
+                    "use_man": use_man,
+                }
+            )
+        if not needs:
+            continue
+        use_man_area = all(n["use_man"] for n in needs)
+        if use_man_area:
+            avail = man_qty * (man_avail or day_minutes)
+            resource = man_qty
+            mode = "인력"
+        else:
+            # 설비 공정: 설비 시간 기준 (혼합이면 설비 우선)
+            if any(not n["use_man"] for n in needs):
+                avail = eq_qty * day_minutes
+                resource = eq_qty
+                mode = "설비"
+                needs = [n for n in needs if not n["use_man"]] or needs
+            else:
+                avail = man_qty * (man_avail or day_minutes)
+                resource = man_qty
+                mode = "인력"
+        need_sum = sum(n["필요분"] for n in needs) or 1.0
+        proc_load = round(need_sum / avail * 100, 1) if avail > 0 else None
+        for n in needs:
+            share = n["필요분"] / need_sum
+            alloc = avail * share
+            daily_cap = round(alloc / n["매당분"], 1) if n["매당분"] > 0 else 0.0
+            month_cap = round(daily_cap * days, 1)
+            meet = month_cap + 1e-6 >= n["월목표매수"]
+            detail_rows.append(
+                {
+                    "제품군": n["제품군"],
+                    "공정": area,
+                    "제약유형": "인력" if n["use_man"] else "설비",
+                    "품목수": n["품목수"],
+                    "월목표매수": n["월목표매수"],
+                    "일목표매수": n["일목표매수"],
+                    "매당분": n["매당분"],
+                    "필요분": n["필요분"],
+                    "가용분": round(avail, 1),
+                    "배분분": round(alloc, 1),
+                    "자원수": resource,
+                    "공정부하율%": proc_load,
+                    "일가능매수": daily_cap,
+                    "월가능매수": month_cap,
+                    "달성": "OK" if meet else "부족",
+                }
+            )
+
+    detail = pd.DataFrame(detail_rows)
+    if detail.empty:
+        return detail, empty_sum
+
+    # 전체 공정 합산 부하로 달성 재판정: 공정별로 필요합≤가용이면 그 공정 OK
+    # 제품군 요약: 전 공정 월가능의 최소(병목)가 월 출하 가능량
+    summary = (
+        detail.groupby("제품군", as_index=False)
+        .agg(
+            월목표매수=("월목표매수", "first"),
+            일목표매수=("일목표매수", "first"),
+            품목수=("품목수", "max"),
+            월가능매수=("월가능매수", "min"),
+            일가능매수=("일가능매수", "min"),
+            최대부하율=("공정부하율%", "max"),
+        )
+    )
+    summary["월가능매수"] = summary["월가능매수"].round(1)
+    summary["일가능매수"] = summary["일가능매수"].round(1)
+    summary["달성"] = summary.apply(
+        lambda r: "OK" if float(r["월가능매수"]) + 1e-6 >= float(r["월목표매수"]) else "부족",
+        axis=1,
+    )
+    summary["부족매수"] = (summary["월목표매수"] - summary["월가능매수"]).clip(lower=0).round(1)
+    # 병목 공정
+    bn = (
+        detail.sort_values("월가능매수")
+        .groupby("제품군", as_index=False)
+        .first()[["제품군", "공정"]]
+        .rename(columns={"공정": "병목공정"})
+    )
+    summary = summary.merge(bn, on="제품군", how="left")
+    return detail, summary
 
 
 def process_standard_times(products: pd.DataFrame, product_codes: list[str] | None = None) -> pd.DataFrame:
