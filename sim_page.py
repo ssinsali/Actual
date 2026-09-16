@@ -60,16 +60,18 @@ from sim_engine import (
 
 
 def _daily_avg_from_family_stats(stats: pd.DataFrame, work_days: float) -> dict[str, float]:
-    """계획 요약(월목표) → 일평균 치수 CEL/Ring · 외관."""
+    """계획 요약(월목표) → 일평균 치수 CEL/Ring · Hole · 외관."""
     days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
     by: dict[str, float] = {}
     if stats is not None and not stats.empty:
         for _, row in stats.iterrows():
             by[str(row["구분"])] = float(row["월목표합계"])
+    total = by.get("합계", 0.0)
     return {
         "치수_CEL": round(by.get("CEL", 0.0) / days, 1),
         "치수_Ring": round(by.get("Ring", 0.0) / days, 1),
-        "외관": round(by.get("합계", 0.0) / days, 1),
+        "Hole": round(total / days, 1),
+        "외관": round(total / days, 1),
     }
 
 
@@ -82,7 +84,7 @@ def _campus_share_for_area(
     shift_teams: int,
     working_teams: int,
 ) -> float:
-    """캠퍼스 자원 비중 (치수=설비, 외관=인력)."""
+    """캠퍼스 자원 비중 (치수·Hole=설비, 외관=인력)."""
     if area == "외관":
         total_h, _ = running_manpower(manpower, campus=None, area=area)
         camp_h, _ = running_manpower(manpower, campus=campus, area=area)
@@ -108,10 +110,17 @@ def _campus_share_for_area(
     return (float(camp_n) / float(total_n)) if total_n > 0 else 0.0
 
 
-def _scale_daily_avg(avg: dict[str, float], dim_share: float, app_share: float) -> dict[str, float]:
+def _scale_daily_avg(
+    avg: dict[str, float],
+    *,
+    dim_share: float,
+    hole_share: float,
+    app_share: float,
+) -> dict[str, float]:
     return {
         "치수_CEL": round(float(avg.get("치수_CEL", 0)) * dim_share, 1),
         "치수_Ring": round(float(avg.get("치수_Ring", 0)) * dim_share, 1),
+        "Hole": round(float(avg.get("Hole", 0)) * hole_share, 1),
         "외관": round(float(avg.get("외관", 0)) * app_share, 1),
     }
 
@@ -132,14 +141,16 @@ def _render_plan_family_summary(stats: pd.DataFrame) -> None:
 
 
 def _render_daily_avg_row(title: str, avg: dict[str, float]) -> None:
-    """일평균 치수 CEL · 치수 Ring · 외관."""
+    """일평균 치수 CEL · 치수 Ring · Hole · 외관."""
     st.markdown(f"**{title}**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("치수 CEL", f"{avg.get('치수_CEL', 0):,.1f}매/일")
     with c2:
         st.metric("치수 Ring", f"{avg.get('치수_Ring', 0):,.1f}매/일")
     with c3:
+        st.metric("Hole", f"{avg.get('Hole', 0):,.1f}매/일")
+    with c4:
         st.metric("외관", f"{avg.get('외관', 0):,.1f}매/일")
 
 
@@ -736,6 +747,7 @@ def render() -> None:
                     f"계산: 월목표 ÷ 작업일({work_days}일) · "
                     f"치수 CEL {total_avg['치수_CEL']:,.1f} / "
                     f"치수 Ring {total_avg['치수_Ring']:,.1f} / "
+                    f"Hole {total_avg['Hole']:,.1f} / "
                     f"외관 {total_avg['외관']:,.1f}"
                 )
                 _render_daily_avg_row("전체", total_avg)
@@ -745,6 +757,17 @@ def render() -> None:
                     dim_shares = {
                         c: _campus_share_for_area(
                             "치수",
+                            c,
+                            eq_view,
+                            man_view,
+                            shift_teams=shift_teams,
+                            working_teams=working_teams,
+                        )
+                        for c in camp_names
+                    }
+                    hole_shares = {
+                        c: _campus_share_for_area(
+                            "Hole",
                             c,
                             eq_view,
                             man_view,
@@ -767,18 +790,23 @@ def render() -> None:
                     # 비중 합이 0이면 균등 배분
                     if sum(dim_shares.values()) <= 0:
                         dim_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                    if sum(hole_shares.values()) <= 0:
+                        hole_shares = {c: 1.0 / len(camp_names) for c in camp_names}
                     if sum(app_shares.values()) <= 0:
                         app_shares = {c: 1.0 / len(camp_names) for c in camp_names}
                     campus_cols = st.columns(len(camp_names))
                     for col, camp_name in zip(campus_cols, camp_names):
                         camp_avg = _scale_daily_avg(
-                            total_avg, dim_shares[camp_name], app_shares[camp_name]
+                            total_avg,
+                            dim_share=dim_shares[camp_name],
+                            hole_share=hole_shares[camp_name],
+                            app_share=app_shares[camp_name],
                         )
                         with col:
                             _render_daily_avg_row(camp_name, camp_avg)
                     st.caption(
                         "천안/아산은 전체 일평균을 공정 자원 비중으로 나눈 값 "
-                        "(치수=가동 설비 대수, 외관=근무인원)."
+                        "(치수·Hole=가동 설비 대수, 외관=근무인원)."
                     )
 
                 st.caption(f"적용 파일: **{fname}**")
