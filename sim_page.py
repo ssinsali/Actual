@@ -20,6 +20,7 @@ from stats_engine import AREAS, SHIFTS, add_calendar_parts
 from sim_engine import (
     DEFAULT_SHIFT_MINUTES,
     DEFAULT_SHIFT_TEAMS,
+    DEFAULT_WORK_DAYS,
     DEFAULT_WORKING_TEAMS,
     EQUIP_COLUMNS,
     MANPOWER_COLUMNS,
@@ -29,12 +30,13 @@ from sim_engine import (
     canonical_master_name,
     csv_bytes,
     daily_capacity,
+    default_monthly_targets,
     empty_csv_bytes,
     empty_xlsx_bytes,
     equipment_template,
     manpower_template,
     master_github_paths,
-    mix_simulation,
+    monthly_mix_feasibility,
     newest_matching,
     normalize_equipment,
     normalize_manpower,
@@ -690,55 +692,99 @@ def render() -> None:
                 else:
                     st.altair_chart(chart, use_container_width=True)
 
-            st.markdown("##### 믹스 가동 (자원 시간을 비중으로 나눔)")
-            codes = sorted(pr_view["제품코드"].unique().tolist()) if not pr_view.empty else []
-            mix_default = pd.DataFrame(
-                {"제품코드": codes, "비중": [round(100 / len(codes), 1)] * len(codes)}
-            ) if codes else pd.DataFrame(columns=["제품코드", "비중"])
+            st.markdown("##### 월 생산 믹스 (CEL / Ring / Wafer)")
+            st.caption(
+                "제품군(제품명)별 **월 목표 매수**를 넣으면, 현재 설비·인력을 목표 비중으로 나눠 "
+                "월·일 가능 매수와 달성 여부(OK/부족)를 봅니다. "
+                "택트는 해당 제품군 품목의 공정 평균값을 씁니다."
+            )
+            work_days = int(
+                st.number_input(
+                    "월 작업일수",
+                    min_value=1,
+                    max_value=31,
+                    value=DEFAULT_WORK_DAYS,
+                    step=1,
+                    key="sim_work_days",
+                    help="일목표 = 월목표 ÷ 작업일수",
+                )
+            )
+            mix_default = default_monthly_targets(pr_view)
             mix_edit = st.data_editor(
                 mix_default,
                 use_container_width=True,
                 hide_index=True,
-                key="sim_mix_editor",
+                num_rows="dynamic",
+                key="sim_monthly_mix_editor",
                 column_config={
-                    "제품코드": st.column_config.TextColumn(disabled=True),
-                    "비중": st.column_config.NumberColumn(min_value=0, step=1),
+                    "제품군": st.column_config.TextColumn("제품군 (CEL/Ring/Wafer)", required=True),
+                    "월목표매수": st.column_config.NumberColumn("월목표매수", min_value=0, step=100, format="%.0f"),
                 },
             )
             for label, camp in campus_scopes:
-                mixed = mix_simulation(
+                detail, summary = monthly_mix_feasibility(
                     pr_view,
                     eq_view,
                     mix_edit,
                     campus=camp,
+                    work_days=work_days,
                     manpower=man_view,
                     shift_teams=shift_teams,
                     working_teams=working_teams,
                 )
-                st.markdown(f"**믹스 · {label}**")
-                if mixed.empty:
-                    st.caption("비중을 넣으면 공정별로 나눠 돌린 매수가 나옵니다.")
-                else:
-                    st.dataframe(mixed, use_container_width=True)
-                    mix_chart_df = mixed.copy()
-                    mix_chart_df["라벨"] = mix_chart_df["일가능매수"].map(lambda v: f"{v:,.0f}")
-                    mix_base = alt.Chart(mix_chart_df).encode(
-                        x=alt.X("공정:N", sort=list(AREAS), title="공정"),
-                        xOffset=alt.XOffset("제품코드:N"),
-                        color=alt.Color("제품코드:N", title="제품"),
+                st.markdown(f"**월 믹스 · {label}**")
+                if summary.empty:
+                    st.caption(
+                        "제품군 이름과 제품 기준정보의 제품명/제품군이 맞는지 확인하세요. "
+                        "(예: 제품명이 CEL, Ring, Wafer)"
                     )
-                    mix_bars = mix_base.mark_bar().encode(
-                        y=alt.Y("일가능매수:Q"),
-                        tooltip=["제품코드", "공정", "일가능매수", "제약유형"],
+                    continue
+                ok_n = int((summary["달성"] == "OK").sum())
+                ng_n = int((summary["달성"] != "OK").sum())
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("목표 제품군", f"{len(summary)}종")
+                with c2:
+                    st.metric("달성 OK", f"{ok_n}")
+                with c3:
+                    st.metric("부족", f"{ng_n}")
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+                with st.expander(f"{label} · 공정별 상세", expanded=(label == "Total")):
+                    st.dataframe(detail, use_container_width=True, hide_index=True)
+                    chart_df = summary.melt(
+                        id_vars=["제품군"],
+                        value_vars=["월목표매수", "월가능매수"],
+                        var_name="구분",
+                        value_name="매수",
                     )
-                    mix_texts = mix_base.mark_text(dy=-8, fontSize=11).encode(
-                        y=alt.Y("일가능매수:Q"),
-                        text=alt.Text("라벨:N"),
+                    chart_df["구분"] = chart_df["구분"].map(
+                        {"월목표매수": "월목표", "월가능매수": "월가능"}
+                    )
+                    chart_df["라벨"] = chart_df["매수"].map(lambda v: f"{v:,.0f}")
+                    y_max = float(chart_df["매수"].max() or 0) * 1.15 or 1.0
+                    bars = (
+                        alt.Chart(chart_df)
+                        .mark_bar()
+                        .encode(
+                            x=alt.X("제품군:N", title="제품군"),
+                            xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
+                            y=alt.Y("매수:Q", title="매수/월", scale=alt.Scale(domain=[0, y_max])),
+                            color=alt.Color("구분:N", sort=["월목표", "월가능"]),
+                            tooltip=["제품군", "구분", "매수"],
+                        )
+                    )
+                    texts = (
+                        alt.Chart(chart_df)
+                        .mark_text(dy=-8, fontSize=11)
+                        .encode(
+                            x=alt.X("제품군:N"),
+                            xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
+                            y=alt.Y("매수:Q", scale=alt.Scale(domain=[0, y_max])),
+                            text=alt.Text("라벨:N"),
+                        )
                     )
                     st.altair_chart(
-                        (mix_bars + mix_texts).properties(
-                            height=280, title=f"{label} — 믹스 기준 일 가능 매수"
-                        ),
+                        (bars + texts).properties(height=280, title=f"{label} — 월목표 vs 월가능"),
                         use_container_width=True,
                     )
 
