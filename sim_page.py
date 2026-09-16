@@ -38,6 +38,7 @@ from sim_engine import (
     equipment_template,
     manpower_template,
     master_github_paths,
+    monthly_plan_family_stats,
     monthly_plan_feasibility,
     monthly_plan_template,
     newest_matching,
@@ -53,6 +54,21 @@ from sim_engine import (
     xlsx_bytes,
     utilization_from_actuals,
 )
+
+
+def _render_plan_family_summary(stats: pd.DataFrame) -> None:
+    """합계 · CEL · Ring · Wafer — 계획 품목 수 · 월목표 합계."""
+    if stats is None or stats.empty:
+        return
+    cols = st.columns(len(stats))
+    for col, (_, row) in zip(cols, stats.iterrows()):
+        with col:
+            st.markdown(f"##### {row['구분']}")
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric("계획 품목", f"{int(row['계획품목수'])}종")
+            with m2:
+                st.metric("월목표 합계", f"{float(row['월목표합계']):,.0f}")
 
 
 def _read_plan_csv(raw: bytes) -> pd.DataFrame:
@@ -637,8 +653,12 @@ def render() -> None:
                 st.warning("유효한 행이 없습니다. 제품코드와 월목표매수(>0)를 확인하세요.")
             else:
                 fname = st.session_state.get("sim_plan_fname", "업로드 파일")
-                st.caption(f"적용 중: **{fname}** · {len(plan_for_calc)}종")
-                st.dataframe(plan_for_calc, use_container_width=True, hide_index=True)
+                plan_stats = monthly_plan_family_stats(plan_for_calc, pr_view)
+                st.markdown("**계획 요약**")
+                _render_plan_family_summary(plan_stats)
+                st.caption(f"적용 파일: **{fname}**")
+                with st.expander("업로드 계획 목록", expanded=False):
+                    st.dataframe(plan_for_calc, use_container_width=True, hide_index=True)
                 for label, camp in campus_scopes:
                     detail, summary, missing = monthly_plan_feasibility(
                         pr_view,
