@@ -592,7 +592,7 @@ def render() -> None:
     if product_sel and not pr_view.empty:
         pr_view = pr_view[pr_view["제품코드"].isin(product_sel)]
 
-    tab_master, tab_sim, tab_util = st.tabs(["기준정보", "운영 시뮬레이션", "실적 시간 활용"])
+    tab_sim, tab_master, tab_util = st.tabs(["운영 시뮬레이션", "기준정보", "실적 시간 활용"])
 
     with tab_master:
         st.subheader("현재 적용 중인 기준")
