@@ -856,24 +856,46 @@ def render() -> None:
                 )
                 st.markdown("### 일별 최적 처리 (현장용)")
                 st.caption(
-                    "우선순위(긴급품) 순 · 재공 위치별 권장처리매수. "
-                    "완제품에 가까운 공정(외관→Hole→치수)부터 배분. Hole은 CEL만."
+                    "① 완제품을 출하일 빠른 순으로 차감 → ② 남는 순필요만 공정 재공 배분 "
+                    "(외관→Hole→치수). Hole은 CEL만. 긴급품「특1순위」라도 완제품으로 충당되면 "
+                    "「완제품충당」으로 내려가 현장 처리 대상에서 제외됩니다."
                 )
                 if floor.empty:
                     st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
                 else:
-                    ok_n = int((floor["상태"] == "처리가능").sum())
-                    miss_n = int((floor["상태"] == "재공없음").sum())
-                    short_n = int((floor["상태"] == "재공부족").sum())
-                    m1, m2, m3 = st.columns(3)
+                    hide_fg = st.checkbox(
+                        "완제품 충당 행 숨기기 (현장 처리 불필요)",
+                        value=True,
+                        key="sim_hide_fg_covered",
+                    )
+                    floor_view = (
+                        floor[floor["상태"] != "완제품충당"].copy()
+                        if hide_fg
+                        else floor
+                    )
+                    # 숨김 시 처리순서 재부여
+                    if hide_fg and not floor_view.empty:
+                        floor_view = floor_view.reset_index(drop=True)
+                        floor_view["처리순서"] = range(1, len(floor_view) + 1)
+
+                    ok_n = int((floor_view["상태"] == "처리가능").sum()) if not floor_view.empty else 0
+                    miss_n = int((floor_view["상태"] == "재공없음").sum()) if not floor_view.empty else 0
+                    short_n = int((floor_view["상태"] == "재공부족").sum()) if not floor_view.empty else 0
+                    fg_n = int((floor["상태"] == "완제품충당").sum())
+                    m1, m2, m3, m4 = st.columns(4)
                     with m1:
                         st.metric("처리가능 행", f"{ok_n}")
                     with m2:
                         st.metric("재공없음", f"{miss_n}")
                     with m3:
                         st.metric("재공부족", f"{short_n}")
+                    with m4:
+                        st.metric("완제품충당", f"{fg_n}")
 
-                    st.dataframe(floor, use_container_width=True, hide_index=True)
+                    if floor_view.empty:
+                        st.info("표시할 현장 처리 행이 없습니다. (모두 완제품으로 충당되었거나 필터됨)")
+                    else:
+                        st.dataframe(floor_view, use_container_width=True, hide_index=True)
 
                     camps = [
                         c
