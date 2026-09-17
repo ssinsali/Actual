@@ -77,8 +77,13 @@ def _daily_avg_from_family_stats(stats: pd.DataFrame, work_days: float) -> dict[
         "치수_CEL": round(cel / days, 1),
         "치수_Ring": round(ring / days, 1),
         "치수_Wafer": round(wafer / days, 1),
-        "Hole_CEL": round(cel / days, 1),
+        "Hole_CEL": round(cel / days, 1),  # Hole = CEL만
         "외관": round(total / days, 1),
+        "_월_CEL": cel,
+        "_월_Ring": ring,
+        "_월_Wafer": wafer,
+        "_월_합계": total,
+        "_작업일": days,
     }
 
 
@@ -162,6 +167,52 @@ def _render_daily_avg_row(title: str, avg: dict[str, float]) -> None:
         st.metric("Hole CEL", f"{avg.get('Hole_CEL', 0):,.1f}매/일")
     with c5:
         st.metric("외관", f"{avg.get('외관', 0):,.1f}매/일")
+
+
+def _render_daily_avg_formula(avg: dict[str, float]) -> None:
+    """일평균 계산식 표 — 검증용."""
+    days = float(avg.get("_작업일", DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS)
+    rows = [
+        {
+            "항목": "치수 CEL",
+            "대상": "CEL",
+            "월목표": avg.get("_월_CEL", 0),
+            "식": f"{avg.get('_월_CEL', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("치수_CEL", 0),
+        },
+        {
+            "항목": "치수 Ring",
+            "대상": "Ring",
+            "월목표": avg.get("_월_Ring", 0),
+            "식": f"{avg.get('_월_Ring', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("치수_Ring", 0),
+        },
+        {
+            "항목": "치수 Wafer",
+            "대상": "Wafer",
+            "월목표": avg.get("_월_Wafer", 0),
+            "식": f"{avg.get('_월_Wafer', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("치수_Wafer", 0),
+        },
+        {
+            "항목": "Hole CEL",
+            "대상": "CEL만",
+            "월목표": avg.get("_월_CEL", 0),
+            "식": f"{avg.get('_월_CEL', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("Hole_CEL", 0),
+        },
+        {
+            "항목": "외관",
+            "대상": "전체",
+            "월목표": avg.get("_월_합계", 0),
+            "식": f"{avg.get('_월_합계', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("외관", 0),
+        },
+    ]
+    show = pd.DataFrame(rows)
+    show["월목표"] = show["월목표"].map(lambda v: f"{float(v):,.0f}")
+    show["일평균"] = show["일평균"].map(lambda v: f"{float(v):,.1f}")
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
 
 def _read_plan_csv(raw: bytes) -> pd.DataFrame:
@@ -754,10 +805,25 @@ def render() -> None:
                 st.divider()
                 st.markdown("### 일평균 (매/일)")
                 st.caption(
-                    "치수=CEL·Ring·Wafer 전부 · Hole=CEL만 · 외관=전체 · "
-                    f"월목표 ÷ 작업일({work_days}일)"
+                    "치수 = CEL·Ring·Wafer 각각 ÷ 작업일 · "
+                    "Hole = CEL만 ÷ 작업일 · "
+                    "외관 = 전체 합계 ÷ 작업일"
                 )
                 _render_daily_avg_row("전체", total_avg)
+                with st.expander("일평균 계산식 확인", expanded=True):
+                    _render_daily_avg_formula(total_avg)
+                    fam_sum = (
+                        float(total_avg.get("_월_CEL", 0))
+                        + float(total_avg.get("_월_Ring", 0))
+                        + float(total_avg.get("_월_Wafer", 0))
+                    )
+                    grand = float(total_avg.get("_월_합계", 0))
+                    if abs(grand - fam_sum) > 0.5:
+                        st.caption(
+                            f"참고: 합계 {grand:,.0f} ≠ CEL+Ring+Wafer {fam_sum:,.0f} "
+                            f"(차이 {grand - fam_sum:,.0f}는 제품군 미분류·기타 품목). "
+                            "치수·Hole에는 포함하지 않고, 외관 합계에만 포함합니다."
+                        )
 
                 camp_names = [c for c in ("천안", "아산") if not campus_sel or c in campus_sel]
                 if camp_names:
