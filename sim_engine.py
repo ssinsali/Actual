@@ -923,6 +923,9 @@ def monthly_plan_family_stats(
     rows = [_row("합계", tagged)]
     for fam in PLAN_PRODUCT_FAMILIES:
         rows.append(_row(fam, tagged[tagged["제품군"] == fam]))
+    other = tagged[~tagged["제품군"].isin(PLAN_PRODUCT_FAMILIES)]
+    if not other.empty:
+        rows.append(_row("기타", other))
     return pd.DataFrame(rows)
 
 
