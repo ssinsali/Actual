@@ -1,6 +1,8 @@
 """설비·제품 기준정보와 1440분 운영 시뮬레이션."""
 from __future__ import annotations
 
+import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -1428,6 +1430,376 @@ def floor_manager_daily_raw(
     )
     out["처리순서"] = out.groupby(["캠퍼스", "공정"]).cumcount() + 1
     return out.drop(columns=["_fam", "_area"]).reset_index(drop=True)
+
+
+# ----- 공정 재공 + 출하(긴급품) → 일별 최적 처리 -----
+
+WIP_COLUMNS = ("사업장", "공정코드", "공정명", "제품코드", "제품군", "검사영역")
+SHIP_COLUMNS = ("우선순위", "제품코드", "재공_출하표", "완제품", "부족분", "출하예정일", "출하예정수량")
+
+
+def _map_wip_inspect_area(process_name: str) -> str:
+    """재공 공정명 → 검사 영역(치수/Hole/외관/종합측정실/기타)."""
+    name = _norm(process_name)
+    u = name.upper()
+    if "외관" in name:
+        return "외관"
+    if "HOLE" in u or "홀측정" in name or "홀 측정" in name or name.endswith("홀"):
+        return "Hole"
+    if any(k in name for k in ("치수", "형상 측정", "3D", "저항", "조도")):
+        return "치수"
+    if "종합" in name or "CMM" in u:
+        return "종합측정실"
+    return name or "기타"
+
+
+def _priority_rank(label: Any) -> int:
+    t = _norm(label)
+    if not t:
+        return 99
+    if "특" in t and "1" in t:
+        return 0
+    if "1순위" in t or t == "1":
+        return 1
+    if "2순위" in t or t == "2":
+        return 2
+    if "3순위" in t or t == "3":
+        return 3
+    # 숫자 추출
+    for i, ch in enumerate(t):
+        if ch.isdigit():
+            try:
+                return int("".join(c for c in t[i:] if c.isdigit())[:2] or "50")
+            except ValueError:
+                break
+    return 50
+
+
+def normalize_wip(df: pd.DataFrame) -> pd.DataFrame:
+    """공정 재공 리스트 정규화. 행 1개 = 재공 1매. Sub Total 제외."""
+    empty = pd.DataFrame(columns=list(WIP_COLUMNS))
+    if df is None or df.empty:
+        return empty
+    work = _rename_by_alias(
+        df.dropna(how="all").copy(),
+        {
+            "사업장": ("사업장", "캠퍼스", "공장", "campus"),
+            "공정코드": ("공정코드", "공정", "공정번호"),
+            "공정명": ("공정명", "설명", "공정이름"),
+            "제품코드": ("제품코드", "제품", "품목코드", "품번"),
+            "제품군": ("제품군", "제품구분", "세부형상", "유형"),
+        },
+    )
+    for c in ("사업장", "공정코드", "공정명", "제품코드", "제품군"):
+        if c not in work.columns:
+            work[c] = ""
+    work["사업장"] = work["사업장"].map(_norm)
+    work["공정명"] = work["공정명"].map(_norm)
+    work["제품코드"] = work["제품코드"].map(_norm)
+    work["제품군"] = work["제품군"].map(lambda v: _infer_product_family(v) or _norm(v))
+    work["공정코드"] = work["공정코드"].map(lambda v: _norm(v).replace(".0", "") if _norm(v).endswith(".0") else _norm(v))
+    # Sub Total / 합계 행 제거
+    bad = work["제품코드"].str.contains(r"sub\s*total|합계|total", case=False, na=False)
+    work = work[(work["제품코드"] != "") & ~bad]
+    # 사업장 앞으로 채우기(병합 셀)
+    work["사업장"] = work["사업장"].replace("", pd.NA).ffill().fillna("")
+    work["검사영역"] = work["공정명"].map(_map_wip_inspect_area)
+    return work[list(WIP_COLUMNS)].reset_index(drop=True)
+
+
+def aggregate_wip(wip: pd.DataFrame) -> pd.DataFrame:
+    """사업장·공정·제품별 재공 매수."""
+    if wip is None or wip.empty:
+        return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
+    work = wip if "검사영역" in wip.columns and "제품코드" in wip.columns else normalize_wip(wip)
+    if work.empty:
+        return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
+    if "재공매수" in work.columns:
+        return work
+    return (
+        work.groupby(["사업장", "공정코드", "공정명", "제품코드", "제품군", "검사영역"], as_index=False)
+        .size()
+        .rename(columns={"size": "재공매수"})
+    )
+
+def _shipping_date_columns(df: pd.DataFrame) -> list[str]:
+    cols = []
+    for c in df.columns:
+        s = str(c)
+        if s in ("우선순위", "품목코드", "제품코드", "재공", "완제품", "부족분"):
+            continue
+        # datetime-like header
+        try:
+            ts = pd.to_datetime(s, errors="coerce")
+            if pd.notna(ts):
+                cols.append(c)
+                continue
+        except Exception:
+            pass
+        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+            cols.append(c)
+    # sort by date
+    def _key(c):
+        return pd.to_datetime(str(c), errors="coerce") or pd.Timestamp.max
+
+    return sorted(cols, key=_key)
+
+
+def normalize_shipping_urgent(df: pd.DataFrame, ship_date: str | None = None) -> pd.DataFrame:
+    """긴급품 시트 → 일자별 출하 예정.
+
+    ship_date: 'YYYY-MM-DD' 또는 None(첫 출하열).
+    """
+    empty = pd.DataFrame(columns=list(SHIP_COLUMNS))
+    if df is None or df.empty:
+        return empty
+    work = df.dropna(how="all").copy()
+    work.columns = [str(c).replace("\n", " ").strip() for c in work.columns]
+    work = _rename_by_alias(
+        work,
+        {
+            "우선순위": ("우선순위", "순위", "priority"),
+            "제품코드": ("제품코드", "품목코드", "품번", "item"),
+            "재공_출하표": ("재공",),
+            "완제품": ("완제품",),
+            "부족분": ("부족분",),
+        },
+    )
+    for c in ("우선순위", "제품코드", "재공_출하표", "완제품", "부족분"):
+        if c not in work.columns:
+            work[c] = "" if c in ("우선순위", "제품코드") else 0
+    work["제품코드"] = work["제품코드"].map(_norm)
+    work = work[work["제품코드"] != ""]
+    date_cols = _shipping_date_columns(work)
+    if not date_cols:
+        return empty
+    # 선택일
+    chosen = None
+    if ship_date:
+        for c in date_cols:
+            if str(ship_date)[:10] in str(c):
+                chosen = c
+                break
+    if chosen is None:
+        chosen = date_cols[0]
+    day_label = str(pd.to_datetime(str(chosen), errors="coerce").date()) if pd.notna(pd.to_datetime(str(chosen), errors="coerce")) else str(chosen)[:10]
+
+    out = work[["우선순위", "제품코드", "재공_출하표", "완제품", "부족분"]].copy()
+    out["출하예정일"] = day_label
+    out["출하예정수량"] = pd.to_numeric(work[chosen], errors="coerce").fillna(0)
+    out = out[out["출하예정수량"] > 0]
+    out["우선순위점수"] = out["우선순위"].map(_priority_rank)
+    out = out.sort_values(["우선순위점수", "제품코드"]).drop(columns=["우선순위점수"])
+    return out.reset_index(drop=True)
+
+
+def shipping_date_options(df: pd.DataFrame) -> list[str]:
+    """긴급품 raw에서 선택 가능한 출하일 목록."""
+    if df is None or df.empty:
+        return []
+    work = df.copy()
+    work.columns = [str(c).replace("\n", " ").strip() for c in work.columns]
+    opts = []
+    for c in _shipping_date_columns(work):
+        ts = pd.to_datetime(str(c), errors="coerce")
+        opts.append(str(ts.date()) if pd.notna(ts) else str(c)[:10])
+    return opts
+
+
+def read_wip_excel(data: bytes | Path) -> pd.DataFrame:
+    """재공 xlsx/csv → 정규화."""
+    if isinstance(data, Path):
+        raw = data.read_bytes()
+    else:
+        raw = data
+    try:
+        df = pd.read_excel(BytesIO(raw), sheet_name=0)
+    except Exception:
+        df = pd.DataFrame()
+        for enc in ("utf-8-sig", "utf-8", "cp949"):
+            try:
+                df = pd.read_csv(BytesIO(raw), encoding=enc)
+                break
+            except Exception:
+                continue
+    return normalize_wip(df)
+
+
+def read_shipping_excel(data: bytes | Path, ship_date: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """출하 xlsx → (긴급품 raw, 선택일 정규화).
+
+    시트 우선: 긴급품 → 출하계획 → 첫 시트.
+    """
+    if isinstance(data, Path):
+        path_or_buf: Any = data
+        raw = data.read_bytes()
+    else:
+        raw = data
+        path_or_buf = BytesIO(raw)
+    try:
+        xl = pd.ExcelFile(path_or_buf)
+        sheet = "긴급품" if "긴급품" in xl.sheet_names else (
+            "출하계획" if "출하계획" in xl.sheet_names else xl.sheet_names[0]
+        )
+        urgent = pd.read_excel(xl, sheet_name=sheet)
+    except Exception:
+        urgent = pd.DataFrame()
+        for enc in ("utf-8-sig", "utf-8", "cp949"):
+            try:
+                urgent = pd.read_csv(BytesIO(raw), encoding=enc)
+                break
+            except Exception:
+                continue
+    return urgent, normalize_shipping_urgent(urgent, ship_date=ship_date)
+
+
+def daily_optimal_from_wip_shipping(
+    wip: pd.DataFrame,
+    shipping: pd.DataFrame,
+    *,
+    products: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """출하 예정(긴급품) ∩ 공정 재공 → 현장용 일별 최적 처리 Raw."""
+    cols = [
+        "처리순서",
+        "우선순위",
+        "제품코드",
+        "제품군",
+        "출하예정일",
+        "출하예정수량",
+        "사업장",
+        "공정코드",
+        "공정명",
+        "검사영역",
+        "재공매수",
+        "권장처리매수",
+        "상태",
+        "비고",
+    ]
+    if shipping is None or shipping.empty:
+        return pd.DataFrame(columns=cols)
+    ship = shipping.copy()
+    if "출하예정수량" not in ship.columns:
+        ship = normalize_shipping_urgent(ship)
+    if ship.empty:
+        return pd.DataFrame(columns=cols)
+
+    wip_agg = aggregate_wip(wip)
+    fam_map: dict[str, str] = {}
+    if products is not None and not products.empty and "제품코드" in products.columns:
+        pc = products[["제품코드", "제품군"]].drop_duplicates("제품코드")
+        fam_map = {_norm(a): _infer_product_family(b) for a, b in zip(pc["제품코드"], pc["제품군"])}
+
+    rows: list[dict[str, Any]] = []
+    area_ord = {"외관": 0, "Hole": 1, "치수": 2, "종합측정실": 3}
+
+    ship = ship.copy()
+    ship["_pri"] = ship["우선순위"].map(_priority_rank) if "우선순위" in ship.columns else 99
+    ship = ship.sort_values(["_pri", "제품코드"])
+
+    for _, s in ship.iterrows():
+        code = _norm(s["제품코드"])
+        need = float(s["출하예정수량"])
+        day = _norm(s.get("출하예정일", ""))
+        pri = _norm(s.get("우선순위", ""))
+        fam = fam_map.get(code, "")
+        hit = wip_agg[wip_agg["제품코드"] == code] if not wip_agg.empty else pd.DataFrame()
+        if hit.empty:
+            rows.append(
+                {
+                    "처리순서": 0,
+                    "우선순위": pri,
+                    "제품코드": code,
+                    "제품군": fam,
+                    "출하예정일": day,
+                    "출하예정수량": need,
+                    "사업장": "",
+                    "공정코드": "",
+                    "공정명": "",
+                    "검사영역": "",
+                    "재공매수": 0,
+                    "권장처리매수": 0,
+                    "상태": "재공없음",
+                    "비고": "출하 대상이나 공정 재공에 없음",
+                }
+            )
+            continue
+        hit = hit.copy()
+        hit["_ord"] = hit["검사영역"].map(lambda a: area_ord.get(a, 9))
+        if fam and fam != "CEL":
+            hit = hit[hit["검사영역"] != "Hole"]
+        if hit.empty:
+            rows.append(
+                {
+                    "처리순서": 0,
+                    "우선순위": pri,
+                    "제품코드": code,
+                    "제품군": fam,
+                    "출하예정일": day,
+                    "출하예정수량": need,
+                    "사업장": "",
+                    "공정코드": "",
+                    "공정명": "",
+                    "검사영역": "",
+                    "재공매수": 0,
+                    "권장처리매수": 0,
+                    "상태": "재공없음",
+                    "비고": "Hole 제외 후 재공 없음",
+                }
+            )
+            continue
+        hit = hit.sort_values(["_ord", "사업장", "공정명"])
+        remain = need
+        for _, w in hit.iterrows():
+            stock = float(w["재공매수"])
+            take = min(remain, stock) if remain > 0 else 0.0
+            note = "Hole=CEL만" if w["검사영역"] == "Hole" and fam == "CEL" else ""
+            rows.append(
+                {
+                    "처리순서": 0,
+                    "우선순위": pri,
+                    "제품코드": code,
+                    "제품군": fam or _norm(w.get("제품군", "")),
+                    "출하예정일": day,
+                    "출하예정수량": need,
+                    "사업장": _norm(w["사업장"]),
+                    "공정코드": _norm(w["공정코드"]),
+                    "공정명": _norm(w["공정명"]),
+                    "검사영역": _norm(w["검사영역"]),
+                    "재공매수": stock,
+                    "권장처리매수": round(take, 1),
+                    "상태": "처리가능" if take > 0 else "대기(재고배분완료)",
+                    "비고": note,
+                }
+            )
+            remain -= take
+        if remain > 0.5:
+            rows.append(
+                {
+                    "처리순서": 0,
+                    "우선순위": pri,
+                    "제품코드": code,
+                    "제품군": fam,
+                    "출하예정일": day,
+                    "출하예정수량": need,
+                    "사업장": "",
+                    "공정코드": "",
+                    "공정명": "",
+                    "검사영역": "",
+                    "재공매수": 0,
+                    "권장처리매수": round(remain, 1),
+                    "상태": "재공부족",
+                    "비고": f"출하 대비 재공 부족 {remain:g}매",
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=cols)
+    out["_pri"] = out["우선순위"].map(_priority_rank)
+    out = out.sort_values(["_pri", "제품코드", "상태", "사업장"])
+    out["처리순서"] = range(1, len(out) + 1)
+    return out.drop(columns=["_pri"]).reset_index(drop=True)
 
 
 def process_standard_times(products: pd.DataFrame, product_codes: list[str] | None = None) -> pd.DataFrame:
