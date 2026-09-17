@@ -722,7 +722,7 @@ def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
             )
             period_sum = float(plot["실적"].sum())
             y_max = float(plot["실적"].max())
-            y_max = y_max * 1.35 if y_max > 0 else 1.0
+            y_max = y_max * 1.45 if y_max > 0 else 1.0
 
             st.markdown(f"**{area} · {lab}** · 31일 합 {period_sum:,.0f}")
             x_enc = alt.X("일자표시:N", title="일자", sort=day_sort)
@@ -740,15 +740,14 @@ def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
                 .mark_bar(color=color_map.get(lab, "#5dade2"), cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
                 .encode(x=x_enc, y=y_enc, tooltip=tip)
             )
-            # 막대 위 세로 숫자 (잘림 방지용 y여백 + 노란 글씨)
+            # 막대 위 가로 숫자
             labels = (
                 alt.Chart(plot)
                 .mark_text(
-                    angle=270,
-                    align="left",
-                    baseline="middle",
-                    dx=6,
-                    fontSize=10,
+                    align="center",
+                    baseline="bottom",
+                    dy=-4,
+                    fontSize=13,
                     fontWeight="bold",
                     color="#f7dc6f",
                 )
@@ -756,7 +755,7 @@ def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
             )
             chart = (
                 (bars + labels)
-                .properties(height=320, title=f"{area} · {lab}")
+                .properties(height=340, title=f"{area} · {lab}")
                 .configure_axis(labelColor="#d5d8dc", titleColor="#d5d8dc")
                 .configure_view(strokeWidth=0)
             )
