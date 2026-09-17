@@ -30,8 +30,10 @@ from sim_engine import (
     MONTHLY_PLAN_COLUMNS,
     PRODUCT_ACTUAL_COLUMNS,
     PRODUCT_COLUMNS,
+    aggregate_wip,
     canonical_master_name,
     csv_bytes,
+    daily_optimal_from_wip_shipping,
     daily_operation_plan,
     effective_daily_headcount,
     empty_csv_bytes,
@@ -49,12 +51,17 @@ from sim_engine import (
     normalize_monthly_plan,
     normalize_product_actuals,
     normalize_products,
+    normalize_shipping_urgent,
+    normalize_wip,
     process_standard_times,
     product_actual_template,
     product_template,
     read_csv_table,
+    read_shipping_excel,
+    read_wip_excel,
     running_manpower,
     running_qty,
+    shipping_date_options,
     xlsx_bytes,
     utilization_from_actuals,
 )
@@ -721,316 +728,152 @@ def render() -> None:
             st.dataframe(product_actuals, use_container_width=True)
 
     with tab_sim:
-        st.subheader("월 생산 계획")
+        st.subheader("일별 최적 처리")
         st.caption(
-            "**제품코드 + 월목표매수** CSV를 업로드하면 일목표·공정별 시간 배분·하루 운영안·달성 여부를 계산합니다. "
-            f"근무인원 = 총인원 × ({working_teams}/{shift_teams})."
+            "**출하계획 Excel(긴급품 시트)** + **공정 재공 Excel**을 올리면, "
+            "오늘(선택일) 출하 대상 중 실제 재공이 있는 제품을 공정·사업장별로 정리합니다. "
+            "CSV를 내려받아 현장 관리자에게 전달하세요."
         )
 
-        campus_scopes: list[tuple[str, str | None]] = [("Total", None)]
-        for c in CAMPUSES:
-            if campus_sel and c not in campus_sel:
-                continue
-            campus_scopes.append((c, c))
-        extra = []
-        if not eq_view.empty and "캠퍼스" in eq_view.columns:
-            extra.extend(eq_view["캠퍼스"].dropna().unique().tolist())
-        if not man_view.empty and "캠퍼스" in man_view.columns:
-            extra.extend(man_view["캠퍼스"].dropna().unique().tolist())
-        for c in sorted({str(x) for x in extra if str(x).strip()}):
-            if c and c not in {n for n, _ in campus_scopes}:
-                if campus_sel and c not in campus_sel:
-                    continue
-                campus_scopes.append((c, c))
-
-        if pr_view.empty or (eq_view.empty and man_view.empty):
-            st.warning("제품·설비·인력 기준정보를 먼저 올려 주세요.")
-        else:
-            work_days = int(
-                st.number_input(
-                    "월 작업일수",
-                    min_value=1,
-                    max_value=31,
-                    value=DEFAULT_WORK_DAYS,
-                    step=1,
-                    key="sim_work_days",
-                    help="일목표 = 월목표 ÷ 작업일수",
-                )
+        up1, up2 = st.columns(2)
+        with up1:
+            ship_file = st.file_uploader(
+                "출하계획 Excel (긴급품)",
+                type=["xlsx", "xls"],
+                key="sim_ship_upload",
+                help="일별_출하계획 …xlsx — '긴급품' 시트 사용",
             )
-            plan_dl, plan_up = st.columns(2)
-            with plan_dl:
-                st.download_button(
-                    "월 생산계획 양식 CSV",
-                    data=csv_bytes(monthly_plan_template()),
-                    file_name="월_생산계획.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                    key="sim_dl_plan_csv",
-                )
-            with plan_up:
-                plan_file = st.file_uploader(
-                    "월 생산계획 CSV 업로드",
-                    type=["csv"],
-                    key="sim_plan_upload",
-                    help="열: 제품코드, 월목표매수",
-                )
-            if plan_file is not None:
-                sig = (plan_file.name, int(getattr(plan_file, "size", 0) or 0))
-                if sig != st.session_state.get("sim_plan_sig"):
-                    try:
-                        uploaded = _read_plan_csv(plan_file.getvalue())
-                    except Exception:
-                        uploaded = pd.DataFrame()
-                    if uploaded.empty:
-                        st.error("CSV를 읽지 못했습니다. 인코딩·열 이름을 확인하세요.")
-                    else:
-                        st.session_state["sim_plan_upload_df"] = uploaded
-                        st.session_state["sim_plan_sig"] = sig
-                        st.session_state["sim_plan_fname"] = plan_file.name
-                        st.rerun()
+        with up2:
+            wip_file = st.file_uploader(
+                "공정 재공 Excel",
+                type=["xlsx", "xls"],
+                key="sim_wip_upload",
+                help="공정 재공 현황 - 재공 리스트 …xlsx",
+            )
 
-            plan_raw = st.session_state.get("sim_plan_upload_df")
-            plan_for_calc = normalize_monthly_plan(plan_raw) if plan_raw is not None else pd.DataFrame()
+        if ship_file is not None:
+            sig = (ship_file.name, int(getattr(ship_file, "size", 0) or 0))
+            if sig != st.session_state.get("sim_ship_sig"):
+                try:
+                    raw_ship, _ = read_shipping_excel(ship_file.getvalue())
+                    st.session_state["sim_ship_raw"] = raw_ship
+                    st.session_state["sim_ship_sig"] = sig
+                    st.session_state["sim_ship_fname"] = ship_file.name
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"출하계획 읽기 실패: {e}")
 
-            if plan_raw is None:
-                st.info("월 생산계획 CSV를 업로드하세요. (제품코드, 월목표매수)")
-            elif plan_for_calc.empty:
-                st.warning("유효한 행이 없습니다. 제품코드와 월목표매수(>0)를 확인하세요.")
+        if wip_file is not None:
+            sig = (wip_file.name, int(getattr(wip_file, "size", 0) or 0))
+            if sig != st.session_state.get("sim_wip_sig"):
+                try:
+                    st.session_state["sim_wip_df"] = read_wip_excel(wip_file.getvalue())
+                    st.session_state["sim_wip_sig"] = sig
+                    st.session_state["sim_wip_fname"] = wip_file.name
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"재공 읽기 실패: {e}")
+
+        ship_raw = st.session_state.get("sim_ship_raw")
+        wip_df = st.session_state.get("sim_wip_df")
+
+        if ship_raw is None or wip_df is None:
+            st.info("출하계획 Excel과 공정 재공 Excel을 모두 업로드하세요.")
+            st.caption(
+                "양식: `templates/`의 일별_출하계획(긴급품 시트), 공정 재공 현황 Excel"
+            )
+        else:
+            date_opts = shipping_date_options(ship_raw)
+            if not date_opts:
+                st.warning("긴급품 시트에서 출하 일자 열을 찾지 못했습니다.")
             else:
-                fname = st.session_state.get("sim_plan_fname", "업로드 파일")
-                plan_stats = monthly_plan_family_stats(plan_for_calc, pr_view)
-                st.markdown("**계획 요약**")
-                _render_plan_family_summary(plan_stats)
-
-                total_avg = _daily_avg_from_family_stats(plan_stats, work_days)
-                st.divider()
-                st.markdown("### 일평균 (매/일)")
-                st.caption(
-                    "치수 = CEL·Ring·Wafer 각각 ÷ 작업일 · "
-                    "Hole = CEL만 ÷ 작업일 · "
-                    "외관 = 전체 합계 ÷ 작업일"
+                ship_day = st.selectbox(
+                    "출하 기준일",
+                    options=date_opts,
+                    index=0,
+                    key="sim_ship_day",
+                    help="긴급품 시트의 일자별 수량 열",
                 )
-                _render_daily_avg_row("전체", total_avg)
-                with st.expander("일평균 계산식 확인", expanded=True):
-                    _render_daily_avg_formula(total_avg)
-                    fam_sum = (
-                        float(total_avg.get("_월_CEL", 0))
-                        + float(total_avg.get("_월_Ring", 0))
-                        + float(total_avg.get("_월_Wafer", 0))
-                    )
-                    grand = float(total_avg.get("_월_합계", 0))
-                    if abs(grand - fam_sum) > 0.5:
-                        st.caption(
-                            f"참고: 합계 {grand:,.0f} ≠ CEL+Ring+Wafer {fam_sum:,.0f} "
-                            f"(차이 {grand - fam_sum:,.0f}는 제품군 미분류·기타 품목). "
-                            "치수·Hole에는 포함하지 않고, 외관 합계에만 포함합니다."
-                        )
+                ship_norm = normalize_shipping_urgent(ship_raw, ship_date=ship_day)
+                wip_agg = aggregate_wip(wip_df)
 
-                camp_names = [c for c in ("천안", "아산") if not campus_sel or c in campus_sel]
-                if camp_names:
-                    dim_shares = {
-                        c: _campus_share_for_area(
-                            "치수",
-                            c,
-                            eq_view,
-                            man_view,
-                            shift_teams=shift_teams,
-                            working_teams=working_teams,
-                        )
-                        for c in camp_names
-                    }
-                    hole_shares = {
-                        c: _campus_share_for_area(
-                            "Hole",
-                            c,
-                            eq_view,
-                            man_view,
-                            shift_teams=shift_teams,
-                            working_teams=working_teams,
-                        )
-                        for c in camp_names
-                    }
-                    app_shares = {
-                        c: _campus_share_for_area(
-                            "외관",
-                            c,
-                            eq_view,
-                            man_view,
-                            shift_teams=shift_teams,
-                            working_teams=working_teams,
-                        )
-                        for c in camp_names
-                    }
-                    # 비중 합이 0이면 균등 배분
-                    if sum(dim_shares.values()) <= 0:
-                        dim_shares = {c: 1.0 / len(camp_names) for c in camp_names}
-                    if sum(hole_shares.values()) <= 0:
-                        hole_shares = {c: 1.0 / len(camp_names) for c in camp_names}
-                    if sum(app_shares.values()) <= 0:
-                        app_shares = {c: 1.0 / len(camp_names) for c in camp_names}
-                    campus_cols = st.columns(len(camp_names))
-                    for col, camp_name in zip(campus_cols, camp_names):
-                        camp_avg = _scale_daily_avg(
-                            total_avg,
-                            dim_share=dim_shares[camp_name],
-                            hole_share=hole_shares[camp_name],
-                            app_share=app_shares[camp_name],
-                        )
-                        with col:
-                            _render_daily_avg_row(camp_name, camp_avg)
-                    st.caption(
-                        "천안/아산은 전체 일평균을 공정 자원 비중으로 나눈 값 "
-                        "(치수·Hole=가동 설비 대수, 외관=근무인원)."
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("출하 품목", f"{len(ship_norm)}종")
+                with c2:
+                    st.metric("출하 예정수량", f"{float(ship_norm['출하예정수량'].sum()):,.0f}매")
+                with c3:
+                    st.metric("재공 위치", f"{len(wip_agg)}건")
+                with c4:
+                    st.metric(
+                        "재공 매수",
+                        f"{float(wip_agg['재공매수'].sum()) if not wip_agg.empty else 0:,.0f}매",
                     )
 
-                # 현장 관리자용 일별 최적 처리 Raw
-                floor_raw = floor_manager_daily_raw(
-                    pr_view,
-                    plan_for_calc,
-                    work_days=work_days,
-                    campuses=tuple(camp_names) if camp_names else ("천안", "아산"),
-                    equip=eq_view,
-                    manpower=man_view,
-                    shift_teams=shift_teams,
-                    working_teams=working_teams,
-                )
-                st.markdown("### 일별 최적 처리 (현장용 Raw)")
                 st.caption(
-                    "캠퍼스·공정별 제품 처리순서와 권장 매수입니다. "
-                    "치수=CEL·Ring·Wafer, Hole=CEL만, 외관=전체. "
-                    "CSV를 내려받아 현장 관리자에게 전달하세요."
+                    f"출하: **{st.session_state.get('sim_ship_fname', '')}** · "
+                    f"재공: **{st.session_state.get('sim_wip_fname', '')}** · 기준일 {ship_day}"
                 )
-                if floor_raw.empty:
-                    st.info("다운로드할 일별 처리 데이터가 없습니다. 기준정보·계획을 확인하세요.")
+
+                with st.expander("출하 예정(선택일)", expanded=False):
+                    st.dataframe(ship_norm, use_container_width=True, hide_index=True)
+                with st.expander("재공 집계", expanded=False):
+                    st.dataframe(wip_agg, use_container_width=True, hide_index=True)
+
+                floor = daily_optimal_from_wip_shipping(
+                    wip_df, ship_norm, products=pr_view
+                )
+                st.markdown("### 일별 최적 처리 (현장용)")
+                st.caption(
+                    "우선순위(긴급품) 순 · 재공 위치별 권장처리매수. "
+                    "완제품에 가까운 공정(외관→Hole→치수)부터 배분. Hole은 CEL만."
+                )
+                if floor.empty:
+                    st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
                 else:
-                    st.dataframe(
-                        floor_raw.head(200),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    if len(floor_raw) > 200:
-                        st.caption(f"미리보기 200행 / 전체 {len(floor_raw)}행 (CSV에 전체 포함)")
-                    dl1, dl2, dl3 = st.columns(3)
-                    with dl1:
+                    ok_n = int((floor["상태"] == "처리가능").sum())
+                    miss_n = int((floor["상태"] == "재공없음").sum())
+                    short_n = int((floor["상태"] == "재공부족").sum())
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        st.metric("처리가능 행", f"{ok_n}")
+                    with m2:
+                        st.metric("재공없음", f"{miss_n}")
+                    with m3:
+                        st.metric("재공부족", f"{short_n}")
+
+                    st.dataframe(floor, use_container_width=True, hide_index=True)
+
+                    camps = [
+                        c
+                        for c in ("천안", "아산")
+                        if c in set(floor["사업장"].dropna().astype(str))
+                        or (not campus_sel or c in campus_sel)
+                    ]
+                    if not camps:
+                        camps = ["천안", "아산"]
+                    dl_cols = st.columns(1 + len(camps))
+                    with dl_cols[0]:
                         st.download_button(
-                            "전체 캠퍼스 CSV",
-                            data=csv_bytes(floor_raw),
-                            file_name="일별_최적처리_전체.csv",
+                            "전체 CSV",
+                            data=csv_bytes(floor),
+                            file_name=f"일별_최적처리_{ship_day}.csv",
                             mime="text/csv",
                             use_container_width=True,
-                            key="sim_dl_floor_all",
+                            key="sim_dl_opt_all",
                         )
-                    for i, camp_name in enumerate(
-                        camp_names if camp_names else ["천안", "아산"]
-                    ):
-                        sub = floor_raw[floor_raw["캠퍼스"] == camp_name]
-                        col = dl2 if i == 0 else dl3
-                        with col:
+                    for i, camp_name in enumerate(camps):
+                        sub = floor[floor["사업장"] == camp_name]
+                        with dl_cols[i + 1]:
                             st.download_button(
                                 f"{camp_name} CSV",
                                 data=csv_bytes(sub),
-                                file_name=f"일별_최적처리_{camp_name}.csv",
+                                file_name=f"일별_최적처리_{camp_name}_{ship_day}.csv",
                                 mime="text/csv",
                                 use_container_width=True,
-                                key=f"sim_dl_floor_{camp_name}",
+                                key=f"sim_dl_opt_{camp_name}",
                                 disabled=sub.empty,
                             )
-
-                st.caption(f"적용 파일: **{fname}**")
-                with st.expander("업로드 계획 목록", expanded=False):
-                    st.dataframe(plan_for_calc, use_container_width=True, hide_index=True)
-                for label, camp in campus_scopes:
-                    detail, summary, missing = monthly_plan_feasibility(
-                        pr_view,
-                        eq_view,
-                        plan_for_calc,
-                        campus=camp,
-                        work_days=work_days,
-                        manpower=man_view,
-                        shift_teams=shift_teams,
-                        working_teams=working_teams,
-                    )
-                    st.markdown(f"**생산 계획 · {label}**")
-                    if missing:
-                        st.warning(
-                            "제품 기준정보에 없는 코드: "
-                            + ", ".join(missing[:20])
-                            + (" …" if len(missing) > 20 else "")
-                        )
-                    if summary.empty:
-                        st.caption("계획에 유효한 제품코드가 없습니다. 기준정보와 코드를 맞춰 주세요.")
-                        continue
-                    ok_n = int((summary["달성"] == "OK").sum())
-                    ng_n = int((summary["달성"] != "OK").sum())
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        st.metric("계획 품목", f"{len(summary)}종")
-                    with c2:
-                        st.metric("달성 OK", f"{ok_n}")
-                    with c3:
-                        st.metric("부족", f"{ng_n}")
-                    with c4:
-                        st.metric("작업일", f"{work_days}일")
-                    st.markdown("**월·일 목표 vs 가능**")
-                    show_sum = summary[
-                        [
-                            c
-                            for c in (
-                                "제품코드",
-                                "제품명",
-                                "월목표매수",
-                                "일목표매수",
-                                "월가능매수",
-                                "일가능매수",
-                                "병목공정",
-                                "달성",
-                                "부족매수",
-                            )
-                            if c in summary.columns
-                        ]
-                    ]
-                    st.dataframe(show_sum, use_container_width=True, hide_index=True)
-                    daily = daily_operation_plan(detail, summary)
-                    st.markdown("**하루 운영안 (공정별 시간·매수 배분)**")
-                    st.dataframe(daily, use_container_width=True, hide_index=True)
-                    with st.expander(f"{label} · 공정별 상세", expanded=False):
-                        st.dataframe(detail, use_container_width=True, hide_index=True)
-                        chart_df = summary.melt(
-                            id_vars=["제품코드"],
-                            value_vars=["월목표매수", "월가능매수"],
-                            var_name="구분",
-                            value_name="매수",
-                        )
-                        chart_df["구분"] = chart_df["구분"].map(
-                            {"월목표매수": "월목표", "월가능매수": "월가능"}
-                        )
-                        chart_df["라벨"] = chart_df["매수"].map(lambda v: f"{v:,.0f}")
-                        y_max = float(chart_df["매수"].max() or 0) * 1.15 or 1.0
-                        bars = (
-                            alt.Chart(chart_df)
-                            .mark_bar()
-                            .encode(
-                                x=alt.X("제품코드:N", title="제품코드"),
-                                xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
-                                y=alt.Y("매수:Q", title="매수/월", scale=alt.Scale(domain=[0, y_max])),
-                                color=alt.Color("구분:N", sort=["월목표", "월가능"]),
-                                tooltip=["제품코드", "구분", "매수"],
-                            )
-                        )
-                        texts = (
-                            alt.Chart(chart_df)
-                            .mark_text(dy=-8, fontSize=10)
-                            .encode(
-                                x=alt.X("제품코드:N"),
-                                xOffset=alt.XOffset("구분:N", sort=["월목표", "월가능"]),
-                                y=alt.Y("매수:Q", scale=alt.Scale(domain=[0, y_max])),
-                                text=alt.Text("라벨:N"),
-                            )
-                        )
-                        st.altair_chart(
-                            (bars + texts).properties(height=280, title=f"{label} — 월목표 vs 월가능"),
-                            use_container_width=True,
-                        )
 
     with tab_util:
         st.subheader("실적 기준 인당 시간 활용")
