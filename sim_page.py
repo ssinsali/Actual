@@ -60,17 +60,24 @@ from sim_engine import (
 
 
 def _daily_avg_from_family_stats(stats: pd.DataFrame, work_days: float) -> dict[str, float]:
-    """계획 요약(월목표) → 일평균 치수 CEL/Ring · Hole · 외관."""
+    """계획 요약 → 일평균.
+
+    치수: CEL·Ring·Wafer 전부 / Hole: CEL만 / 외관: 전체.
+    """
     days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
     by: dict[str, float] = {}
     if stats is not None and not stats.empty:
         for _, row in stats.iterrows():
             by[str(row["구분"])] = float(row["월목표합계"])
+    cel = by.get("CEL", 0.0)
+    ring = by.get("Ring", 0.0)
+    wafer = by.get("Wafer", 0.0)
     total = by.get("합계", 0.0)
     return {
-        "치수_CEL": round(by.get("CEL", 0.0) / days, 1),
-        "치수_Ring": round(by.get("Ring", 0.0) / days, 1),
-        "Hole": round(total / days, 1),
+        "치수_CEL": round(cel / days, 1),
+        "치수_Ring": round(ring / days, 1),
+        "치수_Wafer": round(wafer / days, 1),
+        "Hole_CEL": round(cel / days, 1),
         "외관": round(total / days, 1),
     }
 
@@ -120,7 +127,8 @@ def _scale_daily_avg(
     return {
         "치수_CEL": round(float(avg.get("치수_CEL", 0)) * dim_share, 1),
         "치수_Ring": round(float(avg.get("치수_Ring", 0)) * dim_share, 1),
-        "Hole": round(float(avg.get("Hole", 0)) * hole_share, 1),
+        "치수_Wafer": round(float(avg.get("치수_Wafer", 0)) * dim_share, 1),
+        "Hole_CEL": round(float(avg.get("Hole_CEL", 0)) * hole_share, 1),
         "외관": round(float(avg.get("외관", 0)) * app_share, 1),
     }
 
@@ -141,16 +149,18 @@ def _render_plan_family_summary(stats: pd.DataFrame) -> None:
 
 
 def _render_daily_avg_row(title: str, avg: dict[str, float]) -> None:
-    """일평균 치수 CEL · 치수 Ring · Hole · 외관."""
+    """일평균 — 치수 CEL/Ring/Wafer · Hole CEL · 외관."""
     st.markdown(f"**{title}**")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         st.metric("치수 CEL", f"{avg.get('치수_CEL', 0):,.1f}매/일")
     with c2:
         st.metric("치수 Ring", f"{avg.get('치수_Ring', 0):,.1f}매/일")
     with c3:
-        st.metric("Hole", f"{avg.get('Hole', 0):,.1f}매/일")
+        st.metric("치수 Wafer", f"{avg.get('치수_Wafer', 0):,.1f}매/일")
     with c4:
+        st.metric("Hole CEL", f"{avg.get('Hole_CEL', 0):,.1f}매/일")
+    with c5:
         st.metric("외관", f"{avg.get('외관', 0):,.1f}매/일")
 
 
@@ -744,11 +754,8 @@ def render() -> None:
                 st.divider()
                 st.markdown("### 일평균 (매/일)")
                 st.caption(
-                    f"계산: 월목표 ÷ 작업일({work_days}일) · "
-                    f"치수 CEL {total_avg['치수_CEL']:,.1f} / "
-                    f"치수 Ring {total_avg['치수_Ring']:,.1f} / "
-                    f"Hole {total_avg['Hole']:,.1f} / "
-                    f"외관 {total_avg['외관']:,.1f}"
+                    "치수=CEL·Ring·Wafer 전부 · Hole=CEL만 · 외관=전체 · "
+                    f"월목표 ÷ 작업일({work_days}일)"
                 )
                 _render_daily_avg_row("전체", total_avg)
 
