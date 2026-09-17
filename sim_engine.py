@@ -1439,18 +1439,44 @@ SHIP_COLUMNS = ("우선순위", "제품코드", "재공_출하표", "완제품",
 
 
 def _map_wip_inspect_area(process_name: str) -> str:
-    """재공 공정명 → 검사 영역(치수/Hole/외관/종합측정실/기타)."""
+    """재공 공정명 → 검사 영역.
+
+    - 종합측정실: 공정명에 '종합측정실' 포함 (예: 종합측정실 (3D))
+    - 치수: 저항측정 · 3D측정 (예: 저항측정 (Si), SiC 3D측정)
+    - Hole / 외관: 기존과 동일
+    """
     name = _norm(process_name)
-    u = name.upper()
+    if not name:
+        return "기타"
+    compact = name.replace(" ", "").upper()
+
+    # 종합측정실이 들어가면 종합측정실 (3D 포함이어도 종합 우선)
+    if "종합측정실" in name.replace(" ", "") or "종합측정실" in name:
+        return "종합측정실"
+
     if "외관" in name:
         return "외관"
-    if "HOLE" in u or "홀측정" in name or "홀 측정" in name or name.endswith("홀"):
+
+    if (
+        "HOLE" in compact
+        or "홀측정" in name.replace(" ", "")
+        or "홀 측정" in name
+        or compact.endswith("홀")
+    ):
         return "Hole"
-    if any(k in name for k in ("치수", "형상 측정", "3D", "저항", "조도")):
+
+    # 치수: 저항측정 / 3D측정 만
+    if "저항" in name and "측정" in name:
         return "치수"
-    if "종합" in name or "CMM" in u:
-        return "종합측정실"
-    return name or "기타"
+    if "3D측정" in compact or "3D 측정" in name:
+        return "치수"
+
+    return "기타"
+
+
+def process_name_matches_area(process_name: str, area: str) -> bool:
+    """공정명 기준으로 표시 탭(치수/Hole/외관/종합측정실) 소속 여부."""
+    return _map_wip_inspect_area(process_name) == area
 
 
 def _priority_rank(label: Any) -> int:
@@ -1514,6 +1540,10 @@ def aggregate_wip(wip: pd.DataFrame) -> pd.DataFrame:
     work = wip if "검사영역" in wip.columns and "제품코드" in wip.columns else normalize_wip(wip)
     if work.empty:
         return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
+    # 공정명 규칙 변경 반영(세션에 남은 옛 매핑 보정)
+    if "공정명" in work.columns:
+        work = work.copy()
+        work["검사영역"] = work["공정명"].map(_map_wip_inspect_area)
     if "재공매수" in work.columns:
         return work
     return (
