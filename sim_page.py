@@ -857,8 +857,8 @@ def render() -> None:
                 st.markdown("### 일별 최적 처리 (현장용)")
                 st.caption(
                     "① 완제품을 출하일 빠른 순으로 차감 → ② 남는 순필요만 공정 재공 배분 "
-                    "(외관→Hole→치수). Hole은 CEL만. 긴급품「특1순위」라도 완제품으로 충당되면 "
-                    "「완제품충당」으로 내려가 현장 처리 대상에서 제외됩니다."
+                    "(외관→Hole→치수). Hole은 CEL만. "
+                    "아래는 **치수 / Hole / 외관 / 종합측정실** 검사영역별로 나눠 표시합니다."
                 )
                 if floor.empty:
                     st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
@@ -868,68 +868,126 @@ def render() -> None:
                         value=True,
                         key="sim_hide_fg_covered",
                     )
-                    floor_view = (
+                    floor_base = (
                         floor[floor["상태"] != "완제품충당"].copy()
                         if hide_fg
-                        else floor
+                        else floor.copy()
                     )
-                    # 숨김 시 처리순서 재부여
-                    if hide_fg and not floor_view.empty:
-                        floor_view = floor_view.reset_index(drop=True)
-                        floor_view["처리순서"] = range(1, len(floor_view) + 1)
 
-                    ok_n = int((floor_view["상태"] == "처리가능").sum()) if not floor_view.empty else 0
-                    miss_n = int((floor_view["상태"] == "재공없음").sum()) if not floor_view.empty else 0
-                    short_n = int((floor_view["상태"] == "재공부족").sum()) if not floor_view.empty else 0
-                    fg_n = int((floor["상태"] == "완제품충당").sum())
-                    m1, m2, m3, m4 = st.columns(4)
-                    with m1:
-                        st.metric("처리가능 행", f"{ok_n}")
-                    with m2:
-                        st.metric("재공없음", f"{miss_n}")
-                    with m3:
-                        st.metric("재공부족", f"{short_n}")
-                    with m4:
-                        st.metric("완제품충당", f"{fg_n}")
+                    day_tag = "전체일자" if ship_day == "전체" else ship_day
+                    area_tabs_order = ("치수", "Hole", "외관", "종합측정실")
+                    known_areas = set(area_tabs_order)
+                    area_frames: dict[str, pd.DataFrame] = {}
+                    for area in area_tabs_order:
+                        sub = floor_base[floor_base["검사영역"].astype(str) == area].copy()
+                        if not sub.empty:
+                            sub = sub.reset_index(drop=True)
+                            sub["처리순서"] = range(1, len(sub) + 1)
+                        area_frames[area] = sub
+                    unassigned = floor_base[
+                        floor_base["검사영역"].map(lambda x: str(x).strip() not in known_areas)
+                    ].copy()
+                    if not unassigned.empty:
+                        unassigned = unassigned.reset_index(drop=True)
+                        unassigned["처리순서"] = range(1, len(unassigned) + 1)
 
-                    if floor_view.empty:
-                        st.info("표시할 현장 처리 행이 없습니다. (모두 완제품으로 충당되었거나 필터됨)")
-                    else:
-                        st.dataframe(floor_view, use_container_width=True, hide_index=True)
+                    tab_labels = [f"{a} ({len(area_frames[a])})" for a in area_tabs_order]
+                    tab_labels.append(f"미배정 ({len(unassigned)})")
+                    tabs = st.tabs(tab_labels)
 
-                    camps = [
-                        c
-                        for c in ("천안", "아산")
-                        if c in set(floor["사업장"].dropna().astype(str))
-                        or (not campus_sel or c in campus_sel)
-                    ]
-                    if not camps:
-                        camps = ["천안", "아산"]
-                    dl_cols = st.columns(1 + len(camps))
-                    with dl_cols[0]:
-                        st.download_button(
-                            "전체 CSV",
-                            data=csv_bytes(floor),
-                            file_name=f"일별_최적처리_{ship_day if ship_day != '전체' else '전체일자'}.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                            key="sim_dl_opt_all",
+                    def _render_area_block(
+                        area_name: str,
+                        df_area: pd.DataFrame,
+                        *,
+                        key_prefix: str,
+                    ) -> None:
+                        if df_area.empty:
+                            st.info(f"{area_name}: 표시할 행이 없습니다.")
+                            return
+                        ok_n = int((df_area["상태"] == "처리가능").sum())
+                        miss_n = int((df_area["상태"] == "재공없음").sum())
+                        short_n = int((df_area["상태"] == "재공부족").sum())
+                        wait_n = int((df_area["상태"] == "대기(재고배분완료)").sum())
+                        qty = float(
+                            pd.to_numeric(df_area["권장처리매수"], errors="coerce")
+                            .fillna(0)
+                            .sum()
                         )
-                    for i, camp_name in enumerate(camps):
-                        sub = floor[floor["사업장"] == camp_name]
-                        with dl_cols[i + 1]:
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        with c1:
+                            st.metric("행수", f"{len(df_area)}")
+                        with c2:
+                            st.metric("처리가능", f"{ok_n}")
+                        with c3:
+                            st.metric("재공부족", f"{short_n}")
+                        with c4:
+                            st.metric("재공없음/대기", f"{miss_n + wait_n}")
+                        with c5:
+                            st.metric("권장처리합", f"{qty:,.0f}매")
+                        st.dataframe(df_area, use_container_width=True, hide_index=True)
+
+                        camps = [
+                            c
+                            for c in ("천안", "아산")
+                            if c in set(df_area["사업장"].dropna().astype(str))
+                            or (not campus_sel or c in campus_sel)
+                        ]
+                        if not camps:
+                            camps = ["천안", "아산"]
+                        dl = st.columns(1 + len(camps))
+                        with dl[0]:
                             st.download_button(
-                                f"{camp_name} CSV",
-                                data=csv_bytes(sub),
-                                file_name=(
-                                    f"일별_최적처리_{camp_name}_"
-                                    f"{'전체일자' if ship_day == '전체' else ship_day}.csv"
-                                ),
+                                f"{area_name} 전체 CSV",
+                                data=csv_bytes(df_area),
+                                file_name=f"일별_최적처리_{area_name}_{day_tag}.csv",
                                 mime="text/csv",
                                 use_container_width=True,
-                                key=f"sim_dl_opt_{camp_name}",
-                                disabled=sub.empty,
+                                key=f"{key_prefix}_all",
                             )
+                        for i, camp_name in enumerate(camps):
+                            camp_df = df_area[df_area["사업장"] == camp_name]
+                            with dl[i + 1]:
+                                st.download_button(
+                                    f"{camp_name}",
+                                    data=csv_bytes(camp_df),
+                                    file_name=f"일별_최적처리_{area_name}_{camp_name}_{day_tag}.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                    key=f"{key_prefix}_{camp_name}",
+                                    disabled=camp_df.empty,
+                                )
+
+                    for tab, area in zip(tabs[:4], area_tabs_order):
+                        with tab:
+                            _render_area_block(
+                                area,
+                                area_frames[area],
+                                key_prefix=f"sim_dl_{area}",
+                            )
+                    with tabs[4]:
+                        st.caption(
+                            "검사영역이 비어 있는 행: 완제품충당 · 재공없음 · 재공부족 등 "
+                            "(공정에 아직 배정되지 않은 상태)."
+                        )
+                        _render_area_block(
+                            "미배정",
+                            unassigned,
+                            key_prefix="sim_dl_unassigned",
+                        )
+
+                    fg_n = int((floor["상태"] == "완제품충당").sum())
+                    st.caption(
+                        f"전체 원본 {len(floor)}행 · 완제품충당 {fg_n}건"
+                        + (" (숨김)" if hide_fg else "")
+                    )
+                    st.download_button(
+                        "전 영역 통합 CSV",
+                        data=csv_bytes(floor),
+                        file_name=f"일별_최적처리_통합_{day_tag}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="sim_dl_opt_all",
+                    )
 
         # ----- 후순위: 월 생산 계획 (능력 검토) -----
         st.divider()
