@@ -717,25 +717,48 @@ def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
             plot = grid.merge(src, on="일자", how="left")
             plot["실적"] = pd.to_numeric(plot["실적"], errors="coerce").fillna(0.0)
             plot["일자표시"] = plot["일자"].dt.strftime("%m/%d")
-            plot["라벨"] = plot["실적"].map(lambda v: f"{float(v):,.0f}" if float(v) > 0 else "")
+            plot["라벨"] = plot["실적"].map(
+                lambda v: f"{int(round(float(v)))}" if float(v) > 0 else ""
+            )
             period_sum = float(plot["실적"].sum())
+            y_max = float(plot["실적"].max())
+            y_max = y_max * 1.35 if y_max > 0 else 1.0
 
             st.markdown(f"**{area} · {lab}** · 31일 합 {period_sum:,.0f}")
-            base = alt.Chart(plot).encode(
-                x=alt.X("일자표시:N", title="일자", sort=day_sort),
-                y=alt.Y("실적:Q", title="실적"),
-                tooltip=[
-                    alt.Tooltip("일자:T", title="일자"),
-                    alt.Tooltip("실적:Q", title="실적", format=",.0f"),
-                ],
+            x_enc = alt.X("일자표시:N", title="일자", sort=day_sort)
+            y_enc = alt.Y(
+                "실적:Q",
+                title="실적",
+                scale=alt.Scale(domain=[0, y_max], nice=False, zero=True),
             )
-            bars = base.mark_bar(color=color_map.get(lab, "#5dade2"))
-            labels = base.mark_text(
-                dy=-8,
-                fontSize=11,
-                fontWeight="bold",
-                color="#f4f6f7",
-            ).encode(text="라벨:N")
-            chart = (bars + labels).properties(height=280, title=f"{area} · {lab}")
+            tip = [
+                alt.Tooltip("일자:T", title="일자"),
+                alt.Tooltip("실적:Q", title="실적", format=",.0f"),
+            ]
+            bars = (
+                alt.Chart(plot)
+                .mark_bar(color=color_map.get(lab, "#5dade2"), cornerRadiusTopLeft=2, cornerRadiusTopRight=2)
+                .encode(x=x_enc, y=y_enc, tooltip=tip)
+            )
+            # 막대 위 세로 숫자 (잘림 방지용 y여백 + 노란 글씨)
+            labels = (
+                alt.Chart(plot)
+                .mark_text(
+                    angle=270,
+                    align="left",
+                    baseline="middle",
+                    dx=6,
+                    fontSize=10,
+                    fontWeight="bold",
+                    color="#f7dc6f",
+                )
+                .encode(x=x_enc, y=y_enc, text="라벨:N", tooltip=tip)
+            )
+            chart = (
+                (bars + labels)
+                .properties(height=320, title=f"{area} · {lab}")
+                .configure_axis(labelColor="#d5d8dc", titleColor="#d5d8dc")
+                .configure_view(strokeWidth=0)
+            )
             st.altair_chart(chart, use_container_width=True)
 
