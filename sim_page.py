@@ -53,6 +53,7 @@ from sim_engine import (
     normalize_products,
     normalize_shipping_urgent,
     normalize_wip,
+    process_name_matches_area,
     process_standard_times,
     product_actual_template,
     product_template,
@@ -856,9 +857,9 @@ def render() -> None:
                 )
                 st.markdown("### 일별 최적 처리 (현장용)")
                 st.caption(
-                    "① 완제품을 출하일 빠른 순으로 차감 → ② 남는 순필요만 공정 재공 배분 "
-                    "(외관→Hole→치수). Hole은 CEL만. "
-                    "아래는 **치수 / Hole / 외관 / 종합측정실** 검사영역별로 나눠 표시합니다."
+                    "① 완제품 차감 → ② 순필요만 공정 재공 배분(외관→Hole→치수). Hole은 CEL만. "
+                    "탭 구분(공정명): **치수**=저항측정·3D측정 / **종합측정실**=이름에 종합측정실 포함 "
+                    "/ **Hole**·**외관**=해당 공정명."
                 )
                 if floor.empty:
                     st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
@@ -876,17 +877,23 @@ def render() -> None:
 
                     day_tag = "전체일자" if ship_day == "전체" else ship_day
                     area_tabs_order = ("치수", "Hole", "외관", "종합측정실")
-                    known_areas = set(area_tabs_order)
+
+                    def _in_area(proc_name: object, area: str) -> bool:
+                        n = str(proc_name).strip() if proc_name is not None else ""
+                        return bool(n) and process_name_matches_area(n, area)
+
                     area_frames: dict[str, pd.DataFrame] = {}
+                    assigned = pd.Series(False, index=floor_base.index)
                     for area in area_tabs_order:
-                        sub = floor_base[floor_base["검사영역"].astype(str) == area].copy()
+                        mask = floor_base["공정명"].map(lambda n, a=area: _in_area(n, a))
+                        assigned = assigned | mask
+                        sub = floor_base[mask].copy()
                         if not sub.empty:
                             sub = sub.reset_index(drop=True)
                             sub["처리순서"] = range(1, len(sub) + 1)
+                            sub["검사영역"] = area
                         area_frames[area] = sub
-                    unassigned = floor_base[
-                        floor_base["검사영역"].map(lambda x: str(x).strip() not in known_areas)
-                    ].copy()
+                    unassigned = floor_base[~assigned].copy()
                     if not unassigned.empty:
                         unassigned = unassigned.reset_index(drop=True)
                         unassigned["처리순서"] = range(1, len(unassigned) + 1)
@@ -966,8 +973,8 @@ def render() -> None:
                             )
                     with tabs[4]:
                         st.caption(
-                            "검사영역이 비어 있는 행: 완제품충당 · 재공없음 · 재공부족 등 "
-                            "(공정에 아직 배정되지 않은 상태)."
+                            "공정명이 비었거나(재공없음·재공부족·완제품충당), "
+                            "치수(저항·3D)·Hole·외관·종합측정실 규칙에 안 맞는 공정."
                         )
                         _render_area_block(
                             "미배정",
