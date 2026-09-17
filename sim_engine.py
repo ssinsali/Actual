@@ -1523,32 +1523,52 @@ def aggregate_wip(wip: pd.DataFrame) -> pd.DataFrame:
     )
 
 def _shipping_date_columns(df: pd.DataFrame) -> list[str]:
+    """긴급품 시트의 일자 열만 추출 (우선순위·품목·재공·완제품·부족분 제외)."""
+    skip = {
+        "우선순위",
+        "품목코드",
+        "제품코드",
+        "재공",
+        "재공_출하표",
+        "완제품",
+        "부족분",
+        "순위",
+        "priority",
+    }
     cols = []
     for c in df.columns:
-        s = str(c)
-        if s in ("우선순위", "품목코드", "제품코드", "재공", "완제품", "부족분"):
+        s = str(c).replace("\n", " ").strip()
+        if s in skip or s.startswith("Unnamed"):
             continue
-        # datetime-like header
-        try:
-            ts = pd.to_datetime(s, errors="coerce")
-            if pd.notna(ts):
-                cols.append(c)
-                continue
-        except Exception:
-            pass
-        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.notna(ts):
             cols.append(c)
-    # sort by date
+            continue
+        # 9/17, 09-17, 2026.9.17 등
+        if re.search(r"\d{1,4}[-/.]\d{1,2}([-/.]\d{1,4})?", s):
+            ts2 = pd.to_datetime(s, errors="coerce")
+            if pd.notna(ts2):
+                cols.append(c)
     def _key(c):
-        return pd.to_datetime(str(c), errors="coerce") or pd.Timestamp.max
+        t = pd.to_datetime(str(c), errors="coerce")
+        return t if pd.notna(t) else pd.Timestamp.max
 
     return sorted(cols, key=_key)
 
 
-def normalize_shipping_urgent(df: pd.DataFrame, ship_date: str | None = None) -> pd.DataFrame:
-    """긴급품 시트 → 일자별 출하 예정.
+def _col_to_date_label(c: Any) -> str:
+    ts = pd.to_datetime(str(c), errors="coerce")
+    if pd.notna(ts):
+        return str(ts.date())
+    return str(c).strip()[:10]
 
-    ship_date: 'YYYY-MM-DD' 또는 None(첫 출하열).
+
+def normalize_shipping_urgent(df: pd.DataFrame, ship_date: str | None = None) -> pd.DataFrame:
+    """긴급품 시트 → 일자별 출하 예정 (제품×일자 행).
+
+    ship_date:
+      - None / '' / '전체' → 수량이 있는 모든 일자 펼침
+      - 'YYYY-MM-DD' → 해당 일자만
     """
     empty = pd.DataFrame(columns=list(SHIP_COLUMNS))
     if df is None or df.empty:
@@ -1573,37 +1593,62 @@ def normalize_shipping_urgent(df: pd.DataFrame, ship_date: str | None = None) ->
     date_cols = _shipping_date_columns(work)
     if not date_cols:
         return empty
-    # 선택일
-    chosen = None
-    if ship_date:
-        for c in date_cols:
-            if str(ship_date)[:10] in str(c):
-                chosen = c
-                break
-    if chosen is None:
-        chosen = date_cols[0]
-    day_label = str(pd.to_datetime(str(chosen), errors="coerce").date()) if pd.notna(pd.to_datetime(str(chosen), errors="coerce")) else str(chosen)[:10]
 
-    out = work[["우선순위", "제품코드", "재공_출하표", "완제품", "부족분"]].copy()
-    out["출하예정일"] = day_label
-    out["출하예정수량"] = pd.to_numeric(work[chosen], errors="coerce").fillna(0)
-    out = out[out["출하예정수량"] > 0]
+    want_all = ship_date is None or str(ship_date).strip() in ("", "전체", "all", "ALL")
+    use_cols = date_cols
+    if not want_all:
+        matched = [c for c in date_cols if str(ship_date)[:10] in str(c) or _col_to_date_label(c) == str(ship_date)[:10]]
+        use_cols = matched or date_cols[:1]
+
+    rows: list[dict[str, Any]] = []
+    for _, r in work.iterrows():
+        base = {
+            "우선순위": _norm(r.get("우선순위", "")),
+            "제품코드": _norm(r["제품코드"]),
+            "재공_출하표": pd.to_numeric(r.get("재공_출하표", 0), errors="coerce") or 0,
+            "완제품": pd.to_numeric(r.get("완제품", 0), errors="coerce") or 0,
+            "부족분": pd.to_numeric(r.get("부족분", 0), errors="coerce") or 0,
+        }
+        for dc in use_cols:
+            qty = pd.to_numeric(r.get(dc), errors="coerce")
+            if pd.isna(qty) or float(qty) <= 0:
+                continue
+            rows.append(
+                {
+                    **base,
+                    "출하예정일": _col_to_date_label(dc),
+                    "출하예정수량": float(qty),
+                }
+            )
+
+    if not rows:
+        return empty
+    out = pd.DataFrame(rows)
     out["우선순위점수"] = out["우선순위"].map(_priority_rank)
-    out = out.sort_values(["우선순위점수", "제품코드"]).drop(columns=["우선순위점수"])
+    out = out.sort_values(["출하예정일", "우선순위점수", "제품코드"]).drop(columns=["우선순위점수"])
     return out.reset_index(drop=True)
 
 
 def shipping_date_options(df: pd.DataFrame) -> list[str]:
-    """긴급품 raw에서 선택 가능한 출하일 목록."""
+    """긴급품 raw에서 선택 가능한 출하일 목록. 맨 앞에 '전체'."""
     if df is None or df.empty:
         return []
     work = df.copy()
     work.columns = [str(c).replace("\n", " ").strip() for c in work.columns]
-    opts = []
-    for c in _shipping_date_columns(work):
-        ts = pd.to_datetime(str(c), errors="coerce")
-        opts.append(str(ts.date()) if pd.notna(ts) else str(c)[:10])
-    return opts
+    date_cols = _shipping_date_columns(work)
+    if not date_cols:
+        return []
+    opts = ["전체"]
+    for c in date_cols:
+        opts.append(_col_to_date_label(c))
+    # 중복 제거 (순서 유지)
+    seen: set[str] = set()
+    uniq = []
+    for o in opts:
+        if o not in seen:
+            seen.add(o)
+            uniq.append(o)
+    return uniq
 
 
 def read_wip_excel(data: bytes | Path) -> pd.DataFrame:
@@ -1695,7 +1740,9 @@ def daily_optimal_from_wip_shipping(
 
     ship = ship.copy()
     ship["_pri"] = ship["우선순위"].map(_priority_rank) if "우선순위" in ship.columns else 99
-    ship = ship.sort_values(["_pri", "제품코드"])
+    if "출하예정일" not in ship.columns:
+        ship["출하예정일"] = ""
+    ship = ship.sort_values(["출하예정일", "_pri", "제품코드"])
 
     for _, s in ship.iterrows():
         code = _norm(s["제품코드"])
@@ -1797,7 +1844,7 @@ def daily_optimal_from_wip_shipping(
     if out.empty:
         return pd.DataFrame(columns=cols)
     out["_pri"] = out["우선순위"].map(_priority_rank)
-    out = out.sort_values(["_pri", "제품코드", "상태", "사업장"])
+    out = out.sort_values(["출하예정일", "_pri", "제품코드", "상태", "사업장"])
     out["처리순서"] = range(1, len(out) + 1)
     return out.drop(columns=["_pri"]).reset_index(drop=True)
 
