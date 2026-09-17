@@ -669,7 +669,7 @@ def render() -> None:
 
 
 def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
-    """공정별 막대: 일자 × (합계/천안/아산), 최근 N일."""
+    """공정별로 합계·천안·아산 막대그래프를 각각 그림 (최근 N일)."""
     if df is None or df.empty or "일자" not in df.columns:
         st.caption("일별 실적을 표시할 데이터가 없습니다.")
         return
@@ -689,73 +689,49 @@ def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
 
     st.caption(
         f"기간: {min_d.date()} ~ {max_d.date()} ({int(days)}일) · "
-        f"표시 행 {len(work):,}건"
+        f"표시 행 {len(work):,}건 · 공정마다 합계 / 천안 / 아산 그래프 3개"
     )
 
-    camp_order = ["합계", "천안", "아산"]
-    area_order = [a for a in AREAS]  # 종합측정실, 치수, Hole, 외관
+    camp_order = ("합계", "천안", "아산")
+    all_days = pd.date_range(min_d, max_d, freq="D")
+    day_sort = [d.strftime("%m/%d") for d in all_days]
+    color_map = {"합계": "#5dade2", "천안": "#58d68d", "아산": "#f5b041"}
 
-    for area in area_order:
+    for area in AREAS:
         sub = work[work["영역"].astype(str) == area]
-        st.markdown(f"##### {area}")
+        st.markdown(f"#### {area}")
         if sub.empty:
             st.caption(f"{area}: 해당 기간 실적 없음")
             continue
 
-        by_camp = (
-            sub.groupby(["일자", "캠퍼스"], as_index=False)["실적"]
-            .sum()
-            .rename(columns={"실적": "실적"})
-        )
-        total = (
-            sub.groupby("일자", as_index=False)["실적"]
-            .sum()
-            .assign(구분="합계")
-        )
-        pieces = [total.rename(columns={"실적": "실적"})]
-        for camp in ("천안", "아산"):
-            c = by_camp[by_camp["캠퍼스"].astype(str) == camp][["일자", "실적"]].copy()
-            c["구분"] = camp
-            pieces.append(c)
-        long = pd.concat(pieces, ignore_index=True)
-        # 날짜축에 빈 날도 보이게 0 채움
-        all_days = pd.date_range(min_d, max_d, freq="D")
-        grid = pd.MultiIndex.from_product(
-            [all_days, camp_order], names=["일자", "구분"]
-        ).to_frame(index=False)
-        long = grid.merge(long, on=["일자", "구분"], how="left")
-        long["실적"] = pd.to_numeric(long["실적"], errors="coerce").fillna(0.0)
-        long["일자표시"] = long["일자"].dt.strftime("%m/%d")
-        day_sort = [d.strftime("%m/%d") for d in all_days]
+        by_camp = sub.groupby(["일자", "캠퍼스"], as_index=False)["실적"].sum()
+        series_map: dict[str, pd.DataFrame] = {
+            "합계": sub.groupby("일자", as_index=False)["실적"].sum(),
+            "천안": by_camp[by_camp["캠퍼스"].astype(str) == "천안"][["일자", "실적"]],
+            "아산": by_camp[by_camp["캠퍼스"].astype(str) == "아산"][["일자", "실적"]],
+        }
 
-        chart = (
-            alt.Chart(long)
-            .mark_bar()
-            .encode(
-                x=alt.X("일자표시:N", title="일자", sort=day_sort),
-                y=alt.Y("실적:Q", title="실적"),
-                color=alt.Color(
-                    "구분:N",
-                    title="구분",
-                    sort=camp_order,
-                    scale=alt.Scale(domain=camp_order),
-                ),
-                xOffset=alt.XOffset("구분:N", sort=camp_order),
-                tooltip=[
-                    alt.Tooltip("일자:T", title="일자"),
-                    "구분",
-                    alt.Tooltip("실적:Q", title="실적", format=",.0f"),
-                ],
+        for lab in camp_order:
+            src = series_map[lab]
+            grid = pd.DataFrame({"일자": all_days})
+            plot = grid.merge(src, on="일자", how="left")
+            plot["실적"] = pd.to_numeric(plot["실적"], errors="coerce").fillna(0.0)
+            plot["일자표시"] = plot["일자"].dt.strftime("%m/%d")
+            period_sum = float(plot["실적"].sum())
+
+            st.markdown(f"**{area} · {lab}** · 31일 합 {period_sum:,.0f}")
+            chart = (
+                alt.Chart(plot)
+                .mark_bar(color=color_map.get(lab, "#5dade2"))
+                .encode(
+                    x=alt.X("일자표시:N", title="일자", sort=day_sort),
+                    y=alt.Y("실적:Q", title="실적"),
+                    tooltip=[
+                        alt.Tooltip("일자:T", title="일자"),
+                        alt.Tooltip("실적:Q", title="실적", format=",.0f"),
+                    ],
+                )
+                .properties(height=260, title=f"{area} · {lab}")
             )
-            .properties(height=280, title=f"{area} · 일별 실적 (합계/천안/아산)")
-        )
-        st.altair_chart(chart, use_container_width=True)
-
-        # 요약 메트릭: 기간 합계
-        sums = long.groupby("구분", as_index=False)["실적"].sum()
-        mcols = st.columns(3)
-        for i, lab in enumerate(camp_order):
-            val = float(sums.loc[sums["구분"] == lab, "실적"].sum()) if not sums.empty else 0.0
-            with mcols[i]:
-                st.metric(f"{area} · {lab} (31일 합)", f"{val:,.0f}")
+            st.altair_chart(chart, use_container_width=True)
 
