@@ -1704,7 +1704,13 @@ def daily_optimal_from_wip_shipping(
     *,
     products: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """출하 예정(긴급품) ∩ 공정 재공 → 현장용 일별 최적 처리 Raw."""
+    """출하 예정(긴급품) ∩ 공정 재공 → 현장용 일별 최적 처리 Raw.
+
+    규칙:
+      1) 제품별 완제품을 출하예정일 빠른 날부터 차감 → 남는 순필요만 현장 처리
+      2) 공정 재공은 외관→Hole→치수 순, 제품·일자 간 재고를 중복 배분하지 않음
+      3) Hole은 CEL만
+    """
     cols = [
         "처리순서",
         "우선순위",
@@ -1712,6 +1718,8 @@ def daily_optimal_from_wip_shipping(
         "제품군",
         "출하예정일",
         "출하예정수량",
+        "완제품사용",
+        "순필요매수",
         "사업장",
         "공정코드",
         "공정명",
@@ -1737,21 +1745,52 @@ def daily_optimal_from_wip_shipping(
 
     rows: list[dict[str, Any]] = []
     area_ord = {"외관": 0, "Hole": 1, "치수": 2, "종합측정실": 3}
+    status_ord = {
+        "처리가능": 0,
+        "재공부족": 1,
+        "재공없음": 2,
+        "대기(재고배분완료)": 3,
+        "완제품충당": 9,
+    }
 
     ship = ship.copy()
+    ship["제품코드"] = ship["제품코드"].map(_norm)
     ship["_pri"] = ship["우선순위"].map(_priority_rank) if "우선순위" in ship.columns else 99
     if "출하예정일" not in ship.columns:
         ship["출하예정일"] = ""
-    ship = ship.sort_values(["출하예정일", "_pri", "제품코드"])
+    if "완제품" not in ship.columns:
+        ship["완제품"] = 0
+    ship["완제품"] = pd.to_numeric(ship["완제품"], errors="coerce").fillna(0).clip(lower=0)
+    ship["출하예정수량"] = pd.to_numeric(ship["출하예정수량"], errors="coerce").fillna(0)
+    # 일자 빠른 순 → 완제품·재공 모두 앞에서부터 소진
+    ship = ship.sort_values(["제품코드", "출하예정일", "_pri"])
+
+    # 제품별 완제품 잔량 (긴급품 시트 값, 일자 공통)
+    fg_left: dict[str, float] = {}
+    for code, g in ship.groupby("제품코드", sort=False):
+        fg_left[str(code)] = float(g["완제품"].max())
+
+    # 공정 재공 잔량 (배분 시 차감)
+    wip_pool = wip_agg.copy()
+    if wip_pool.empty:
+        wip_pool["_left"] = pd.Series(dtype=float)
+    else:
+        wip_pool["_left"] = pd.to_numeric(wip_pool["재공매수"], errors="coerce").fillna(0)
 
     for _, s in ship.iterrows():
         code = _norm(s["제품코드"])
-        need = float(s["출하예정수량"])
+        gross = float(s["출하예정수량"])
+        if gross <= 0:
+            continue
         day = _norm(s.get("출하예정일", ""))
         pri = _norm(s.get("우선순위", ""))
         fam = fam_map.get(code, "")
-        hit = wip_agg[wip_agg["제품코드"] == code] if not wip_agg.empty else pd.DataFrame()
-        if hit.empty:
+
+        use_fg = min(fg_left.get(code, 0.0), gross)
+        fg_left[code] = fg_left.get(code, 0.0) - use_fg
+        need = gross - use_fg
+
+        if need <= 0.5:
             rows.append(
                 {
                     "처리순서": 0,
@@ -1759,23 +1798,38 @@ def daily_optimal_from_wip_shipping(
                     "제품코드": code,
                     "제품군": fam,
                     "출하예정일": day,
-                    "출하예정수량": need,
+                    "출하예정수량": gross,
+                    "완제품사용": round(use_fg, 1),
+                    "순필요매수": 0.0,
                     "사업장": "",
                     "공정코드": "",
                     "공정명": "",
                     "검사영역": "",
                     "재공매수": 0,
                     "권장처리매수": 0,
-                    "상태": "재공없음",
-                    "비고": "출하 대상이나 공정 재공에 없음",
+                    "상태": "완제품충당",
+                    "비고": f"완제품 {use_fg:g}매로 출하 충당(현장 처리 불필요)",
                 }
             )
             continue
-        hit = hit.copy()
-        hit["_ord"] = hit["검사영역"].map(lambda a: area_ord.get(a, 9))
-        if fam and fam != "CEL":
-            hit = hit[hit["검사영역"] != "Hole"]
+
+        hit = (
+            wip_pool[wip_pool["제품코드"] == code].copy()
+            if not wip_pool.empty
+            else pd.DataFrame()
+        )
+        if not hit.empty:
+            hit["_ord"] = hit["검사영역"].map(lambda a: area_ord.get(a, 9))
+            if fam and fam != "CEL":
+                hit = hit[hit["검사영역"] != "Hole"]
+            hit = hit[hit["_left"] > 0.5]
+
         if hit.empty:
+            note = (
+                f"완제품 {use_fg:g}매 차감 후 순필요 {need:g}매, 공정 재공 없음"
+                if use_fg > 0
+                else "출하 대상이나 공정 재공에 없음"
+            )
             rows.append(
                 {
                     "처리순서": 0,
@@ -1783,24 +1837,34 @@ def daily_optimal_from_wip_shipping(
                     "제품코드": code,
                     "제품군": fam,
                     "출하예정일": day,
-                    "출하예정수량": need,
+                    "출하예정수량": gross,
+                    "완제품사용": round(use_fg, 1),
+                    "순필요매수": round(need, 1),
                     "사업장": "",
                     "공정코드": "",
                     "공정명": "",
                     "검사영역": "",
                     "재공매수": 0,
-                    "권장처리매수": 0,
+                    "권장처리매수": round(need, 1),
                     "상태": "재공없음",
-                    "비고": "Hole 제외 후 재공 없음",
+                    "비고": note,
                 }
             )
             continue
+
         hit = hit.sort_values(["_ord", "사업장", "공정명"])
         remain = need
-        for _, w in hit.iterrows():
+        fg_note_used = use_fg
+        for idx, w in hit.iterrows():
+            left = float(wip_pool.at[idx, "_left"])
             stock = float(w["재공매수"])
-            take = min(remain, stock) if remain > 0 else 0.0
-            note = "Hole=CEL만" if w["검사영역"] == "Hole" and fam == "CEL" else ""
+            take = min(remain, left) if remain > 0 else 0.0
+            note_bits = []
+            if fg_note_used > 0:
+                note_bits.append(f"완제품 {fg_note_used:g}매 차감")
+                fg_note_used = 0.0
+            if w["검사영역"] == "Hole" and fam == "CEL":
+                note_bits.append("Hole=CEL만")
             rows.append(
                 {
                     "처리순서": 0,
@@ -1808,7 +1872,9 @@ def daily_optimal_from_wip_shipping(
                     "제품코드": code,
                     "제품군": fam or _norm(w.get("제품군", "")),
                     "출하예정일": day,
-                    "출하예정수량": need,
+                    "출하예정수량": gross,
+                    "완제품사용": round(use_fg, 1),
+                    "순필요매수": round(need, 1),
                     "사업장": _norm(w["사업장"]),
                     "공정코드": _norm(w["공정코드"]),
                     "공정명": _norm(w["공정명"]),
@@ -1816,10 +1882,12 @@ def daily_optimal_from_wip_shipping(
                     "재공매수": stock,
                     "권장처리매수": round(take, 1),
                     "상태": "처리가능" if take > 0 else "대기(재고배분완료)",
-                    "비고": note,
+                    "비고": " · ".join(note_bits),
                 }
             )
-            remain -= take
+            if take > 0:
+                wip_pool.at[idx, "_left"] = left - take
+                remain -= take
         if remain > 0.5:
             rows.append(
                 {
@@ -1828,7 +1896,9 @@ def daily_optimal_from_wip_shipping(
                     "제품코드": code,
                     "제품군": fam,
                     "출하예정일": day,
-                    "출하예정수량": need,
+                    "출하예정수량": gross,
+                    "완제품사용": round(use_fg, 1),
+                    "순필요매수": round(need, 1),
                     "사업장": "",
                     "공정코드": "",
                     "공정명": "",
@@ -1836,17 +1906,20 @@ def daily_optimal_from_wip_shipping(
                     "재공매수": 0,
                     "권장처리매수": round(remain, 1),
                     "상태": "재공부족",
-                    "비고": f"출하 대비 재공 부족 {remain:g}매",
+                    "비고": f"순필요 {need:g}매 중 재공 부족 {remain:g}매",
                 }
             )
 
     out = pd.DataFrame(rows)
     if out.empty:
         return pd.DataFrame(columns=cols)
+
     out["_pri"] = out["우선순위"].map(_priority_rank)
-    out = out.sort_values(["출하예정일", "_pri", "제품코드", "상태", "사업장"])
+    out["_st"] = out["상태"].map(lambda x: status_ord.get(x, 5))
+    # 현장 처리 필요 건을 위에, 완제품충당은 아래
+    out = out.sort_values(["_st", "출하예정일", "_pri", "제품코드", "사업장"])
     out["처리순서"] = range(1, len(out) + 1)
-    return out.drop(columns=["_pri"]).reset_index(drop=True)
+    return out.drop(columns=["_pri", "_st"]).reset_index(drop=True)
 
 
 def process_standard_times(products: pd.DataFrame, product_codes: list[str] | None = None) -> pd.DataFrame:
