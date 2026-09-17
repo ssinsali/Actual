@@ -1295,6 +1295,141 @@ def daily_operation_plan(detail: pd.DataFrame, summary: pd.DataFrame) -> pd.Data
     return detail[cols].sort_values(["공정", "제품코드"]).reset_index(drop=True)
 
 
+def floor_manager_daily_raw(
+    products: pd.DataFrame,
+    plan: pd.DataFrame,
+    *,
+    work_days: float = DEFAULT_WORK_DAYS,
+    campuses: tuple[str, ...] | list[str] = ("천안", "아산"),
+    equip: pd.DataFrame | None = None,
+    manpower: pd.DataFrame | None = None,
+    shift_teams: int = DEFAULT_SHIFT_TEAMS,
+    working_teams: int = DEFAULT_WORKING_TEAMS,
+) -> pd.DataFrame:
+    """현장 관리자용 일별 처리 Raw — 캠퍼스·공정·제품별 권장 매수.
+
+    규칙:
+    - 치수: CEL·Ring·Wafer
+    - Hole: CEL만
+    - 외관·종합측정실: 계획 전체
+    - 캠퍼스 배분: 공정 자원 비중(치수·Hole=설비, 외관=인력)
+    """
+    empty_cols = [
+        "캠퍼스",
+        "공정",
+        "처리순서",
+        "제품코드",
+        "제품명",
+        "제품군",
+        "일목표_전체",
+        "캠퍼스배분매수",
+        "예상소요분",
+        "매당분",
+        "제약유형",
+        "캠퍼스비중%",
+        "비고",
+    ]
+    tagged = _tagged_monthly_plan(plan, products)
+    if tagged.empty or products.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
+    tagged = tagged.copy()
+    tagged["일목표_전체"] = (tagged["월목표매수"] / days).round(2)
+
+    # 제품명 맵
+    name_map: dict[str, str] = {}
+    if "제품명" in products.columns:
+        for _, r in products.drop_duplicates("제품코드").iterrows():
+            name_map[_norm(r["제품코드"])] = _norm(r["제품명"])
+
+    eq = equip if equip is not None else pd.DataFrame()
+    man = manpower if manpower is not None else pd.DataFrame()
+    camp_list = [c for c in campuses if c]
+
+    def _share(area: str, campus: str) -> float:
+        return _campus_resource_share(
+            area=area,
+            campus=campus,
+            equip=eq,
+            manpower=man,
+            shift_teams=shift_teams,
+            working_teams=working_teams,
+        )
+
+    shares: dict[tuple[str, str], float] = {}
+    for area in AREAS:
+        raw = {c: _share(area, c) for c in camp_list}
+        s = sum(raw.values())
+        if s <= 0 and camp_list:
+            raw = {c: 1.0 / len(camp_list) for c in camp_list}
+        elif s > 0:
+            raw = {c: v / s for c, v in raw.items()}
+        for c, v in raw.items():
+            shares[(c, area)] = v
+
+    rows: list[dict[str, Any]] = []
+    for _, t in tagged.iterrows():
+        code = _norm(t["제품코드"])
+        fam = _norm(t["제품군"])
+        daily_all = float(t["일목표_전체"])
+        pname = name_map.get(code, code)
+        for area in AREAS:
+            # 공정별 대상 제품군 필터
+            if area == "Hole" and fam != "CEL":
+                continue
+            if area == "치수" and fam not in PLAN_PRODUCT_FAMILIES:
+                continue
+            spec = _product_process_spec(products, code, area)
+            if spec is None:
+                continue
+            tact = float(spec["매당_인시분"] if spec["제약유형"] == "인력" else spec["매당_설비분"])
+            if tact <= 0:
+                tact = float(spec["매당_인시분"] or spec["매당_설비분"] or 0)
+            note = ""
+            if area == "Hole":
+                note = "Hole은 CEL만 측정"
+            elif area == "치수":
+                note = "치수=CEL·Ring·Wafer"
+            for camp in camp_list:
+                share = shares.get((camp, area), 0.0)
+                qty = round(daily_all * share, 2)
+                if qty <= 0:
+                    continue
+                rows.append(
+                    {
+                        "캠퍼스": camp,
+                        "공정": area,
+                        "처리순서": 0,
+                        "제품코드": code,
+                        "제품명": pname,
+                        "제품군": fam,
+                        "일목표_전체": daily_all,
+                        "캠퍼스배분매수": qty,
+                        "예상소요분": round(qty * tact, 1),
+                        "매당분": round(tact, 4),
+                        "제약유형": spec["제약유형"],
+                        "캠퍼스비중%": round(share * 100, 1),
+                        "비고": note,
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(columns=empty_cols)
+
+    out = pd.DataFrame(rows)
+    # 공정 내: 제품군(CEL→Ring→Wafer) · 배분매수 큰 순 → 처리순서
+    fam_ord = {f: i for i, f in enumerate(PLAN_PRODUCT_FAMILIES)}
+    out["_fam"] = out["제품군"].map(lambda x: fam_ord.get(x, 99))
+    out["_area"] = out["공정"].map(lambda x: list(AREAS).index(x) if x in AREAS else 99)
+    out = out.sort_values(
+        ["캠퍼스", "_area", "_fam", "캠퍼스배분매수", "제품코드"],
+        ascending=[True, True, True, False, True],
+    )
+    out["처리순서"] = out.groupby(["캠퍼스", "공정"]).cumcount() + 1
+    return out.drop(columns=["_fam", "_area"]).reset_index(drop=True)
+
+
 def process_standard_times(products: pd.DataFrame, product_codes: list[str] | None = None) -> pd.DataFrame:
     """공정별 평균 매당 인시분·설비분."""
     if products.empty:
