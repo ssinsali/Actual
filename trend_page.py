@@ -717,21 +717,25 @@ def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
             plot = grid.merge(src, on="일자", how="left")
             plot["실적"] = pd.to_numeric(plot["실적"], errors="coerce").fillna(0.0)
             plot["일자표시"] = plot["일자"].dt.strftime("%m/%d")
+            plot["라벨"] = plot["실적"].map(lambda v: f"{float(v):,.0f}" if float(v) > 0 else "")
             period_sum = float(plot["실적"].sum())
 
             st.markdown(f"**{area} · {lab}** · 31일 합 {period_sum:,.0f}")
-            chart = (
-                alt.Chart(plot)
-                .mark_bar(color=color_map.get(lab, "#5dade2"))
-                .encode(
-                    x=alt.X("일자표시:N", title="일자", sort=day_sort),
-                    y=alt.Y("실적:Q", title="실적"),
-                    tooltip=[
-                        alt.Tooltip("일자:T", title="일자"),
-                        alt.Tooltip("실적:Q", title="실적", format=",.0f"),
-                    ],
-                )
-                .properties(height=260, title=f"{area} · {lab}")
+            base = alt.Chart(plot).encode(
+                x=alt.X("일자표시:N", title="일자", sort=day_sort),
+                y=alt.Y("실적:Q", title="실적"),
+                tooltip=[
+                    alt.Tooltip("일자:T", title="일자"),
+                    alt.Tooltip("실적:Q", title="실적", format=",.0f"),
+                ],
             )
+            bars = base.mark_bar(color=color_map.get(lab, "#5dade2"))
+            labels = base.mark_text(
+                dy=-8,
+                fontSize=11,
+                fontWeight="bold",
+                color="#f4f6f7",
+            ).encode(text="라벨:N")
+            chart = (bars + labels).properties(height=280, title=f"{area} · {lab}")
             st.altair_chart(chart, use_container_width=True)
 
