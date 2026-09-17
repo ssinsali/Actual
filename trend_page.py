@@ -307,10 +307,9 @@ def _signed_bar(df: pd.DataFrame, x: str, y: str, *, title: str, x_sort) -> None
 def render() -> None:
     st.title("월평균 추이")
     st.caption(
-        "월평균(일평균 실적) = 그달 실적 합계 ÷ 작업일 수. "
+        "월평균(일평균 실적·**12시간·조 교대일 기준**) = 그달 실적 합계 ÷ 작업일 수. "
         "비교 월을 기준 월 대비로 봐서 조·공정별로 상승 / 유지 / 하락을 봅니다. "
-        "비교월이 기준월보다 작으면 −, 크면 +. "
-        "추이 월은 여러 달을 켜서 맨 아래 전체 흐름을 봅니다."
+        "하단에는 최근 31일 일별 실적(합계/천안/아산) 막대그래프가 있습니다."
     )
 
     records, notes, _chosen = load_records()
@@ -382,7 +381,7 @@ def render() -> None:
             trend_months = (
                 render_slicer("추이 월", months, key="trend_trend_months", default_on=True) if months else []
             )
-            st.caption("추이 월은 맨 아래 월별 일평균 추이에만 적용됩니다. 여러 달을 켜 두세요.")
+            st.caption("추이 월은 「월별 일평균 추이_12시간」에만 적용됩니다. 여러 달을 켜 두세요.")
             hold_pct = st.slider(
                 "유지 범위 (±%)",
                 min_value=1,
@@ -605,35 +604,60 @@ def render() -> None:
         st.markdown("##### 한눈에 보기 (행: 조, 열: 공정)")
         st.dataframe(piv, use_container_width=True)
 
-    st.subheader("월별 일평균 추이")
+    st.subheader("월별 일평균 추이_12시간")
+    st.caption(
+        "조·공정별 **교대일(약 12시간) 기준** 일평균 = 그달 실적 합계 ÷ 해당 조·공정 작업일 수. "
+        "공장 주+야(24시간) 합산이 아닙니다."
+    )
     if series.empty:
         st.caption("표시할 시계열이 없습니다.")
-        return
-    chart_df = series.rename(columns={"영역": "공정"})
-    month_sort = [m for m in all_months if m in set(trend_months)] if trend_months else list(all_months)
-    if trend_months:
-        chart_df = chart_df[chart_df["년월"].astype(str).isin(trend_months)]
-    if chart_df.empty or not month_sort:
-        st.warning("추이 월을 하나 이상 켜 주세요.")
-        return
-    st.caption("선택한 추이 월: " + ", ".join(month_sort))
-    if "조" in chart_df.columns:
-        chart_df["_조순서"] = chart_df["조"].map(lambda x: teams_all.index(x) if x in teams_all else 99)
-        chart_df = chart_df.sort_values(["공정", "_조순서", "년월"])
-    chart = (
-        alt.Chart(chart_df)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("년월:N", title="월", sort=month_sort),
-            y=alt.Y("일평균_실적:Q", title="일평균 실적"),
-            color=alt.Color("조:N", title="조", sort=teams_all),
-            tooltip=["년월", "조", "공정", "일평균_실적", "작업일수", "인당실적"],
-        )
-        .properties(height=360, width=520)
-        .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
-        .resolve_scale(y="independent")
+    else:
+        chart_df = series.rename(columns={"영역": "공정"})
+        month_sort = [m for m in all_months if m in set(trend_months)] if trend_months else list(all_months)
+        if trend_months:
+            chart_df = chart_df[chart_df["년월"].astype(str).isin(trend_months)]
+        if chart_df.empty or not month_sort:
+            st.warning("추이 월을 하나 이상 켜 주세요.")
+        else:
+            st.caption("선택한 추이 월: " + ", ".join(month_sort))
+            if "조" in chart_df.columns:
+                chart_df["_조순서"] = chart_df["조"].map(
+                    lambda x: teams_all.index(x) if x in teams_all else 99
+                )
+                chart_df = chart_df.sort_values(["공정", "_조순서", "년월"])
+            chart = (
+                alt.Chart(chart_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("년월:N", title="월", sort=month_sort),
+                    y=alt.Y("일평균_실적:Q", title="일평균 실적 (12시간·조 기준)"),
+                    color=alt.Color("조:N", title="조", sort=teams_all),
+                    tooltip=["년월", "조", "공정", "일평균_실적", "작업일수", "인당실적"],
+                )
+                .properties(height=360, width=520)
+                .facet(facet=alt.Facet("공정:N", title="공정", sort=list(AREAS)), columns=2)
+                .resolve_scale(y="independent")
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # ----- 일별 합계 / 천안 / 아산 (최근 31일) -----
+    st.subheader("일별 실적 (최근 31일)")
+    st.caption(
+        "조·주야·공정 필터는 반영하고, 캠퍼스는 **합계 / 천안 / 아산**을 함께 표시합니다. "
+        "데이터 최신일 기준 최근 31일 · 공정별 막대그래프."
     )
-    st.altair_chart(chart, use_container_width=True)
+    daily_campus_sel = [c for c in CAMPUSES if c in set(records["캠퍼스"].dropna().astype(str))]
+    if not daily_campus_sel:
+        daily_campus_sel = list(campus_sel) or list(CAMPUSES)
+    daily_src = apply_basic_filters(
+        records,
+        area_sel=area_sel,
+        campus_sel=daily_campus_sel,
+        shift_sel=shift_sel,
+        team_sel=team_sel,
+        mode="전체",
+    )
+    _render_daily_campus_area_bars(daily_src, days=31)
 
     st.download_button(
         "조·공정 월평균 판정 CSV",
@@ -642,3 +666,96 @@ def render() -> None:
         mime="text/csv",
         key="trend_dl_status",
     )
+
+
+def _render_daily_campus_area_bars(df: pd.DataFrame, *, days: int = 31) -> None:
+    """공정별 막대: 일자 × (합계/천안/아산), 최근 N일."""
+    if df is None or df.empty or "일자" not in df.columns:
+        st.caption("일별 실적을 표시할 데이터가 없습니다.")
+        return
+    work = df.dropna(subset=["일자"]).copy()
+    work["일자"] = pd.to_datetime(work["일자"], errors="coerce")
+    work = work.dropna(subset=["일자"])
+    if work.empty:
+        st.caption("일별 실적을 표시할 데이터가 없습니다.")
+        return
+    work["일자"] = work["일자"].dt.normalize()
+    max_d = work["일자"].max()
+    min_d = max_d - pd.Timedelta(days=max(1, int(days)) - 1)
+    work = work[(work["일자"] >= min_d) & (work["일자"] <= max_d)]
+    if work.empty:
+        st.caption("최근 31일 구간 데이터가 없습니다.")
+        return
+
+    st.caption(
+        f"기간: {min_d.date()} ~ {max_d.date()} ({int(days)}일) · "
+        f"표시 행 {len(work):,}건"
+    )
+
+    camp_order = ["합계", "천안", "아산"]
+    area_order = [a for a in AREAS]  # 종합측정실, 치수, Hole, 외관
+
+    for area in area_order:
+        sub = work[work["영역"].astype(str) == area]
+        st.markdown(f"##### {area}")
+        if sub.empty:
+            st.caption(f"{area}: 해당 기간 실적 없음")
+            continue
+
+        by_camp = (
+            sub.groupby(["일자", "캠퍼스"], as_index=False)["실적"]
+            .sum()
+            .rename(columns={"실적": "실적"})
+        )
+        total = (
+            sub.groupby("일자", as_index=False)["실적"]
+            .sum()
+            .assign(구분="합계")
+        )
+        pieces = [total.rename(columns={"실적": "실적"})]
+        for camp in ("천안", "아산"):
+            c = by_camp[by_camp["캠퍼스"].astype(str) == camp][["일자", "실적"]].copy()
+            c["구분"] = camp
+            pieces.append(c)
+        long = pd.concat(pieces, ignore_index=True)
+        # 날짜축에 빈 날도 보이게 0 채움
+        all_days = pd.date_range(min_d, max_d, freq="D")
+        grid = pd.MultiIndex.from_product(
+            [all_days, camp_order], names=["일자", "구분"]
+        ).to_frame(index=False)
+        long = grid.merge(long, on=["일자", "구분"], how="left")
+        long["실적"] = pd.to_numeric(long["실적"], errors="coerce").fillna(0.0)
+        long["일자표시"] = long["일자"].dt.strftime("%m/%d")
+        day_sort = [d.strftime("%m/%d") for d in all_days]
+
+        chart = (
+            alt.Chart(long)
+            .mark_bar()
+            .encode(
+                x=alt.X("일자표시:N", title="일자", sort=day_sort),
+                y=alt.Y("실적:Q", title="실적"),
+                color=alt.Color(
+                    "구분:N",
+                    title="구분",
+                    sort=camp_order,
+                    scale=alt.Scale(domain=camp_order),
+                ),
+                xOffset=alt.XOffset("구분:N", sort=camp_order),
+                tooltip=[
+                    alt.Tooltip("일자:T", title="일자"),
+                    "구분",
+                    alt.Tooltip("실적:Q", title="실적", format=",.0f"),
+                ],
+            )
+            .properties(height=280, title=f"{area} · 일별 실적 (합계/천안/아산)")
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        # 요약 메트릭: 기간 합계
+        sums = long.groupby("구분", as_index=False)["실적"].sum()
+        mcols = st.columns(3)
+        for i, lab in enumerate(camp_order):
+            val = float(sums.loc[sums["구분"] == lab, "실적"].sum()) if not sums.empty else 0.0
+            with mcols[i]:
+                st.metric(f"{area} · {lab} (31일 합)", f"{val:,.0f}")
+
