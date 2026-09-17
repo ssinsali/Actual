@@ -37,6 +37,7 @@ from sim_engine import (
     empty_csv_bytes,
     empty_xlsx_bytes,
     equipment_template,
+    floor_manager_daily_raw,
     manpower_template,
     master_github_paths,
     monthly_plan_family_stats,
@@ -881,6 +882,59 @@ def render() -> None:
                         "천안/아산은 전체 일평균을 공정 자원 비중으로 나눈 값 "
                         "(치수·Hole=가동 설비 대수, 외관=근무인원)."
                     )
+
+                # 현장 관리자용 일별 최적 처리 Raw
+                floor_raw = floor_manager_daily_raw(
+                    pr_view,
+                    plan_for_calc,
+                    work_days=work_days,
+                    campuses=tuple(camp_names) if camp_names else ("천안", "아산"),
+                    equip=eq_view,
+                    manpower=man_view,
+                    shift_teams=shift_teams,
+                    working_teams=working_teams,
+                )
+                st.markdown("### 일별 최적 처리 (현장용 Raw)")
+                st.caption(
+                    "캠퍼스·공정별 제품 처리순서와 권장 매수입니다. "
+                    "치수=CEL·Ring·Wafer, Hole=CEL만, 외관=전체. "
+                    "CSV를 내려받아 현장 관리자에게 전달하세요."
+                )
+                if floor_raw.empty:
+                    st.info("다운로드할 일별 처리 데이터가 없습니다. 기준정보·계획을 확인하세요.")
+                else:
+                    st.dataframe(
+                        floor_raw.head(200),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if len(floor_raw) > 200:
+                        st.caption(f"미리보기 200행 / 전체 {len(floor_raw)}행 (CSV에 전체 포함)")
+                    dl1, dl2, dl3 = st.columns(3)
+                    with dl1:
+                        st.download_button(
+                            "전체 캠퍼스 CSV",
+                            data=csv_bytes(floor_raw),
+                            file_name="일별_최적처리_전체.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="sim_dl_floor_all",
+                        )
+                    for i, camp_name in enumerate(
+                        camp_names if camp_names else ["천안", "아산"]
+                    ):
+                        sub = floor_raw[floor_raw["캠퍼스"] == camp_name]
+                        col = dl2 if i == 0 else dl3
+                        with col:
+                            st.download_button(
+                                f"{camp_name} CSV",
+                                data=csv_bytes(sub),
+                                file_name=f"일별_최적처리_{camp_name}.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                                key=f"sim_dl_floor_{camp_name}",
+                                disabled=sub.empty,
+                            )
 
                 st.caption(f"적용 파일: **{fname}**")
                 with st.expander("업로드 계획 목록", expanded=False):
