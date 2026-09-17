@@ -875,6 +875,209 @@ def render() -> None:
                                 disabled=sub.empty,
                             )
 
+        # ----- 후순위: 월 생산 계획 (능력 검토) -----
+        st.divider()
+        with st.expander("월 생산 계획 (후순위 · 능력 검토)", expanded=False):
+            st.caption(
+                "재공·출하 일별 처리와 별개입니다. "
+                "제품코드+월목표 CSV로 월/일 가능·병목·일평균을 참고용으로 봅니다."
+            )
+            if pr_view.empty or (eq_view.empty and man_view.empty):
+                st.warning("제품·설비·인력 기준정보가 있어야 월 계획을 검토할 수 있습니다.")
+            else:
+                work_days = int(
+                    st.number_input(
+                        "월 작업일수",
+                        min_value=1,
+                        max_value=31,
+                        value=DEFAULT_WORK_DAYS,
+                        step=1,
+                        key="sim_work_days",
+                        help="일목표 = 월목표 ÷ 작업일수",
+                    )
+                )
+                pdl, pup = st.columns(2)
+                with pdl:
+                    st.download_button(
+                        "월 생산계획 양식 CSV",
+                        data=csv_bytes(monthly_plan_template()),
+                        file_name="월_생산계획.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="sim_dl_plan_csv",
+                    )
+                with pup:
+                    plan_file = st.file_uploader(
+                        "월 생산계획 CSV",
+                        type=["csv"],
+                        key="sim_plan_upload",
+                        help="열: 제품코드, 월목표매수",
+                    )
+                if plan_file is not None:
+                    sig = (plan_file.name, int(getattr(plan_file, "size", 0) or 0))
+                    if sig != st.session_state.get("sim_plan_sig"):
+                        try:
+                            uploaded = _read_plan_csv(plan_file.getvalue())
+                        except Exception:
+                            uploaded = pd.DataFrame()
+                        if uploaded.empty:
+                            st.error("CSV를 읽지 못했습니다.")
+                        else:
+                            st.session_state["sim_plan_upload_df"] = uploaded
+                            st.session_state["sim_plan_sig"] = sig
+                            st.session_state["sim_plan_fname"] = plan_file.name
+                            st.rerun()
+
+                plan_raw = st.session_state.get("sim_plan_upload_df")
+                plan_for_calc = (
+                    normalize_monthly_plan(plan_raw) if plan_raw is not None else pd.DataFrame()
+                )
+                if plan_raw is None:
+                    st.info("월 생산계획 CSV를 업로드하세요. (제품코드, 월목표매수)")
+                elif plan_for_calc.empty:
+                    st.warning("유효한 행이 없습니다.")
+                else:
+                    fname = st.session_state.get("sim_plan_fname", "업로드 파일")
+                    plan_stats = monthly_plan_family_stats(plan_for_calc, pr_view)
+                    st.markdown("**계획 요약**")
+                    _render_plan_family_summary(plan_stats)
+                    total_avg = _daily_avg_from_family_stats(plan_stats, work_days)
+                    st.markdown("**일평균 (참고)**")
+                    st.caption(
+                        "치수=CEL·Ring·Wafer · Hole=CEL만 · 외관=전체 · "
+                        f"월목표÷작업일({work_days}일)"
+                    )
+                    _render_daily_avg_row("전체", total_avg)
+                    with st.expander("일평균 계산식", expanded=False):
+                        _render_daily_avg_formula(total_avg)
+
+                    camp_names = [
+                        c for c in ("천안", "아산") if not campus_sel or c in campus_sel
+                    ]
+                    if camp_names:
+                        dim_shares = {
+                            c: _campus_share_for_area(
+                                "치수", c, eq_view, man_view,
+                                shift_teams=shift_teams, working_teams=working_teams,
+                            )
+                            for c in camp_names
+                        }
+                        hole_shares = {
+                            c: _campus_share_for_area(
+                                "Hole", c, eq_view, man_view,
+                                shift_teams=shift_teams, working_teams=working_teams,
+                            )
+                            for c in camp_names
+                        }
+                        app_shares = {
+                            c: _campus_share_for_area(
+                                "외관", c, eq_view, man_view,
+                                shift_teams=shift_teams, working_teams=working_teams,
+                            )
+                            for c in camp_names
+                        }
+                        if sum(dim_shares.values()) <= 0:
+                            dim_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                        if sum(hole_shares.values()) <= 0:
+                            hole_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                        if sum(app_shares.values()) <= 0:
+                            app_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                        ccols = st.columns(len(camp_names))
+                        for col, camp_name in zip(ccols, camp_names):
+                            with col:
+                                _render_daily_avg_row(
+                                    camp_name,
+                                    _scale_daily_avg(
+                                        total_avg,
+                                        dim_share=dim_shares[camp_name],
+                                        hole_share=hole_shares[camp_name],
+                                        app_share=app_shares[camp_name],
+                                    ),
+                                )
+
+                    floor_raw = floor_manager_daily_raw(
+                        pr_view,
+                        plan_for_calc,
+                        work_days=work_days,
+                        campuses=tuple(camp_names) if camp_names else ("천안", "아산"),
+                        equip=eq_view,
+                        manpower=man_view,
+                        shift_teams=shift_teams,
+                        working_teams=working_teams,
+                    )
+                    st.markdown("**월계획 기준 하루 배분 (참고 Raw)**")
+                    if floor_raw.empty:
+                        st.caption("표시할 데이터가 없습니다.")
+                    else:
+                        st.dataframe(
+                            floor_raw.head(100),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        st.download_button(
+                            "월계획 기준 일별 Raw CSV",
+                            data=csv_bytes(floor_raw),
+                            file_name="월계획_일별배분_참고.csv",
+                            mime="text/csv",
+                            key="sim_dl_month_floor",
+                        )
+
+                    campus_scopes: list[tuple[str, str | None]] = [("Total", None)]
+                    for c in camp_names:
+                        campus_scopes.append((c, c))
+                    st.caption(f"적용 파일: **{fname}**")
+                    for label, camp in campus_scopes:
+                        detail, summary, missing = monthly_plan_feasibility(
+                            pr_view,
+                            eq_view,
+                            plan_for_calc,
+                            campus=camp,
+                            work_days=work_days,
+                            manpower=man_view,
+                            shift_teams=shift_teams,
+                            working_teams=working_teams,
+                        )
+                        st.markdown(f"**실현성 · {label}**")
+                        if missing:
+                            st.warning(
+                                "기준정보 없는 코드: "
+                                + ", ".join(missing[:15])
+                                + (" …" if len(missing) > 15 else "")
+                            )
+                        if summary.empty:
+                            continue
+                        ok_n = int((summary["달성"] == "OK").sum())
+                        ng_n = int((summary["달성"] != "OK").sum())
+                        a, b, c = st.columns(3)
+                        with a:
+                            st.metric("품목", f"{len(summary)}")
+                        with b:
+                            st.metric("OK", f"{ok_n}")
+                        with c:
+                            st.metric("부족", f"{ng_n}")
+                        show_sum = summary[
+                            [
+                                x
+                                for x in (
+                                    "제품코드",
+                                    "제품명",
+                                    "월목표매수",
+                                    "일목표매수",
+                                    "월가능매수",
+                                    "병목공정",
+                                    "달성",
+                                    "부족매수",
+                                )
+                                if x in summary.columns
+                            ]
+                        ]
+                        st.dataframe(show_sum, use_container_width=True, hide_index=True)
+                        with st.expander(f"{label} 공정 상세", expanded=False):
+                            st.dataframe(detail, use_container_width=True, hide_index=True)
+                            if not detail.empty:
+                                daily = daily_operation_plan(detail, summary)
+                                st.dataframe(daily, use_container_width=True, hide_index=True)
+
     with tab_util:
         st.subheader("실적 기준 인당 시간 활용")
         st.caption(
