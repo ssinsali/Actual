@@ -731,8 +731,8 @@ def render() -> None:
         st.subheader("일별 최적 처리")
         st.caption(
             "**출하계획 Excel(긴급품 시트)** + **공정 재공 Excel**을 올리면, "
-            "오늘(선택일) 출하 대상 중 실제 재공이 있는 제품을 공정·사업장별로 정리합니다. "
-            "CSV를 내려받아 현장 관리자에게 전달하세요."
+            "엑셀 일자별 출하 수량 열을 그대로 반영해 재공이 있는 제품을 공정·사업장별로 정리합니다. "
+            "기본은「전체」일자입니다. CSV를 내려받아 현장 관리자에게 전달하세요."
         )
 
         up1, up2 = st.columns(2)
@@ -756,9 +756,15 @@ def render() -> None:
             if sig != st.session_state.get("sim_ship_sig"):
                 try:
                     raw_ship, _ = read_shipping_excel(ship_file.getvalue())
+                    raw_ship = raw_ship.copy()
+                    raw_ship.columns = [
+                        str(c).replace("\n", " ").strip() for c in raw_ship.columns
+                    ]
                     st.session_state["sim_ship_raw"] = raw_ship
                     st.session_state["sim_ship_sig"] = sig
                     st.session_state["sim_ship_fname"] = ship_file.name
+                    # 이전 단일일(예: 9/17) 선택이 남지 않도록 전체로 초기화
+                    st.session_state["sim_ship_day_v2"] = "전체"
                     st.rerun()
                 except Exception as e:
                     st.error(f"출하계획 읽기 실패: {e}")
@@ -776,6 +782,11 @@ def render() -> None:
 
         ship_raw = st.session_state.get("sim_ship_raw")
         wip_df = st.session_state.get("sim_wip_df")
+        if ship_raw is not None and not getattr(ship_raw, "empty", True):
+            ship_raw = ship_raw.copy()
+            ship_raw.columns = [
+                str(c).replace("\n", " ").strip() for c in ship_raw.columns
+            ]
 
         if ship_raw is None or wip_df is None:
             st.info("출하계획 Excel과 공정 재공 Excel을 모두 업로드하세요.")
@@ -787,23 +798,30 @@ def render() -> None:
             if not date_opts:
                 st.warning("긴급품 시트에서 출하 일자 열을 찾지 못했습니다.")
             else:
+                if "sim_ship_day_v2" not in st.session_state:
+                    st.session_state["sim_ship_day_v2"] = "전체"
                 ship_day = st.selectbox(
                     "출하 기준일",
                     options=date_opts,
-                    index=0,
-                    key="sim_ship_day",
-                    help="긴급품 시트의 일자별 수량 열",
+                    key="sim_ship_day_v2",
+                    help="「전체」= 엑셀의 9/17·9/18·… 수량 열을 각각 출하예정일로 반영. 특정일만 보려면 해당 일자를 선택.",
                 )
-                ship_norm = normalize_shipping_urgent(ship_raw, ship_date=ship_day)
+                ship_norm = normalize_shipping_urgent(
+                    ship_raw,
+                    ship_date=None if ship_day == "전체" else ship_day,
+                )
                 wip_agg = aggregate_wip(wip_df)
 
                 c1, c2, c3, c4 = st.columns(4)
                 with c1:
-                    st.metric("출하 품목", f"{len(ship_norm)}종")
+                    st.metric("출하 품목", f"{ship_norm['제품코드'].nunique()}종")
                 with c2:
                     st.metric("출하 예정수량", f"{float(ship_norm['출하예정수량'].sum()):,.0f}매")
                 with c3:
-                    st.metric("재공 위치", f"{len(wip_agg)}건")
+                    st.metric(
+                        "출하 일자 수",
+                        f"{ship_norm['출하예정일'].nunique()}일" if not ship_norm.empty else "0일",
+                    )
                 with c4:
                     st.metric(
                         "재공 매수",
@@ -814,8 +832,21 @@ def render() -> None:
                     f"출하: **{st.session_state.get('sim_ship_fname', '')}** · "
                     f"재공: **{st.session_state.get('sim_wip_fname', '')}** · 기준일 {ship_day}"
                 )
+                if not ship_norm.empty:
+                    by_day = (
+                        ship_norm.groupby("출하예정일", as_index=False)
+                        .agg(품목수=("제품코드", "nunique"), 예정수량=("출하예정수량", "sum"))
+                        .sort_values("출하예정일")
+                    )
+                    st.caption(
+                        "일자별 출하: "
+                        + " · ".join(
+                            f"{r['출하예정일']} {int(r['예정수량'])}매/{int(r['품목수'])}종"
+                            for _, r in by_day.iterrows()
+                        )
+                    )
 
-                with st.expander("출하 예정(선택일)", expanded=False):
+                with st.expander("출하 예정(일자별 펼침)", expanded=False):
                     st.dataframe(ship_norm, use_container_width=True, hide_index=True)
                 with st.expander("재공 집계", expanded=False):
                     st.dataframe(wip_agg, use_container_width=True, hide_index=True)
@@ -857,7 +888,7 @@ def render() -> None:
                         st.download_button(
                             "전체 CSV",
                             data=csv_bytes(floor),
-                            file_name=f"일별_최적처리_{ship_day}.csv",
+                            file_name=f"일별_최적처리_{ship_day if ship_day != '전체' else '전체일자'}.csv",
                             mime="text/csv",
                             use_container_width=True,
                             key="sim_dl_opt_all",
@@ -868,7 +899,10 @@ def render() -> None:
                             st.download_button(
                                 f"{camp_name} CSV",
                                 data=csv_bytes(sub),
-                                file_name=f"일별_최적처리_{camp_name}_{ship_day}.csv",
+                                file_name=(
+                                    f"일별_최적처리_{camp_name}_"
+                                    f"{'전체일자' if ship_day == '전체' else ship_day}.csv"
+                                ),
                                 mime="text/csv",
                                 use_container_width=True,
                                 key=f"sim_dl_opt_{camp_name}",
