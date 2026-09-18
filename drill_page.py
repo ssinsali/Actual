@@ -12,6 +12,7 @@ from auth import github_file_get, github_file_put, github_store_enabled, render_
 from drill_engine import (
     DEFAULT_DAY_HOURS,
     DEFAULT_UTILIZATION_PCT,
+    DEDUCT_COLUMNS,
     DRILL_QTY_STEM,
     DRILL_STEMS,
     DRILL_TIME_STEM,
@@ -228,6 +229,30 @@ def render() -> None:
             "GitHub `templates/`에 드릴_월별필요수량 / 드릴_제품가공시간을 올리면 Cloud 재시작 후에도 가져옵니다."
         )
 
+    st.markdown("##### 수동 차감")
+    st.caption(
+        "올린 계획에서 빼려는 제품코드와 **매월 차감 매수**를 입력하세요. "
+        "예: `A3E00T-SM` / `500` → 1~12월 모두 500매씩 차감합니다. "
+        "행을 늘려 여러 제품을 넣을 수 있습니다."
+    )
+    deduct_edit = st.data_editor(
+        pd.DataFrame({c: [""] if c == "제품코드" else [0.0] for c in DEDUCT_COLUMNS}),
+        column_config={
+            "제품코드": st.column_config.TextColumn("제품코드", help="예: A3E00T-SM"),
+            "매월차감": st.column_config.NumberColumn(
+                "매월 차감매수",
+                min_value=0,
+                step=1,
+                format="%d",
+                help="모든 월의 필요수량에서 이 매수만큼 뺍니다.",
+            ),
+        },
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="drill_deduct_editor",
+    )
+
     force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False))
     if force_gh:
         _sync_from_github(force=True)
@@ -394,6 +419,7 @@ def render() -> None:
         work_days=work_days,
         day_hours=day_hours,
         utilization_pct=util_pct,
+        deduct=deduct_edit,
     )
 
     if qty_raw.empty or time_raw.empty:
@@ -420,7 +446,7 @@ def render() -> None:
             """
 **계산식**
 
-- 제품·월 필요시간(분) = 필요수량 × 매당가공시간_분
+- 제품·월 필요시간(분) = (원 필요수량 − 수동 차감) × 매당가공시간_분
 - 1대 월 가용시간(분) = 월 작업일수 × 1일 가동시간 × 60 × 가동률
 - 월 필요대수(이론) = 그 달 필요시간 합 ÷ 1대 월 가용시간
 - **총 필요대수** = 월별 필요대수를 올림한 값 중 최대 (가장 바쁜 달을 커버하는 보유 대수)
@@ -429,7 +455,9 @@ def render() -> None:
         return
 
     if result["detail"].empty:
-        if result["qty"].empty:
+        if result.get("deduct_notes") and result["qty"].empty:
+            st.warning("수동 차감 후 남은 필요수량이 없습니다. 차감 매수를 줄여 보세요.")
+        elif result["qty"].empty:
             cols = ", ".join(str(c) for c in result.get("qty_columns") or []) or "(없음)"
             st.warning(
                 "월별 필요수량에서 제품코드 열을 읽지 못했습니다. "
@@ -446,6 +474,12 @@ def render() -> None:
             st.warning(
                 "수량과 가공시간의 제품코드가 겹치지 않습니다. "
                 "철자·공백·하이픈을 확인하세요."
+            )
+        if result.get("deduct_notes"):
+            st.info("수동 차감: " + " · ".join(result["deduct_notes"]))
+        if result.get("deduct_missing"):
+            st.warning(
+                "수량 계획에 없어 차감하지 못한 제품코드: " + ", ".join(result["deduct_missing"])
             )
         if result["unmatched"]:
             st.caption("가공시간이 없는 제품코드: " + ", ".join(result["unmatched"][:30]))
@@ -485,6 +519,12 @@ def render() -> None:
         )
     if result["unused_times"]:
         st.caption("수량 계획이 없는 가공시간 코드: " + ", ".join(result["unused_times"]))
+    if result.get("deduct_notes"):
+        st.info("수동 차감 적용: " + " · ".join(result["deduct_notes"]))
+    if result.get("deduct_missing"):
+        st.warning(
+            "수량 계획에 없어 차감하지 못한 제품코드: " + ", ".join(result["deduct_missing"])
+        )
 
     monthly = result["monthly"].copy()
     monthly["보유대수"] = owned
@@ -549,13 +589,30 @@ def render() -> None:
         st.subheader(f"피크월({peak_label}) 제품별 부하")
         show_p = peak_detail.copy()
         show_p["필요수량"] = show_p["필요수량"].map(_fmt_int)
+        if "차감매수" in show_p.columns:
+            show_p["차감매수"] = show_p["차감매수"].map(_fmt_int)
+        if "필요수량_원" in show_p.columns:
+            show_p["필요수량_원"] = show_p["필요수량_원"].map(_fmt_int)
         show_p["매당가공시간_분"] = show_p["매당가공시간_분"].map(lambda v: _fmt_num(v, 2))
         show_p["필요시간_분"] = show_p["필요시간_분"].map(lambda v: _fmt_num(v, 1))
         show_p["이론필요대수"] = show_p["이론필요대수"].map(lambda v: _fmt_num(v, 3))
+        peak_cols = [
+            c
+            for c in [
+                "제품코드",
+                "제품명",
+                "필요수량_원",
+                "차감매수",
+                "필요수량",
+                "매당가공시간_분",
+                "필요시간_분",
+                "이론필요대수",
+                "비중%",
+            ]
+            if c in show_p.columns
+        ]
         st.dataframe(
-            show_p[
-                ["제품코드", "제품명", "필요수량", "매당가공시간_분", "필요시간_분", "이론필요대수", "비중%"]
-            ],
+            show_p[peak_cols],
             use_container_width=True,
             hide_index=True,
         )
@@ -563,21 +620,30 @@ def render() -> None:
     with st.expander("제품·월 상세"):
         detail = result["detail"].copy()
         detail["필요수량"] = detail["필요수량"].map(_fmt_int)
+        if "차감매수" in detail.columns:
+            detail["차감매수"] = detail["차감매수"].map(_fmt_int)
+        if "필요수량_원" in detail.columns:
+            detail["필요수량_원"] = detail["필요수량_원"].map(_fmt_int)
         detail["매당가공시간_분"] = detail["매당가공시간_분"].map(lambda v: _fmt_num(v, 2))
         detail["필요시간_분"] = detail["필요시간_분"].map(lambda v: _fmt_num(v, 1))
         detail["이론필요대수"] = detail["이론필요대수"].map(lambda v: _fmt_num(v, 3))
+        detail_cols = [
+            c
+            for c in [
+                "월라벨",
+                "제품코드",
+                "제품명",
+                "필요수량_원",
+                "차감매수",
+                "필요수량",
+                "매당가공시간_분",
+                "필요시간_분",
+                "이론필요대수",
+            ]
+            if c in detail.columns
+        ]
         st.dataframe(
-            detail[
-                [
-                    "월라벨",
-                    "제품코드",
-                    "제품명",
-                    "필요수량",
-                    "매당가공시간_분",
-                    "필요시간_분",
-                    "이론필요대수",
-                ]
-            ].rename(columns={"월라벨": "월"}),
+            detail[detail_cols].rename(columns={"월라벨": "월"}),
             use_container_width=True,
             hide_index=True,
         )
@@ -592,7 +658,7 @@ def render() -> None:
     with st.expander("계산식 · 올린 파일"):
         st.markdown(
             f"""
-- 제품·월 필요시간(분) = 필요수량 × 매당가공시간_분
+- 제품·월 필요시간(분) = (원 필요수량 − 수동 차감) × 매당가공시간_분
 - 1대 월 가용 = {work_days:g} × {day_hours:g} × 60 × {util_pct:g}% = **{avail_min:,.0f}분**
 - 월 필요대수(올림) = ceil(그 달 필요시간 합 ÷ 1대 월 가용)
 - 부족대수 = max(월 필요대수 − 현재 보유 {owned}대, 0)
