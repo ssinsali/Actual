@@ -207,12 +207,26 @@ def _fmt_num(v: float, digits: int = 2) -> str:
 
 def render() -> None:
     st.title("드릴설비 필요 분석")
-    st.caption(
-        "월별 제품코드 필요수량과 제품별 가공시간(1매당 분)을 올리면 "
-        "드릴 설비 **총 필요대수**를 계산합니다. "
-        "총 필요대수 = 월별 필요시간 ÷ 1대 월 가용시간 을 올림한 값 중 **피크월**. "
-        "GitHub `templates/`에 드릴_월별필요수량 / 드릴_제품가공시간을 올리면 Cloud 재시작 후에도 가져옵니다."
-    )
+    own_col, own_help = st.columns([1, 3])
+    with own_col:
+        owned = int(
+            st.number_input(
+                "현재 보유 대수",
+                min_value=0,
+                max_value=999,
+                value=0,
+                step=1,
+                help="지금 가동 중인 드릴 설비 대수. 부족대수 = 월 필요대수 − 보유대수.",
+                key="drill_owned",
+            )
+        )
+    with own_help:
+        st.caption(
+            "월별 제품코드 필요수량과 제품별 가공시간(1매당 분)을 올리면 "
+            "드릴 설비 **총 필요대수**와 **보유 대비 부족대수**를 계산합니다. "
+            "부족대수 = 월 필요대수(올림) − 현재 보유 (0 미만은 0). "
+            "GitHub `templates/`에 드릴_월별필요수량 / 드릴_제품가공시간을 올리면 Cloud 재시작 후에도 가져옵니다."
+        )
 
     force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False))
     if force_gh:
@@ -446,23 +460,24 @@ def render() -> None:
     total_req = int(result["total_required"])
     theo = float(result["peak_theoretical"])
     avail_min = float(result["machine_month_min"])
+    short_peak = max(total_req - owned, 0)
 
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        st.metric("총 필요대수", f"{total_req}대")
+        st.metric("현재 보유", f"{owned}대")
     with k2:
-        st.metric("피크월", peak_label)
+        st.metric("총 필요대수", f"{total_req}대")
     with k3:
-        st.metric("피크월 이론 대수", f"{theo:.2f}대")
+        st.metric("부족대수", f"{short_peak}대")
     with k4:
-        st.metric("1대 월 가용", f"{avail_min:,.0f}분")
+        st.metric("피크월", peak_label)
 
     st.caption(
         f"총 필요대수 {total_req}대 = {peak_label} 필요시간 "
         f"{result['peak_hours']:,.1f}시간 ÷ 1대 가용 {avail_min / 60:,.1f}시간 "
         f"→ 이론 {theo:.2f}대를 올림. "
-        f"월평균 이론 대수는 {result['avg_theoretical']:.2f}대입니다. "
-        "보유 대수는 피크월 기준으로 잡습니다."
+        f"부족대수 = {total_req} − 보유 {owned} = {short_peak}대. "
+        f"1대 월 가용 {avail_min:,.0f}분."
     )
     if result["unmatched"]:
         st.warning(
@@ -471,38 +486,59 @@ def render() -> None:
     if result["unused_times"]:
         st.caption("수량 계획이 없는 가공시간 코드: " + ", ".join(result["unused_times"]))
 
-    monthly = result["monthly"]
-    show_m = monthly.copy()
-    show_m["필요수량합"] = show_m["필요수량합"].map(_fmt_int)
-    show_m["필요시간_분"] = show_m["필요시간_분"].map(lambda v: _fmt_num(v, 1))
-    show_m["1대월가용_분"] = show_m["1대월가용_분"].map(_fmt_int)
-    show_m["이론필요대수"] = show_m["이론필요대수"].map(lambda v: _fmt_num(v, 2))
-    show_m["부하율%"] = show_m["부하율%"].map(lambda v: _fmt_num(v, 1))
+    monthly = result["monthly"].copy()
+    monthly["보유대수"] = owned
+    monthly["부족대수"] = (monthly["필요대수"] - owned).clip(lower=0).astype(int)
+    if owned > 0:
+        monthly["보유대비부하%"] = (monthly["이론필요대수"] / owned * 100).round(1)
+    else:
+        monthly["보유대비부하%"] = None
 
-    st.subheader("월별 필요대수")
-    st.dataframe(
-        show_m[["월라벨", "필요수량합", "필요시간_분", "이론필요대수", "필요대수", "부하율%"]].rename(
-            columns={"월라벨": "월", "필요대수": "필요대수(올림)"}
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    chart_df = monthly[["월라벨", "이론필요대수", "필요대수"]].copy()
-    chart_df = chart_df.rename(columns={"월라벨": "월", "이론필요대수": "이론", "필요대수": "올림"})
-    long_chart = chart_df.melt(id_vars="월", var_name="구분", value_name="대수")
-    st.altair_chart(
-        alt.Chart(long_chart)
+    st.subheader("월별 부족 설비")
+    st.caption(f"부족대수 = 월 필요대수(올림) − 현재 보유 {owned}대. 여유 달은 0으로 표시합니다.")
+    chart_df = monthly[["월라벨", "필요대수", "보유대수", "부족대수"]].rename(columns={"월라벨": "월"})
+    bars = (
+        alt.Chart(chart_df)
         .mark_bar()
         .encode(
             x=alt.X("월:N", sort=list(monthly["월라벨"]), title="월"),
-            y=alt.Y("대수:Q", title="필요대수"),
-            color=alt.Color("구분:N", title="구분"),
-            xOffset="구분:N",
-            tooltip=["월", "구분", "대수"],
+            y=alt.Y("부족대수:Q", title="부족 대수"),
+            tooltip=["월", "필요대수", "보유대수", "부족대수"],
         )
-        .properties(height=320, title="월별 드릴 설비 필요대수"),
+    )
+    hold_rule = (
+        alt.Chart(pd.DataFrame({"y": [0]}))
+        .mark_rule(strokeDash=[4, 4])
+        .encode(y="y:Q")
+    )
+    st.altair_chart(
+        (bars + hold_rule).properties(height=320, title=f"월별 부족 설비 (보유 {owned}대 기준)"),
         use_container_width=True,
+    )
+
+    show_m = monthly.copy()
+    show_m["필요수량합"] = show_m["필요수량합"].map(_fmt_int)
+    show_m["필요시간_분"] = show_m["필요시간_분"].map(lambda v: _fmt_num(v, 1))
+    show_m["이론필요대수"] = show_m["이론필요대수"].map(lambda v: _fmt_num(v, 2))
+    show_m["보유대비부하%"] = show_m["보유대비부하%"].map(
+        lambda v: "-" if v is None or (isinstance(v, float) and pd.isna(v)) else _fmt_num(v, 1)
+    )
+    st.subheader("월별 필요대수")
+    st.dataframe(
+        show_m[
+            [
+                "월라벨",
+                "필요수량합",
+                "필요시간_분",
+                "이론필요대수",
+                "필요대수",
+                "보유대수",
+                "부족대수",
+                "보유대비부하%",
+            ]
+        ].rename(columns={"월라벨": "월", "필요대수": "필요대수(올림)"}),
+        use_container_width=True,
+        hide_index=True,
     )
 
     peak_detail = result["detail"][result["detail"]["월라벨"] == peak_label].copy()
@@ -558,8 +594,10 @@ def render() -> None:
             f"""
 - 제품·월 필요시간(분) = 필요수량 × 매당가공시간_분
 - 1대 월 가용 = {work_days:g} × {day_hours:g} × 60 × {util_pct:g}% = **{avail_min:,.0f}분**
-- 월 이론대수 = 그 달 필요시간 합 ÷ {avail_min:,.0f}
+- 월 필요대수(올림) = ceil(그 달 필요시간 합 ÷ 1대 월 가용)
+- 부족대수 = max(월 필요대수 − 현재 보유 {owned}대, 0)
 - 총 필요대수 = 월별 올림 대수 중 최대
+- 총 부족대수 = max(총 필요대수 − 보유, 0)
             """
         )
         for n in notes:
