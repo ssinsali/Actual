@@ -577,7 +577,7 @@ def render() -> None:
     chart_df = monthly[["월라벨", "필요대수", "보유대수", "부족대수"]].rename(columns={"월라벨": "월"})
     chart_df["표시"] = chart_df["부족대수"].map(lambda v: f"{int(v)}대")
     month_order = list(monthly["월라벨"])
-    y_max = max(float(chart_df["부족대수"].max()), 1.0) * 1.2
+    y_max = max(float(chart_df["부족대수"].max()), 1.0) * 1.28
     bars = (
         alt.Chart(chart_df)
         .mark_bar()
@@ -589,11 +589,12 @@ def render() -> None:
     )
     labels = (
         alt.Chart(chart_df)
-        .mark_text(dy=-8, fontSize=13, fontWeight="bold")
+        .mark_text(dy=-10, fontSize=20, fontWeight="bold", fill="#ffffff")
         .encode(
             x=alt.X("월:N", sort=month_order),
             y=alt.Y("부족대수:Q"),
             text=alt.Text("표시:N"),
+            color=alt.value("#ffffff"),
         )
     )
     st.altair_chart(
@@ -615,26 +616,46 @@ def render() -> None:
         )
 
     show_m = monthly.copy()
-    show_m["필요수량합"] = show_m["필요수량합"].map(_fmt_int)
+    for col in ("필요수량합", "수동차감", "차감분반영합"):
+        if col not in show_m.columns:
+            show_m[col] = 0
+        show_m[col] = show_m[col].map(_fmt_int)
     show_m["필요시간_분"] = show_m["필요시간_분"].map(lambda v: _fmt_num(v, 1))
     show_m["이론필요대수"] = show_m["이론필요대수"].map(lambda v: _fmt_num(v, 2))
     show_m["보유대비부하%"] = show_m["보유대비부하%"].map(
         lambda v: "-" if v is None or (isinstance(v, float) and pd.isna(v)) else _fmt_num(v, 1)
     )
     st.subheader("월별 필요대수")
+    st.caption(
+        "필요수량합 = 가공시간이 있는 제품의 CSV 원 수량 합. "
+        "차감분 반영 합 = 필요수량합 − 수동 차감. "
+        "필요시간 = Σ (차감분 반영 매수 × 매당가공시간). "
+        "가공시간이 없는 코드는 필요수량합에도 넣지 않습니다."
+    )
     st.dataframe(
         show_m[
             [
-                "월라벨",
-                "필요수량합",
-                "필요시간_분",
-                "이론필요대수",
-                "필요대수",
-                "보유대수",
-                "부족대수",
-                "보유대비부하%",
+                c
+                for c in [
+                    "월라벨",
+                    "필요수량합",
+                    "차감분반영합",
+                    "필요시간_분",
+                    "이론필요대수",
+                    "필요대수",
+                    "보유대수",
+                    "부족대수",
+                    "보유대비부하%",
+                ]
+                if c in show_m.columns
             ]
-        ].rename(columns={"월라벨": "월", "필요대수": "필요대수(올림)"}),
+        ].rename(
+            columns={
+                "월라벨": "월",
+                "차감분반영합": "차감분 반영 합",
+                "필요대수": "필요대수(올림)",
+            }
+        ),
         use_container_width=True,
         hide_index=True,
     )
