@@ -397,7 +397,7 @@ def render() -> None:
         with c1:
             st.markdown("##### 월별 필요수량 양식")
             st.dataframe(qty_template(), use_container_width=True, hide_index=True)
-            st.caption("가로형: 제품코드 + 1월~12월. 세로형(년도, 월, 제품코드, 필요수량)도 가능합니다.")
+            st.caption("가로형: 제품코드(또는 코드구분) + 1월~12월. 세로형(년도, 월, 제품코드, 필요수량)도 가능합니다.")
         with c2:
             st.markdown("##### 제품별 가공시간 양식")
             st.dataframe(time_template(), use_container_width=True, hide_index=True)
@@ -415,12 +415,31 @@ def render() -> None:
         return
 
     if result["detail"].empty:
-        st.warning("수량과 가공시간을 제품코드로 맞출 수 없습니다. 코드 철자·공백을 확인하세요.")
+        if result["qty"].empty:
+            cols = ", ".join(str(c) for c in result.get("qty_columns") or []) or "(없음)"
+            st.warning(
+                "월별 필요수량에서 제품코드 열을 읽지 못했습니다. "
+                "`제품코드` 또는 `코드구분` 열이 있는지 확인하세요. "
+                f"현재 열: {cols}"
+            )
+        elif result["times"].empty:
+            cols = ", ".join(str(c) for c in result.get("time_columns") or []) or "(없음)"
+            st.warning(
+                "제품 가공시간에서 매당가공시간_분 값을 읽지 못했습니다. "
+                f"현재 열: {cols}"
+            )
+        else:
+            st.warning(
+                "수량과 가공시간의 제품코드가 겹치지 않습니다. "
+                "철자·공백·하이픈을 확인하세요."
+            )
         if result["unmatched"]:
-            st.caption("가공시간이 없는 제품코드: " + ", ".join(result["unmatched"]))
-        with st.expander("올린 파일 미리보기"):
-            st.dataframe(qty_raw, use_container_width=True)
-            st.dataframe(time_raw, use_container_width=True)
+            st.caption("가공시간이 없는 제품코드: " + ", ".join(result["unmatched"][:30]))
+        if result["unused_times"]:
+            st.caption("수량 계획이 없는 가공시간 코드: " + ", ".join(result["unused_times"][:30]))
+        with st.expander("올린 파일 미리보기", expanded=True):
+            st.dataframe(qty_raw, use_container_width=True, hide_index=True)
+            st.dataframe(time_raw, use_container_width=True, hide_index=True)
         return
 
     peak_label = result["peak_label"] or "-"
