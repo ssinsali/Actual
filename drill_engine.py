@@ -28,10 +28,63 @@ TIME_COLUMNS = ("제품코드", "제품명", "매당가공시간_분", "비고")
 DEFAULT_DAY_HOURS = 24.0
 DEFAULT_UTILIZATION_PCT = 100.0
 
+_CODE_ALIASES = (
+    "제품코드",
+    "코드구분",
+    "제품코드구분",
+    "품번",
+    "품목코드",
+    "자재코드",
+    "품목",
+    "item",
+    "itemcode",
+    "code",
+    "product",
+    "productcode",
+)
+
 _MONTH_HEADER_RE = re.compile(
     r"^(?:(?P<year>20\d{2})\s*[-./년]?\s*)?(?P<month>1[0-2]|0?[1-9])\s*월?$"
 )
 _YM_COMPACT_RE = re.compile(r"^(?P<year>20\d{2})(?P<month>1[0-2]|0[1-9])$")
+
+
+def _code_key(v: Any) -> str:
+    """제품코드 비교용 — 공백·특수하이픈을 맞춘다."""
+    t = _norm(v).replace("\ufeff", "").replace("\u00a0", " ")
+    for ch in ("－", "–", "—", "−", "﹣"):
+        t = t.replace(ch, "-")
+    return re.sub(r"\s+", "", t).upper()
+
+
+def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.dropna(how="all").copy()
+    work.columns = [_norm(c) for c in work.columns]
+    drop = [
+        c
+        for c in work.columns
+        if c == ""
+        or str(c).startswith("Unnamed")
+        or work[c].map(lambda v: _norm(v) == "").all()
+    ]
+    if drop:
+        work = work.drop(columns=drop, errors="ignore")
+    return work
+
+
+def _ensure_product_code(work: pd.DataFrame) -> pd.DataFrame:
+    if "제품코드" in work.columns:
+        return work
+    for col in list(work.columns):
+        key = str(col).replace(" ", "").replace("_", "").lower()
+        for opt in _CODE_ALIASES:
+            if key == opt.replace(" ", "").replace("_", "").lower():
+                return work.rename(columns={col: "제품코드"})
+    for col in list(work.columns):
+        key = str(col).replace(" ", "")
+        if "코드" in key and "설비" not in key and "공정" not in key:
+            return work.rename(columns={col: "제품코드"})
+    return work
 
 
 def _ceil_machines(value: float) -> int:
@@ -172,12 +225,11 @@ def normalize_qty(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return empty
 
-    work = df.dropna(how="all").copy()
-    work.columns = [_norm(c) for c in work.columns]
+    work = _clean_frame(df)
     work = _rename_by_alias(
         work,
         {
-            "제품코드": ("제품코드", "품번", "품목코드", "item", "code", "product"),
+            "제품코드": _CODE_ALIASES,
             "제품명": ("제품명", "품명", "itemname", "name"),
             "년도": ("년도", "연도", "year"),
             "월": ("월", "month"),
@@ -185,10 +237,11 @@ def normalize_qty(df: pd.DataFrame) -> pd.DataFrame:
             "필요수량": ("필요수량", "수량", "매수", "목표", "월목표", "월목표매수", "qty"),
         },
     )
+    work = _ensure_product_code(work)
 
     if "제품코드" not in work.columns:
         return empty
-    work["제품코드"] = work["제품코드"].map(_norm)
+    work["제품코드"] = work["제품코드"].map(_code_key)
     if "제품명" not in work.columns:
         work["제품명"] = ""
     work["제품명"] = work["제품명"].map(_norm)
@@ -265,9 +318,9 @@ def normalize_times(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return empty
     work = _rename_by_alias(
-        df.dropna(how="all").copy(),
+        _clean_frame(df),
         {
-            "제품코드": ("제품코드", "품번", "품목코드", "item", "code", "product"),
+            "제품코드": _CODE_ALIASES,
             "제품명": ("제품명", "품명", "itemname", "name"),
             "매당가공시간_분": (
                 "매당가공시간_분",
@@ -283,10 +336,11 @@ def normalize_times(df: pd.DataFrame) -> pd.DataFrame:
             "비고": ("비고", "메모", "remark", "note"),
         },
     )
+    work = _ensure_product_code(work)
     for col in TIME_COLUMNS:
         if col not in work.columns:
             work[col] = "" if col != "매당가공시간_분" else 0
-    work["제품코드"] = work["제품코드"].map(_norm)
+    work["제품코드"] = work["제품코드"].map(_code_key)
     work["제품명"] = work["제품명"].map(_norm)
     work["비고"] = work["비고"].map(_norm)
     work["매당가공시간_분"] = pd.to_numeric(work["매당가공시간_분"], errors="coerce").fillna(0)
@@ -352,6 +406,8 @@ def calc_drill_requirement(
         "monthly": empty_monthly,
         "unmatched": [],
         "unused_times": [],
+        "qty_columns": list(qty.columns) if qty is not None else [],
+        "time_columns": list(times.columns) if times is not None else [],
         "work_days": float(work_days),
         "day_hours": float(day_hours),
         "utilization_pct": float(utilization_pct),
@@ -366,15 +422,15 @@ def calc_drill_requirement(
         return result
 
     time_map = {
-        _norm(r["제품코드"]): float(r["매당가공시간_분"])
+        _code_key(r["제품코드"]): float(r["매당가공시간_분"])
         for _, r in time_n.iterrows()
     }
     name_map = {
-        _norm(r["제품코드"]): _norm(r["제품명"])
+        _code_key(r["제품코드"]): _norm(r["제품명"])
         for _, r in time_n.iterrows()
         if _norm(r["제품명"])
     }
-    qty_codes = set(qty_n["제품코드"].map(_norm))
+    qty_codes = set(qty_n["제품코드"].map(_code_key))
     time_codes = set(time_map)
     result["unmatched"] = sorted(qty_codes - time_codes)
     result["unused_times"] = sorted(time_codes - qty_codes)
@@ -385,7 +441,7 @@ def calc_drill_requirement(
     if detail.empty:
         return result
     detail["제품명"] = detail.apply(
-        lambda r: r["제품명"] or name_map.get(_norm(r["제품코드"]), ""),
+        lambda r: r["제품명"] or name_map.get(_code_key(r["제품코드"]), ""),
         axis=1,
     )
     detail["필요시간_분"] = detail["필요수량"] * detail["매당가공시간_분"]
