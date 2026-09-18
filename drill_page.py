@@ -563,18 +563,6 @@ def render() -> None:
         f"부족대수 = {total_req} − 보유 {owned} = {short_peak}대. "
         f"1대 월 가용 {avail_min:,.0f}분."
     )
-    if result["unmatched"]:
-        st.warning(
-            "가공시간이 없어 계산에서 빠진 제품코드: " + ", ".join(result["unmatched"])
-        )
-    if result["unused_times"]:
-        st.caption("수량 계획이 없는 가공시간 코드: " + ", ".join(result["unused_times"]))
-    if result.get("deduct_notes"):
-        st.info("수동 차감 적용: " + " · ".join(result["deduct_notes"]))
-    if result.get("deduct_missing"):
-        st.warning(
-            "수량 계획에 없어 차감하지 못한 제품코드: " + ", ".join(result["deduct_missing"])
-        )
 
     monthly = result["monthly"].copy()
     monthly["보유대수"] = owned
@@ -587,24 +575,44 @@ def render() -> None:
     st.subheader("월별 부족 설비")
     st.caption(f"부족대수 = 월 필요대수(올림) − 현재 보유 {owned}대. 여유 달은 0으로 표시합니다.")
     chart_df = monthly[["월라벨", "필요대수", "보유대수", "부족대수"]].rename(columns={"월라벨": "월"})
+    chart_df["표시"] = chart_df["부족대수"].map(lambda v: f"{int(v)}대")
+    month_order = list(monthly["월라벨"])
+    y_max = max(float(chart_df["부족대수"].max()), 1.0) * 1.2
     bars = (
         alt.Chart(chart_df)
         .mark_bar()
         .encode(
-            x=alt.X("월:N", sort=list(monthly["월라벨"]), title="월"),
-            y=alt.Y("부족대수:Q", title="부족 대수"),
+            x=alt.X("월:N", sort=month_order, title="월"),
+            y=alt.Y("부족대수:Q", title="부족 대수", scale=alt.Scale(domain=[0, y_max])),
             tooltip=["월", "필요대수", "보유대수", "부족대수"],
         )
     )
-    hold_rule = (
-        alt.Chart(pd.DataFrame({"y": [0]}))
-        .mark_rule(strokeDash=[4, 4])
-        .encode(y="y:Q")
+    labels = (
+        alt.Chart(chart_df)
+        .mark_text(dy=-8, fontSize=13, fontWeight="bold")
+        .encode(
+            x=alt.X("월:N", sort=month_order),
+            y=alt.Y("부족대수:Q"),
+            text=alt.Text("표시:N"),
+        )
     )
     st.altair_chart(
-        (bars + hold_rule).properties(height=320, title=f"월별 부족 설비 (보유 {owned}대 기준)"),
+        (bars + labels).properties(height=340, title=f"월별 부족 설비 (보유 {owned}대 기준)"),
         use_container_width=True,
     )
+
+    if result["unmatched"]:
+        st.warning(
+            "가공시간이 없어 계산에서 빠진 제품코드: " + ", ".join(result["unmatched"])
+        )
+    if result["unused_times"]:
+        st.caption("수량 계획이 없는 가공시간 코드: " + ", ".join(result["unused_times"]))
+    if result.get("deduct_notes"):
+        st.info("수동 차감 적용: " + " · ".join(result["deduct_notes"]))
+    if result.get("deduct_missing"):
+        st.warning(
+            "수량 계획에 없어 차감하지 못한 제품코드: " + ", ".join(result["deduct_missing"])
+        )
 
     show_m = monthly.copy()
     show_m["필요수량합"] = show_m["필요수량합"].map(_fmt_int)
