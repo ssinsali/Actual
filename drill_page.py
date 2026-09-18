@@ -19,6 +19,7 @@ from drill_engine import (
     QTY_WIDE_COLUMNS,
     TIME_COLUMNS,
     calc_drill_requirement,
+    normalize_qty,
     qty_template,
     time_template,
 )
@@ -206,6 +207,72 @@ def _fmt_num(v: float, digits: int = 2) -> str:
     return f"{float(v):,.{digits}f}"
 
 
+def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
+    """제품코드 + 매월 차감매수 키인. data_editor 없이 항상 보이게."""
+    if "drill_deduct_rows" not in st.session_state:
+        st.session_state.drill_deduct_rows = []
+    rows: list[dict] = st.session_state.drill_deduct_rows
+
+    st.subheader("제품별 수동 차감")
+    st.caption("예: A3E00T-SM 을 매월 500매씩 빼려면 코드를 고르거나 입력하고 추가를 누르세요.")
+    c1, c2, c3, c4 = st.columns([2.2, 2.2, 1.6, 1])
+    with c1:
+        options = ["(선택)"] + list(code_options)
+        picked = st.selectbox("제품코드 선택", options, key="drill_deduct_pick")
+    with c2:
+        typed = st.text_input("직접 입력", placeholder="A3E00T-SM", key="drill_deduct_typed")
+    with c3:
+        amt = int(
+            st.number_input(
+                "매월 차감매수",
+                min_value=0,
+                max_value=10_000_000,
+                value=500,
+                step=1,
+                key="drill_deduct_amt",
+            )
+        )
+    with c4:
+        st.write("")
+        add_clicked = st.button("추가", type="primary", use_container_width=True, key="drill_deduct_add")
+
+    if add_clicked:
+        code = (typed or "").strip()
+        if not code and picked and picked != "(선택)":
+            code = str(picked).strip()
+        if not code:
+            st.warning("제품코드를 선택하거나 직접 입력하세요.")
+        elif amt <= 0:
+            st.warning("차감 매수는 1 이상이어야 합니다.")
+        else:
+            kept = [r for r in rows if str(r.get("제품코드", "")).strip().upper() != code.upper()]
+            kept.append({"제품코드": code, "매월차감": amt})
+            st.session_state.drill_deduct_rows = kept
+            st.rerun()
+
+    if rows:
+        st.caption("적용 중인 차감")
+        for i, row in enumerate(list(rows)):
+            d1, d2, d3 = st.columns([3, 2, 1])
+            with d1:
+                st.write(str(row.get("제품코드", "")))
+            with d2:
+                st.write(f"{int(row.get('매월차감') or 0):,}매 / 월")
+            with d3:
+                if st.button("삭제", key=f"drill_deduct_del_{i}", use_container_width=True):
+                    st.session_state.drill_deduct_rows = [r for j, r in enumerate(rows) if j != i]
+                    st.rerun()
+        if st.button("차감 목록 비우기", key="drill_deduct_clear"):
+            st.session_state.drill_deduct_rows = []
+            st.rerun()
+    else:
+        st.info("아직 차감이 없습니다. 위에서 제품코드와 매수를 넣고 **추가**를 누르세요.")
+
+    if not rows:
+        return pd.DataFrame(columns=list(DEDUCT_COLUMNS))
+    return pd.DataFrame(rows, columns=list(DEDUCT_COLUMNS))
+
+
 def render() -> None:
     st.title("드릴설비 필요 분석")
     own_col, own_help = st.columns([1, 3])
@@ -228,30 +295,6 @@ def render() -> None:
             "부족대수 = 월 필요대수(올림) − 현재 보유 (0 미만은 0). "
             "GitHub `templates/`에 드릴_월별필요수량 / 드릴_제품가공시간을 올리면 Cloud 재시작 후에도 가져옵니다."
         )
-
-    st.markdown("##### 수동 차감")
-    st.caption(
-        "올린 계획에서 빼려는 제품코드와 **매월 차감 매수**를 입력하세요. "
-        "예: `A3E00T-SM` / `500` → 1~12월 모두 500매씩 차감합니다. "
-        "행을 늘려 여러 제품을 넣을 수 있습니다."
-    )
-    deduct_edit = st.data_editor(
-        pd.DataFrame({c: [""] if c == "제품코드" else [0.0] for c in DEDUCT_COLUMNS}),
-        column_config={
-            "제품코드": st.column_config.TextColumn("제품코드", help="예: A3E00T-SM"),
-            "매월차감": st.column_config.NumberColumn(
-                "매월 차감매수",
-                min_value=0,
-                step=1,
-                format="%d",
-                help="모든 월의 필요수량에서 이 매수만큼 뺍니다.",
-            ),
-        },
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        key="drill_deduct_editor",
-    )
 
     force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False))
     if force_gh:
@@ -412,6 +455,13 @@ def render() -> None:
 
     if source_note:
         st.info(source_note)
+
+    code_options: list[str] = []
+    if not qty_raw.empty:
+        qty_norm = normalize_qty(qty_raw)
+        if not qty_norm.empty and "제품코드" in qty_norm.columns:
+            code_options = sorted({str(c) for c in qty_norm["제품코드"].tolist() if str(c).strip()})
+    deduct_edit = _render_deduct_ui(code_options)
 
     result = calc_drill_requirement(
         qty_raw,
