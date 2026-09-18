@@ -469,8 +469,8 @@ def calc_drill_requirement(
     이론필요대수 = 필요시간 ÷ 1대 월가용
     총 필요대수 = 월별 올림 대수 중 최대 (피크월 커버)
     """
-    qty_n = normalize_qty(qty)
-    qty_n, deduct_notes, deduct_missing = apply_qty_deduct(qty_n, deduct)
+    qty_all = normalize_qty(qty)
+    qty_n, deduct_notes, deduct_missing = apply_qty_deduct(qty_all.copy(), deduct)
     time_n = normalize_times(times)
     avail = machine_month_minutes(
         work_days=work_days,
@@ -496,6 +496,8 @@ def calc_drill_requirement(
             "월",
             "월라벨",
             "필요수량합",
+            "수동차감",
+            "차감분반영합",
             "필요시간_분",
             "1대월가용_분",
             "이론필요대수",
@@ -536,7 +538,7 @@ def calc_drill_requirement(
         for _, r in time_n.iterrows()
         if _norm(r["제품명"])
     }
-    qty_codes = set(qty_n["제품코드"].map(_code_key))
+    qty_codes = set(qty_all["제품코드"].map(_code_key))
     time_codes = set(time_map)
     result["unmatched"] = sorted(qty_codes - time_codes)
     result["unused_times"] = sorted(time_codes - qty_codes)
@@ -552,13 +554,42 @@ def calc_drill_requirement(
     )
     detail["필요시간_분"] = detail["필요수량"] * detail["매당가공시간_분"]
     detail["이론필요대수"] = (detail["필요시간_분"] / avail).round(4)
-    detail = detail.sort_values(["년도", "월", "제품코드"]).reset_index(drop=True)
-    result["detail"] = detail
+    result["detail"] = detail.sort_values(["년도", "월", "제품코드"]).reset_index(drop=True)
+
+    csv_m = qty_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(CSV원합=("필요수량", "sum"))
+    excl = qty_all[qty_all["제품코드"].map(_code_key).isin(set(result["unmatched"]))]
+    excl_m = excl.groupby(["년도", "월", "월라벨"], as_index=False).agg(가공시간없음=("필요수량", "sum"))
+    with_time_all = qty_all[qty_all["제품코드"].map(_code_key).isin(time_codes)]
+    orig_m = with_time_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(
+        필요수량합=("필요수량", "sum")
+    )
+    if "필요수량_원" not in detail.columns:
+        detail["필요수량_원"] = detail["필요수량"]
+    if "차감매수" not in detail.columns:
+        detail["차감매수"] = 0
+    detail["유효차감"] = (
+        detail["필요수량_원"].astype(float) - detail["필요수량"].astype(float)
+    ).clip(lower=0)
+    # 필요시간은 차감분 반영 수량 × 매당가공시간
+    detail["필요시간_분"] = detail["필요수량"] * detail["매당가공시간_분"]
+    detail["이론필요대수"] = (detail["필요시간_분"] / avail).round(4)
+    result["detail"] = detail.sort_values(["년도", "월", "제품코드"]).reset_index(drop=True)
 
     monthly = (
         detail.groupby(["년도", "월", "월라벨"], as_index=False)
-        .agg(필요수량합=("필요수량", "sum"), 필요시간_분=("필요시간_분", "sum"))
+        .agg(
+            차감분반영합=("필요수량", "sum"),
+            필요시간_분=("필요시간_분", "sum"),
+        )
     )
+    monthly = orig_m.merge(monthly, on=["년도", "월", "월라벨"], how="left")
+    monthly = monthly.merge(csv_m, on=["년도", "월", "월라벨"], how="left")
+    monthly = monthly.merge(excl_m, on=["년도", "월", "월라벨"], how="left")
+    for col in ("필요수량합", "차감분반영합", "필요시간_분", "가공시간없음", "CSV원합"):
+        if col not in monthly.columns:
+            monthly[col] = 0
+        monthly[col] = monthly[col].fillna(0)
+    monthly["수동차감"] = (monthly["필요수량합"] - monthly["차감분반영합"]).clip(lower=0)
     monthly["1대월가용_분"] = avail
     monthly["이론필요대수"] = (monthly["필요시간_분"] / avail).round(4)
     monthly["필요대수"] = monthly["이론필요대수"].map(_ceil_machines)
