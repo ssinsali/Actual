@@ -226,7 +226,7 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
                 "매월 차감매수",
                 min_value=0,
                 max_value=10_000_000,
-                value=500,
+                value=0,
                 step=1,
                 key="drill_deduct_amt",
             )
@@ -265,7 +265,7 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
             st.session_state.drill_deduct_rows = []
             st.rerun()
     else:
-        st.info("아직 차감이 없습니다. 위에서 제품코드와 매수를 넣고 **추가**를 누르세요.")
+        st.caption("차감할 제품코드와 매월 차감매수를 넣고 추가하세요.")
 
     if not rows:
         return pd.DataFrame(columns=list(DEDUCT_COLUMNS))
@@ -626,7 +626,7 @@ def render() -> None:
     )
     st.subheader("월별 필요대수")
     st.caption(
-        "필요수량합 = CSV 전체 원 수량(가공시간 없는 제품 포함). "
+        "필요수량합 = 올린 월별 제품코드 필요수량 파일의 해당 월 합계(가공시간 유무와 무관). "
         "차감분 반영 합 = 필요수량합 − 가공시간 없는 제품 − 수동 차감. "
         "필요시간 = Σ (차감분 반영 매수 × 매당가공시간)."
     )
