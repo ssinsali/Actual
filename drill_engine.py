@@ -314,6 +314,54 @@ def normalize_qty(df: pd.DataFrame) -> pd.DataFrame:
     return grouped.reset_index(drop=True)
 
 
+def sum_uploaded_qty_by_month(df: pd.DataFrame) -> pd.DataFrame:
+    """올린 월별 필요수량 파일만으로 월 합계. 가공시간·차감은 보지 않는다."""
+    empty = pd.DataFrame(columns=["년도", "월", "월라벨", "필요수량합"])
+    if df is None or df.empty:
+        return empty
+    work = _clean_frame(df)
+    work = _rename_by_alias(
+        work,
+        {
+            "제품코드": _CODE_ALIASES,
+            "제품명": ("제품명", "품명", "itemname", "name"),
+            "년도": ("년도", "연도", "year"),
+            "월": ("월", "month"),
+            "년월": ("년월", "연월", "yyyymm", "period"),
+            "필요수량": ("필요수량", "수량", "매수", "목표", "월목표", "월목표매수", "qty"),
+        },
+    )
+    work = _ensure_product_code(work)
+    if _is_qty_wide(work):
+        rows = []
+        for col in work.columns:
+            parsed = _parse_month_header(col)
+            if not parsed:
+                continue
+            year, month = parsed
+            total = float(pd.to_numeric(work[col], errors="coerce").fillna(0).sum())
+            rows.append(
+                {
+                    "년도": year or "",
+                    "월": int(month),
+                    "월라벨": _month_label(year or "", int(month)),
+                    "필요수량합": total,
+                }
+            )
+        if not rows:
+            return empty
+        return pd.DataFrame(rows).sort_values(["년도", "월"]).reset_index(drop=True)
+    long_qty = normalize_qty(df)
+    if long_qty.empty:
+        return empty
+    return (
+        long_qty.groupby(["년도", "월", "월라벨"], as_index=False)
+        .agg(필요수량합=("필요수량", "sum"))
+        .sort_values(["년도", "월"])
+        .reset_index(drop=True)
+    )
+
+
 def normalize_times(df: pd.DataFrame) -> pd.DataFrame:
     empty = pd.DataFrame(columns=list(TIME_COLUMNS))
     if df is None or df.empty:
@@ -559,9 +607,7 @@ def calc_drill_requirement(
     csv_m = qty_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(CSV원합=("필요수량", "sum"))
     excl = qty_all[qty_all["제품코드"].map(_code_key).isin(set(result["unmatched"]))]
     excl_m = excl.groupby(["년도", "월", "월라벨"], as_index=False).agg(가공시간없음=("필요수량", "sum"))
-    orig_m = qty_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(
-        필요수량합=("필요수량", "sum")
-    )
+    orig_m = sum_uploaded_qty_by_month(qty)
     if "필요수량_원" not in detail.columns:
         detail["필요수량_원"] = detail["필요수량"]
     if "차감매수" not in detail.columns:
