@@ -559,8 +559,7 @@ def calc_drill_requirement(
     csv_m = qty_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(CSV원합=("필요수량", "sum"))
     excl = qty_all[qty_all["제품코드"].map(_code_key).isin(set(result["unmatched"]))]
     excl_m = excl.groupby(["년도", "월", "월라벨"], as_index=False).agg(가공시간없음=("필요수량", "sum"))
-    with_time_all = qty_all[qty_all["제품코드"].map(_code_key).isin(time_codes)]
-    orig_m = with_time_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(
+    orig_m = qty_all.groupby(["년도", "월", "월라벨"], as_index=False).agg(
         필요수량합=("필요수량", "sum")
     )
     if "필요수량_원" not in detail.columns:
