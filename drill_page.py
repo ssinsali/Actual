@@ -214,13 +214,12 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
     rows: list[dict] = st.session_state.drill_deduct_rows
 
     st.subheader("제품별 수동 차감")
-    st.caption("예: A3E00T-SM 을 매월 500매씩 빼려면 코드를 고르거나 입력하고 추가를 누르세요.")
     c1, c2, c3, c4 = st.columns([2.2, 2.2, 1.6, 1])
     with c1:
         options = ["(선택)"] + list(code_options)
         picked = st.selectbox("제품코드 선택", options, key="drill_deduct_pick")
     with c2:
-        typed = st.text_input("직접 입력", placeholder="A3E00T-SM", key="drill_deduct_typed")
+        typed = st.text_input("직접 입력", placeholder="제품코드", key="drill_deduct_typed")
     with c3:
         amt = int(
             st.number_input(
@@ -627,10 +626,9 @@ def render() -> None:
     )
     st.subheader("월별 필요대수")
     st.caption(
-        "필요수량합 = 가공시간이 있는 제품의 CSV 원 수량 합. "
-        "차감분 반영 합 = 필요수량합 − 수동 차감. "
-        "필요시간 = Σ (차감분 반영 매수 × 매당가공시간). "
-        "가공시간이 없는 코드는 필요수량합에도 넣지 않습니다."
+        "필요수량합 = CSV 전체 원 수량(가공시간 없는 제품 포함). "
+        "차감분 반영 합 = 필요수량합 − 가공시간 없는 제품 − 수동 차감. "
+        "필요시간 = Σ (차감분 반영 매수 × 매당가공시간)."
     )
     st.dataframe(
         show_m[
@@ -659,6 +657,24 @@ def render() -> None:
         use_container_width=True,
         hide_index=True,
     )
+    no_time_codes = list(result.get("unmatched") or [])
+    deduct_rows = list(st.session_state.get("drill_deduct_rows") or [])
+    deduct_bits = [
+        f"{str(r.get('제품코드', '')).strip()} {int(r.get('매월차감') or 0):,}매/월"
+        for r in deduct_rows
+        if str(r.get("제품코드", "")).strip() and int(r.get("매월차감") or 0) > 0
+    ]
+    explain = "차감분 반영 합은 : "
+    if no_time_codes:
+        explain += "가공시간 없는 제품코드 " + ", ".join(no_time_codes)
+    else:
+        explain += "가공시간 없는 제품코드 없음"
+    explain += " + "
+    if deduct_bits:
+        explain += "현재 차감 " + ", ".join(deduct_bits)
+    else:
+        explain += "현재 차감 없음"
+    st.caption(explain)
 
     peak_detail = result["detail"][result["detail"]["월라벨"] == peak_label].copy()
     if not peak_detail.empty:
