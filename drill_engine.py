@@ -24,6 +24,7 @@ MONTH_COLUMNS = tuple(f"{m}월" for m in range(1, 13))
 QTY_WIDE_COLUMNS = (*QTY_ID_COLUMNS, *MONTH_COLUMNS)
 QTY_LONG_COLUMNS = ("년도", "월", "제품코드", "제품명", "필요수량")
 TIME_COLUMNS = ("제품코드", "제품명", "매당가공시간_분", "비고")
+DEDUCT_COLUMNS = ("제품코드", "매월차감")
 
 DEFAULT_DAY_HOURS = 24.0
 DEFAULT_UTILIZATION_PCT = 100.0
@@ -351,6 +352,107 @@ def normalize_times(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def deduct_template() -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"제품코드": "A3E00T-SM", "매월차감": 500}],
+        columns=list(DEDUCT_COLUMNS),
+    )
+
+
+def normalize_deduct(df: pd.DataFrame) -> pd.DataFrame:
+    """수동 차감 — 제품코드 + 매월차감(+ 선택 1월~12월 덮어쓰기)."""
+    empty = pd.DataFrame(columns=["제품코드", "매월차감", *MONTH_COLUMNS])
+    if df is None or df.empty:
+        return empty
+    work = _rename_by_alias(
+        _clean_frame(df),
+        {
+            "제품코드": _CODE_ALIASES,
+            "매월차감": (
+                "매월차감",
+                "매월차감매수",
+                "차감매수",
+                "차감",
+                "월별차감",
+                "공통차감",
+            ),
+        },
+    )
+    work = _ensure_product_code(work)
+    if "제품코드" not in work.columns:
+        return empty
+    if "매월차감" not in work.columns:
+        work["매월차감"] = 0
+    work["제품코드"] = work["제품코드"].map(_code_key)
+    work["매월차감"] = pd.to_numeric(work["매월차감"], errors="coerce").fillna(0)
+    for mcol in MONTH_COLUMNS:
+        if mcol in work.columns:
+            work[mcol] = pd.to_numeric(work[mcol], errors="coerce")
+        else:
+            work[mcol] = pd.NA
+    work = work[work["제품코드"] != ""].copy()
+    if work.empty:
+        return empty
+    return work.drop_duplicates("제품코드", keep="last").reset_index(drop=True)
+
+
+def apply_qty_deduct(
+    qty: pd.DataFrame,
+    deduct: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """필요수량에서 수동 차감을 뺀다. 0 미만은 0.
+
+    반환: (차감 후 qty, 적용 메모, 수량 파일에 없는 코드)
+    """
+    notes: list[str] = []
+    missing: list[str] = []
+    if qty is None or qty.empty:
+        return qty if qty is not None else pd.DataFrame(), notes, missing
+    out = qty.copy()
+    if "필요수량_원" not in out.columns:
+        out["필요수량_원"] = out["필요수량"]
+    out["차감매수"] = 0.0
+    plan = normalize_deduct(deduct)
+    if plan.empty:
+        return out, notes, missing
+
+    qty_codes = set(out["제품코드"].map(_code_key))
+    for _, row in plan.iterrows():
+        code = _code_key(row["제품코드"])
+        if not code:
+            continue
+        if code not in qty_codes:
+            missing.append(code)
+            continue
+        default_amt = float(row.get("매월차감") or 0)
+        applied_months: list[str] = []
+        for month in range(1, 13):
+            mcol = f"{month}월"
+            raw = row.get(mcol)
+            if raw is not None and not (isinstance(raw, float) and pd.isna(raw)) and str(raw).strip() != "":
+                amt = float(pd.to_numeric(raw, errors="coerce") or 0)
+            else:
+                amt = default_amt
+            if amt <= 0:
+                continue
+            mask = (out["제품코드"].map(_code_key) == code) & (out["월"] == month)
+            if not mask.any():
+                continue
+            out.loc[mask, "차감매수"] = amt
+            applied_months.append(f"{mcol} {amt:g}")
+        if applied_months:
+            if default_amt > 0 and len(applied_months) >= 2:
+                notes.append(f"{code}: 매월 {default_amt:g}매 차감")
+            else:
+                notes.append(f"{code}: {', '.join(applied_months)}매 차감")
+        elif default_amt > 0:
+            notes.append(f"{code}: 해당 월 수량이 없어 차감하지 않음")
+
+    out["필요수량"] = (out["필요수량_원"].astype(float) - out["차감매수"].astype(float)).clip(lower=0)
+    out = out[out["필요수량"] > 0].reset_index(drop=True)
+    return out, notes, missing
+
+
 def calc_drill_requirement(
     qty: pd.DataFrame,
     times: pd.DataFrame,
@@ -358,6 +460,7 @@ def calc_drill_requirement(
     work_days: float = DEFAULT_WORK_DAYS,
     day_hours: float = DEFAULT_DAY_HOURS,
     utilization_pct: float = DEFAULT_UTILIZATION_PCT,
+    deduct: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """월별 필요시간·필요대수를 계산한다.
 
@@ -367,6 +470,7 @@ def calc_drill_requirement(
     총 필요대수 = 월별 올림 대수 중 최대 (피크월 커버)
     """
     qty_n = normalize_qty(qty)
+    qty_n, deduct_notes, deduct_missing = apply_qty_deduct(qty_n, deduct)
     time_n = normalize_times(times)
     avail = machine_month_minutes(
         work_days=work_days,
@@ -417,6 +521,8 @@ def calc_drill_requirement(
         "peak_theoretical": 0.0,
         "total_required": 0,
         "avg_theoretical": 0.0,
+        "deduct_notes": deduct_notes,
+        "deduct_missing": deduct_missing,
     }
     if qty_n.empty or time_n.empty or avail <= 0:
         return result
