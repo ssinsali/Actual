@@ -30,6 +30,63 @@ _DATA_DIR.mkdir(parents=True, exist_ok=True)
 TEAM_STACK_ORDER = ("A조", "B조", "C조")
 
 
+def apply_uploader_dropzone_style(*, key_prefix: str = "") -> None:
+    """file_uploader를 드래그앤드롭이 보이도록 키운다 (사이드바·본문 공통)."""
+    del key_prefix  # 호환용 (호출부 시그니처 유지)
+    st.markdown(
+        """
+<style>
+/* Streamlit file uploader — 드래그앤드롭 영역 강조 */
+[data-testid="stFileUploaderDropzone"],
+section[data-testid="stFileUploaderDropzone"] {
+  min-height: 120px !important;
+  padding: 1.1rem 0.9rem !important;
+  border: 2px dashed rgba(93, 173, 226, 0.75) !important;
+  border-radius: 10px !important;
+  background: rgba(93, 173, 226, 0.10) !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: center !important;
+  gap: 0.35rem !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover,
+section[data-testid="stFileUploaderDropzone"]:hover {
+  border-color: rgba(247, 220, 111, 0.9) !important;
+  background: rgba(247, 220, 111, 0.08) !important;
+}
+[data-testid="stFileUploaderDropzone"]::before,
+section[data-testid="stFileUploaderDropzone"]::before {
+  content: "파일을 여기에 끌어다 놓으세요";
+  display: block;
+  width: 100%;
+  text-align: center;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #f7dc6f;
+  line-height: 1.35;
+  margin-bottom: 0.15rem;
+}
+[data-testid="stFileUploaderDropzone"]::after,
+section[data-testid="stFileUploaderDropzone"]::after {
+  content: "또는 Upload 버튼 클릭 · XLSX / XLS / CSV";
+  display: block;
+  width: 100%;
+  text-align: center;
+  font-size: 0.78rem;
+  color: #aeb6bf;
+  margin-bottom: 0.35rem;
+}
+[data-testid="stFileUploaderDropzone"] small,
+[data-testid="stFileUploaderDropzone"] span {
+  opacity: 0.9;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_slicer(
     label: str,
     options: list[str],
@@ -284,11 +341,14 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
             "A 일자, B 조, C~J 영역별 인력/실적, K 캠퍼스(천안/아산), L 주야(주/야)"
         )
 
+    apply_uploader_dropzone_style(key_prefix=key_prefix or "sidebar")
+    st.caption("엑셀/CSV를 **끌어다 놓거나** Upload를 눌러 추가할 수 있습니다. (여러 파일 가능)")
     uploads = st.file_uploader(
-        "엑셀/CSV 추가 업로드",
+        "엑셀/CSV 추가 업로드 (드래그앤드롭)",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=True,
         key=f"{key_prefix}uploader_{_upload_nonce()}",
+        help="파일을 이 상자로 끌어다 놓거나 Upload를 클릭하세요. 여러 개 동시 업로드 가능.",
     )
     # file_uploader는 파일이 남아 있으면 매 실행마다 True → rerun 루프 방지
     upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
