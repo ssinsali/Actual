@@ -55,7 +55,6 @@ from sim_engine import (
     normalize_wip,
     area_by_process_code,
     is_excluded_process_code,
-    process_name_matches_area,
     process_standard_times,
     product_actual_template,
     product_template,
@@ -889,9 +888,9 @@ def render() -> None:
                 )
                 st.markdown("### 일별 최적 처리 (현장용)")
                 st.caption(
-                    "① 완제품 차감 → ② 순필요만 공정 재공 배분(외관→Hole→치수). Hole은 CEL만. "
-                    "치수=75000·76000·76500·78000, Hole=79000, "
-                    "외관=85000·85500·87000·89000. 90000(최종 보관)은 집계하지 않습니다."
+                    "① 완제품 차감 → ② 순필요만 공정 재공 배분(외관→Hole→치수→입고 예정). Hole은 CEL만. "
+                    "입고 예정=50000~74600, 치수=75000·76000·76500·78000, Hole=79000, "
+                    "외관=85000·85500·87000·89000. 그 밖 공정은 집계하지 않습니다."
                 )
                 if floor.empty:
                     st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
@@ -908,18 +907,13 @@ def render() -> None:
                     )
 
                     day_tag = "전체일자" if ship_day == "전체" else ship_day
-                    area_tabs_order = ("치수", "Hole", "외관", "종합측정실")
+                    area_tabs_order = ("입고 예정", "치수", "Hole", "외관")
                     floor_base = floor_base[
                         ~floor_base["공정코드"].map(is_excluded_process_code)
                     ].copy()
 
                     def _display_area(row: pd.Series) -> str | None:
-                        listed = area_by_process_code(row.get("공정코드"))
-                        if listed in ("치수", "Hole", "외관"):
-                            return listed
-                        if process_name_matches_area(row.get("공정명"), "종합측정실"):
-                            return "종합측정실"
-                        return None
+                        return area_by_process_code(row.get("공정코드"))
 
                     display_area = floor_base.apply(_display_area, axis=1)
                     area_frames: dict[str, pd.DataFrame] = {}
@@ -1010,8 +1004,8 @@ def render() -> None:
                             )
                     with tabs[4]:
                         st.caption(
-                            "치수·Hole·외관 지정 공정코드와 종합측정실에 들어가지 않는 행입니다. "
-                            "90000은 최종 보관이라 여기에도 넣지 않습니다."
+                            "공정코드가 없는 행입니다. "
+                            "50000~74600, 치수·Hole·외관 지정 코드 밖은 집계에서 빠져 있습니다."
                         )
                         _render_area_block(
                             "미배정",
