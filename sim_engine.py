@@ -1479,10 +1479,14 @@ def process_name_matches_area(process_name: str, area: str) -> bool:
     return _map_wip_inspect_area(process_name) == area
 
 
-# 공정코드가 커질수록 뒤 공정. 이름 규칙에 없는 재공에만 쓴다.
-# 재공에 Hole/외관 공정명이 있으면 그 코드로 경계를 바꾸고, 없으면 이 값.
-DEFAULT_HOLE_CODE_FROM = 79000
-DEFAULT_APPEARANCE_CODE_FROM = 85000
+# 현장 탭에 묶을 공정코드. 이 목록에 있는 코드만 치수·Hole·외관으로 본다.
+AREA_PROCESS_CODES: dict[str, frozenset[int]] = {
+    "치수": frozenset({75000, 76000, 76500, 78000}),
+    "Hole": frozenset({79000}),
+    "외관": frozenset({85000, 85500, 87000, 89000}),
+}
+# 최종 제품 보관. 재공 집계·일별 처리에서 제외.
+EXCLUDED_PROCESS_CODES = frozenset({90000})
 
 
 def process_code_number(code: Any) -> float | None:
@@ -1499,59 +1503,21 @@ def process_code_number(code: Any) -> float | None:
         return float(matched.group()) if matched else None
 
 
-def area_by_process_code(
-    code: Any,
-    *,
-    hole_from: float | None = None,
-    appearance_from: float | None = None,
-) -> str:
-    """코드가 작으면 치수, 커지면 Hole, 더 커지면 외관."""
+def is_excluded_process_code(code: Any) -> bool:
     number = process_code_number(code)
-    if number is None:
-        return "기타"
-    hole = float(DEFAULT_HOLE_CODE_FROM if hole_from is None else hole_from)
-    appearance = float(
-        DEFAULT_APPEARANCE_CODE_FROM if appearance_from is None else appearance_from
-    )
-    if appearance < hole:
-        appearance = hole
-    if number >= appearance:
-        return "외관"
-    if number >= hole:
-        return "Hole"
-    return "치수"
+    return number is not None and int(number) in EXCLUDED_PROCESS_CODES
 
 
-def route_code_bounds(df: pd.DataFrame) -> tuple[float, float]:
-    """이름 규칙으로 잡힌 Hole·외관 공정코드로 경계.
-
-    외관은 Hole 코드 이상인 것만 본다. 수입검사-외관처럼 앞 공정 코드는 빼기 위해서다.
-    """
-    hole_from = float(DEFAULT_HOLE_CODE_FROM)
-    appearance_from = float(DEFAULT_APPEARANCE_CODE_FROM)
-    if df is None or df.empty or "공정명" not in df.columns:
-        return hole_from, appearance_from
-
-    def _nums(area: str) -> list[float]:
-        if "공정코드" not in df.columns:
-            return []
-        mask = df["공정명"].map(lambda n: _map_wip_inspect_area(n) == area)
-        out: list[float] = []
-        for raw in df.loc[mask, "공정코드"]:
-            number = process_code_number(raw)
-            if number is not None:
-                out.append(number)
-        return out
-
-    hole_nums = _nums("Hole")
-    if hole_nums:
-        hole_from = min(hole_nums)
-    late_appearance = [n for n in _nums("외관") if n >= hole_from]
-    if late_appearance:
-        appearance_from = min(late_appearance)
-    if appearance_from < hole_from:
-        appearance_from = hole_from
-    return hole_from, appearance_from
+def area_by_process_code(code: Any) -> str | None:
+    """지정 공정코드만 치수·Hole·외관. 그 외는 None."""
+    number = process_code_number(code)
+    if number is None or int(number) in EXCLUDED_PROCESS_CODES:
+        return None
+    key = int(number)
+    for area, codes in AREA_PROCESS_CODES.items():
+        if key in codes:
+            return area
+    return None
 
 
 def _priority_rank(label: Any) -> int:
@@ -1599,12 +1565,16 @@ def normalize_wip(df: pd.DataFrame) -> pd.DataFrame:
     work["제품코드"] = work["제품코드"].map(_norm)
     work["제품군"] = work["제품군"].map(lambda v: _infer_product_family(v) or _norm(v))
     work["공정코드"] = work["공정코드"].map(lambda v: _norm(v).replace(".0", "") if _norm(v).endswith(".0") else _norm(v))
-    # Sub Total / 합계 행 제거
+    # Sub Total / 합계 행 제거. 90000(최종 보관)은 집계하지 않음.
     bad = work["제품코드"].str.contains(r"sub\s*total|합계|total", case=False, na=False)
     work = work[(work["제품코드"] != "") & ~bad]
-    # 사업장 앞으로 채우기(병합 셀)
+    # 사업장 앞으로 채우기(병합 셀) 후 90000(최종 보관) 제외
     work["사업장"] = work["사업장"].replace("", pd.NA).ffill().fillna("")
-    work["검사영역"] = work["공정명"].map(_map_wip_inspect_area)
+    work = work[~work["공정코드"].map(is_excluded_process_code)]
+    work["검사영역"] = [
+        area_by_process_code(code) or _map_wip_inspect_area(name)
+        for code, name in zip(work["공정코드"], work["공정명"])
+    ]
     return work[list(WIP_COLUMNS)].reset_index(drop=True)
 
 
@@ -1615,9 +1585,18 @@ def aggregate_wip(wip: pd.DataFrame) -> pd.DataFrame:
     work = wip if "검사영역" in wip.columns and "제품코드" in wip.columns else normalize_wip(wip)
     if work.empty:
         return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
-    # 공정명 규칙 변경 반영(세션에 남은 옛 매핑 보정)
-    if "공정명" in work.columns:
-        work = work.copy()
+    work = work.copy()
+    if "공정코드" in work.columns:
+        work = work[~work["공정코드"].map(is_excluded_process_code)]
+    if work.empty:
+        return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
+    # 지정 공정코드 우선, 없으면 공정명 규칙
+    if "공정명" in work.columns and "공정코드" in work.columns:
+        work["검사영역"] = [
+            area_by_process_code(code) or _map_wip_inspect_area(name)
+            for code, name in zip(work["공정코드"], work["공정명"])
+        ]
+    elif "공정명" in work.columns:
         work["검사영역"] = work["공정명"].map(_map_wip_inspect_area)
     if "재공매수" in work.columns:
         return work
