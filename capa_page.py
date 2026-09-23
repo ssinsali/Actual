@@ -311,7 +311,7 @@ def render() -> None:
                 max_value=100.0,
                 value=float(DEFAULT_UTILIZATION_PCT),
                 step=1.0,
-                help="셋업·비가동을 빼려면 100보다 낮게. 1대 가용시간 = 작업일 × 일가동 × 60 × 가동률.",
+                help="셋업·비가동·인력 제약을 반영. 상단 「가동률 기준 필요대수」와 1대 월 가용에 그대로 적용됩니다.",
                 key="capa_util",
             )
         )
@@ -481,26 +481,56 @@ def render() -> None:
 
     monthly = result["monthly"]
     avail_min = float(result["machine_month_min"])
+    peak_dim = int(result["peak_dim_required"])
+    peak_hole = int(result["peak_hole_required"])
+    short_dim = max(peak_dim - owned_dim, 0)
+    short_hole = max(peak_hole - owned_hole, 0)
 
-    st.subheader("월별 치수 설비 필요대수")
+    st.subheader(f"가동률 {util_pct:g}% 기준 필요대수")
     st.caption(
-        f"필요대수 = ceil(치수 측정시간 합 ÷ 1대 월 가용 {avail_min:,.0f}분). "
-        f"피크 {result['peak_dim_label']} · {result['peak_dim_required']}대. "
-        "치수는 측정시간이 있는 전 제품입니다."
+        f"사이드바 **가동 조건 → 가동률**({util_pct:g}%)을 반영한 값입니다. "
+        f"1대 월 가용 = {work_days:g}일 × {day_hours:g}시간 × 60 × {util_pct:g}% = **{avail_min:,.0f}분**. "
+        "필요대수 = ceil(월 측정시간 합 ÷ 1대 월 가용). 인력 제약이 있으면 가동률을 낮춰 보세요."
     )
-    _count_chart(monthly, "치수_필요대수", "월별 치수 설비 필요대수", "#60a5fa")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("치수 피크 필요", f"{peak_dim}대", help=f"피크월 {result['peak_dim_label']}")
+    with k2:
+        st.metric("치수 부족", f"{short_dim}대", help=f"피크 필요 {peak_dim} − 보유 {owned_dim}")
+    with k3:
+        st.metric("홀 피크 필요", f"{peak_hole}대", help=f"피크월 {result['peak_hole_label']}")
+    with k4:
+        st.metric("홀 부족", f"{short_hole}대", help=f"피크 필요 {peak_hole} − 보유 {owned_hole}")
 
-    st.subheader("월별 홀 설비 필요대수")
+    st.markdown("##### 월별 치수 필요대수")
     st.caption(
-        f"필요대수 = ceil(홀 측정시간 합 ÷ 1대 월 가용 {avail_min:,.0f}분). "
-        f"피크 {result['peak_hole_label']} · {result['peak_hole_required']}대. "
-        "홀은 CEL만 포함합니다."
+        f"치수 = 측정시간이 있는 전 제품. 피크 {result['peak_dim_label']} · {peak_dim}대 "
+        f"(보유 {owned_dim}대 → 부족 {short_dim}대)."
     )
-    _count_chart(monthly, "홀_필요대수", "월별 홀 설비 필요대수", "#fbbf24")
+    _count_chart(
+        monthly,
+        "치수_필요대수",
+        f"가동률 {util_pct:g}% 기준 · 월별 치수 필요대수",
+        "#60a5fa",
+    )
 
+    st.markdown("##### 월별 홀 필요대수")
+    st.caption(
+        f"홀 = CEL만. 피크 {result['peak_hole_label']} · {peak_hole}대 "
+        f"(보유 {owned_hole}대 → 부족 {short_hole}대)."
+    )
+    _count_chart(
+        monthly,
+        "홀_필요대수",
+        f"가동률 {util_pct:g}% 기준 · 월별 홀 필요대수",
+        "#fbbf24",
+    )
+
+    st.divider()
     st.subheader("월별 가동율")
     st.caption(
         f"가동율 = 필요시간 ÷ (보유대수 × {avail_min:,.0f}분) × 100. "
+        f"분모의 1대 가용에도 가동률 {util_pct:g}%가 들어가 있습니다. "
         f"치수 보유 {owned_dim}대 · 홀 보유 {owned_hole}대. 100%를 넘으면 보유 설비가 부족합니다."
     )
     _util_chart(monthly)
