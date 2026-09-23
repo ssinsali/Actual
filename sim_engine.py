@@ -1479,14 +1479,16 @@ def process_name_matches_area(process_name: str, area: str) -> bool:
     return _map_wip_inspect_area(process_name) == area
 
 
-# 현장 탭에 묶을 공정코드. 이 목록에 있는 코드만 치수·Hole·외관으로 본다.
+# 입고 예정: 이 구간(포함)만. 치수 탭 앞에 묶는다.
+INCOMING_CODE_FROM = 50000
+INCOMING_CODE_TO = 74600
+INCOMING_AREA = "입고 예정"
+# 현장 탭에 묶을 공정코드.
 AREA_PROCESS_CODES: dict[str, frozenset[int]] = {
     "치수": frozenset({75000, 76000, 76500, 78000}),
     "Hole": frozenset({79000}),
     "외관": frozenset({85000, 85500, 87000, 89000}),
 }
-# 최종 제품 보관. 재공 집계·일별 처리에서 제외.
-EXCLUDED_PROCESS_CODES = frozenset({90000})
 
 
 def process_code_number(code: Any) -> float | None:
@@ -1503,21 +1505,30 @@ def process_code_number(code: Any) -> float | None:
         return float(matched.group()) if matched else None
 
 
-def is_excluded_process_code(code: Any) -> bool:
-    number = process_code_number(code)
-    return number is not None and int(number) in EXCLUDED_PROCESS_CODES
-
-
 def area_by_process_code(code: Any) -> str | None:
-    """지정 공정코드만 치수·Hole·외관. 그 외는 None."""
+    """입고 예정(50000~74600)과 지정 치수·Hole·외관만. 그 외는 None."""
     number = process_code_number(code)
-    if number is None or int(number) in EXCLUDED_PROCESS_CODES:
+    if number is None:
         return None
     key = int(number)
+    if INCOMING_CODE_FROM <= key <= INCOMING_CODE_TO:
+        return INCOMING_AREA
     for area, codes in AREA_PROCESS_CODES.items():
         if key in codes:
             return area
     return None
+
+
+def is_excluded_process_code(code: Any) -> bool:
+    """코드가 있는데 입고 예정·치수·Hole·외관이 아니면 집계에서 제외."""
+    number = process_code_number(code)
+    if number is None:
+        return False
+    return area_by_process_code(code) is None
+
+
+def is_tracked_process_code(code: Any) -> bool:
+    return area_by_process_code(code) is not None
 
 
 def _priority_rank(label: Any) -> int:
@@ -1568,9 +1579,9 @@ def normalize_wip(df: pd.DataFrame) -> pd.DataFrame:
     # Sub Total / 합계 행 제거. 90000(최종 보관)은 집계하지 않음.
     bad = work["제품코드"].str.contains(r"sub\s*total|합계|total", case=False, na=False)
     work = work[(work["제품코드"] != "") & ~bad]
-    # 사업장 앞으로 채우기(병합 셀) 후 90000(최종 보관) 제외
+    # 사업장 앞으로 채우기(병합 셀) 후, 지정 공정 외 재공은 집계하지 않음
     work["사업장"] = work["사업장"].replace("", pd.NA).ffill().fillna("")
-    work = work[~work["공정코드"].map(is_excluded_process_code)]
+    work = work[work["공정코드"].map(is_tracked_process_code)]
     work["검사영역"] = [
         area_by_process_code(code) or _map_wip_inspect_area(name)
         for code, name in zip(work["공정코드"], work["공정명"])
@@ -1587,7 +1598,7 @@ def aggregate_wip(wip: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
     work = work.copy()
     if "공정코드" in work.columns:
-        work = work[~work["공정코드"].map(is_excluded_process_code)]
+        work = work[work["공정코드"].map(is_tracked_process_code)]
     if work.empty:
         return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
     # 지정 공정코드 우선, 없으면 공정명 규칙
@@ -1828,7 +1839,7 @@ def daily_optimal_from_wip_shipping(
         fam_map = {_norm(a): _infer_product_family(b) for a, b in zip(pc["제품코드"], pc["제품군"])}
 
     rows: list[dict[str, Any]] = []
-    area_ord = {"외관": 0, "Hole": 1, "치수": 2, "종합측정실": 3}
+    area_ord = {"외관": 0, "Hole": 1, "치수": 2, "입고 예정": 3, "종합측정실": 4}
     status_ord = {
         "처리가능": 0,
         "재공부족": 1,
