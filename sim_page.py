@@ -731,9 +731,8 @@ def render() -> None:
     with tab_sim:
         st.subheader("일별 최적 처리")
         st.caption(
-            "**출하계획**(긴급품 시트 또는 CSV) + **공정 재공** Excel/CSV를 올리면, "
-            "일자별 출하 수량 열을 그대로 반영해 재공이 있는 제품을 공정·사업장별로 정리합니다. "
-            "기본은「전체」일자입니다. 결과는 CSV로 내려받아 현장 관리자에게 전달하세요."
+            "아래 두 칸에 **직접 올린** 출하계획·공정 재공 파일로 계산합니다. "
+            "csv, xlsx 모두 됩니다. 일자별 수량 열을 그대로 반영하고, 기본은「전체」일자입니다."
         )
 
         up1, up2 = st.columns(2)
@@ -823,8 +822,7 @@ def render() -> None:
                     f"{'과 '.join(missing)} 파일을 업로드하세요. Excel(xlsx)과 CSV 모두 됩니다."
                 )
             st.caption(
-                "양식: `templates/출하계획_샘플.csv`, `templates/공정재공_샘플.csv` "
-                "(엑셀이면 긴급품 시트 · 재공 리스트)"
+                "템플릿 폴더에서 읽지 않습니다. 이 화면에서 올린 파일만 사용합니다."
             )
         else:
             date_opts = shipping_date_options(ship_raw)
