@@ -14,9 +14,7 @@ from capa_engine import (
     QA_PLAN_STEM,
     QA_STEMS,
     QA_TIME_STEM,
-    TIME_COLUMNS,
     calc_qa_capa,
-    measure_template,
     plan_template,
 )
 from sim_engine import (
@@ -25,8 +23,10 @@ from sim_engine import (
     canonical_master_name,
     csv_bytes,
     empty_xlsx_bytes,
+    PRODUCT_COLUMNS,
     newest_matching,
     normalize_equipment,
+    product_template,
     read_csv_table,
     running_qty,
     xlsx_bytes,
@@ -92,7 +92,7 @@ def _owned_from_equipment() -> tuple[int, int, str]:
 def _active_files() -> list[dict[str, str]]:
     folder = master_dir()
     rows: list[dict[str, str]] = []
-    for label, stem in (("월별 생산계획", QA_PLAN_STEM), ("제품 측정시간", QA_TIME_STEM)):
+    for label, stem in (("월별 생산계획", QA_PLAN_STEM), ("제품_기준정보", QA_TIME_STEM)):
         path = newest_matching(folder, stem)
         if path is None:
             rows.append({"구분": label, "파일": "(없음)", "상태": "미등록"})
@@ -117,7 +117,7 @@ def _load_saved() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         notes.append(f"월별 생산계획: {plan_path.name} ({len(plan)}행)")
     if time_path:
         times = read_csv_table(time_path)
-        notes.append(f"제품 측정시간: {time_path.name} ({len(times)}행)")
+        notes.append(f"제품_기준정보: {time_path.name} ({len(times)}행)")
     return plan, times, notes
 
 
@@ -134,7 +134,7 @@ def _render_reset_ui() -> None:
             st.session_state[flag] = True
             st.rerun()
         return
-    st.warning("올려 둔 월별 생산계획·제품 측정시간 파일을 삭제합니다.")
+    st.warning("올려 둔 월별 생산계획·제품_기준정보 파일을 삭제합니다.")
     st.caption("삭제 대상: " + ", ".join(p.name for p in files))
     yes, no = st.columns(2)
     with yes:
@@ -234,8 +234,8 @@ def _util_chart(monthly: pd.DataFrame) -> None:
 def render() -> None:
     st.title("QA그룹 CAPA 관리")
     st.caption(
-        "월별 생산계획과 제품 측정시간으로 치수·홀 설비 필요대수와 가동율을 계산합니다. "
-        "홀은 CEL만 측정합니다. 생산계획·측정시간은 GitHub에서 가져오지 않고, 이 화면에서 올린 파일만 사용합니다."
+        "월별 생산계획과 제품_기준정보로 치수·홀 설비 필요대수와 가동율을 계산합니다. "
+        "측정시간은 설비 운영 시뮬레이션과 같은 제품_기준정보(공정, 매당_설비분)를 씁니다. 홀은 CEL만 봅니다."
     )
 
     flash = st.session_state.pop("capa_flash", None)
@@ -309,15 +309,15 @@ def render() -> None:
         st.divider()
         st.header("파일 업로드")
         st.caption(
-            "월별 생산계획과 제품 측정시간을 직접 올리세요. "
-            "저장소 템플릿은 자동으로 불러오지 않습니다. "
-            "측정시간은 치수_측정분·홀_측정분, 또는 공정·매당_설비분 형식을 읽습니다."
+            "월별 생산계획과 제품_기준정보를 직접 올리세요. "
+            "제품_기준정보는 설비 운영 시뮬레이션과 같은 양식입니다. "
+            "치수·Hole 행의 매당_설비분을 1매 측정시간으로 사용합니다."
         )
         st.dataframe(pd.DataFrame(_active_files()), use_container_width=True, hide_index=True)
         _render_reset_ui()
 
         plan_up = st.file_uploader("① 월별 생산계획", type=["csv", "xlsx"], key="capa_up_plan")
-        time_up = st.file_uploader("② 제품 측정시간", type=["csv", "xlsx"], key="capa_up_time")
+        time_up = st.file_uploader("② 제품_기준정보", type=["csv", "xlsx"], key="capa_up_time")
         plan_sig = (plan_up.name, int(getattr(plan_up, "size", 0) or 0)) if plan_up else None
         time_sig = (time_up.name, int(getattr(time_up, "size", 0) or 0)) if time_up else None
         if plan_up is not None and plan_sig != st.session_state.get("capa_plan_sig"):
@@ -330,7 +330,7 @@ def render() -> None:
             path = _save_upload(time_up, QA_TIME_STEM)
             st.session_state["capa_time_sig"] = time_sig
             st.session_state["capa_use_sample"] = False
-            st.session_state["capa_flash"] = f"측정시간 업로드: {path.name}"
+            st.session_state["capa_flash"] = f"제품_기준정보 업로드: {path.name}"
             st.rerun()
 
         st.subheader("양식 받기")
@@ -343,9 +343,9 @@ def render() -> None:
             key="capa_dl_plan_xlsx",
         )
         st.download_button(
-            "제품 측정시간 엑셀 (예시)",
-            data=xlsx_bytes(measure_template(), "측정시간"),
-            file_name="QA_제품측정시간.xlsx",
+            "제품_기준정보 엑셀 (예시)",
+            data=xlsx_bytes(product_template(), "제품"),
+            file_name="제품_기준정보.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             key="capa_dl_time_xlsx",
@@ -360,9 +360,9 @@ def render() -> None:
                 key="capa_dl_plan_empty",
             )
             st.download_button(
-                "제품 측정시간 빈 엑셀",
-                data=empty_xlsx_bytes(TIME_COLUMNS, "측정시간"),
-                file_name="QA_제품측정시간_빈양식.xlsx",
+                "제품_기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
+                file_name="제품_기준정보_빈양식.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key="capa_dl_time_empty",
@@ -376,9 +376,9 @@ def render() -> None:
                 key="capa_dl_plan_csv",
             )
             st.download_button(
-                "제품 측정시간 CSV (예시)",
-                data=csv_bytes(measure_template()),
-                file_name="QA_제품측정시간.csv",
+                "제품_기준정보 CSV (예시)",
+                data=csv_bytes(product_template()),
+                file_name="제품_기준정보.csv",
                 mime="text/csv",
                 use_container_width=True,
                 key="capa_dl_time_csv",
@@ -391,7 +391,7 @@ def render() -> None:
     saved_plan, saved_times, notes = _load_saved()
     use_sample = bool(st.session_state.get("capa_use_sample"))
     if use_sample:
-        plan_raw, time_raw = plan_template(), measure_template()
+        plan_raw, time_raw = plan_template(), product_template()
         st.info("예시 양식으로 미리보기 중입니다. 실제 계획이면 사이드바에서 업로드하세요.")
     else:
         plan_raw, time_raw = saved_plan, saved_times
@@ -410,9 +410,9 @@ def render() -> None:
         if plan_raw.empty:
             missing.append("월별 생산계획")
         if time_raw.empty:
-            missing.append("제품 측정시간")
+            missing.append("제품_기준정보")
         st.info(
-            "사이드바에서 **월별 생산계획**과 **제품 측정시간** 양식을 받아 올린 뒤 차트를 봅니다. "
+            "사이드바에서 **월별 생산계획**과 **제품_기준정보** 양식을 받아 올린 뒤 차트를 봅니다. "
             "바로 보려면 **예시 데이터로 미리보기**를 누르세요. "
             f"지금 없는 파일: {' · '.join(missing)}."
         )
@@ -422,9 +422,9 @@ def render() -> None:
             st.dataframe(plan_template(), use_container_width=True, hide_index=True)
             st.caption("가로형: 제품코드 + 1월~12월. 세로형(년도, 월, 제품코드, 필요수량)도 가능합니다.")
         with c2:
-            st.markdown("##### 제품 측정시간")
-            st.dataframe(measure_template(), use_container_width=True, hide_index=True)
-            st.caption("치수_측정분·홀_측정분 = 1매 측정시간(분). 홀은 CEL만 계산합니다.")
+            st.markdown("##### 제품_기준정보")
+            st.dataframe(product_template(), use_container_width=True, hide_index=True)
+            st.caption("설비 운영 시뮬레이션과 같은 양식입니다. 치수·Hole의 매당_설비분이 1매 측정시간입니다. 홀은 CEL만 계산합니다.")
         return
 
     if result["monthly"].empty:
@@ -521,8 +521,8 @@ def render() -> None:
     with st.expander("계산식 · 올린 파일"):
         st.markdown(
             f"""
-- 치수 필요시간(분) = Σ (월 생산수량 × 치수_측정분) — 전 제품
-- 홀 필요시간(분) = Σ (CEL 월 생산수량 × 홀_측정분)
+- 치수 필요시간(분) = Σ (월 생산수량 × 치수 공정 매당_설비분) — 전 제품
+- 홀 필요시간(분) = Σ (CEL 월 생산수량 × Hole 공정 매당_설비분)
 - 1대 월 가용 = {work_days:g} × {day_hours:g} × 60 = **{avail_min:,.0f}분**
 - 필요대수 = ceil(필요시간 ÷ 1대 월 가용)
 - 가동율(%) = 필요시간 ÷ (보유대수 × 1대 월 가용) × 100
@@ -532,5 +532,5 @@ def render() -> None:
             st.write("- ", n)
         st.markdown("**월별 생산계획**")
         st.dataframe(plan_raw, use_container_width=True, hide_index=True)
-        st.markdown("**제품 측정시간**")
+        st.markdown("**제품_기준정보**")
         st.dataframe(time_raw, use_container_width=True, hide_index=True)
