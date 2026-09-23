@@ -53,7 +53,9 @@ from sim_engine import (
     normalize_products,
     normalize_shipping_urgent,
     normalize_wip,
+    area_by_process_code,
     process_name_matches_area,
+    route_code_bounds,
     process_standard_times,
     product_actual_template,
     product_template,
@@ -888,8 +890,8 @@ def render() -> None:
                 st.markdown("### 일별 최적 처리 (현장용)")
                 st.caption(
                     "① 완제품 차감 → ② 순필요만 공정 재공 배분(외관→Hole→치수). Hole은 CEL만. "
-                    "탭 구분(공정명): **치수**=저항측정·3D측정 / **종합측정실**=이름에 종합측정실 포함 "
-                    "/ **Hole**·**외관**=해당 공정명."
+                    "탭은 공정명 우선(치수=저항·3D, 종합측정실, Hole, 외관). "
+                    "이름에 안 맞으면 공정코드가 커질수록 치수 → Hole → 외관."
                 )
                 if floor.empty:
                     st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
@@ -907,23 +909,39 @@ def render() -> None:
 
                     day_tag = "전체일자" if ship_day == "전체" else ship_day
                     area_tabs_order = ("치수", "Hole", "외관", "종합측정실")
+                    hole_from, appearance_from = route_code_bounds(floor_base)
 
-                    def _in_area(proc_name: object, area: str) -> bool:
-                        n = str(proc_name).strip() if proc_name is not None else ""
-                        return bool(n) and process_name_matches_area(n, area)
+                    def _display_area(row: pd.Series) -> str | None:
+                        named = ""
+                        if process_name_matches_area(row.get("공정명"), "종합측정실"):
+                            named = "종합측정실"
+                        elif process_name_matches_area(row.get("공정명"), "외관"):
+                            named = "외관"
+                        elif process_name_matches_area(row.get("공정명"), "Hole"):
+                            named = "Hole"
+                        elif process_name_matches_area(row.get("공정명"), "치수"):
+                            named = "치수"
+                        if named:
+                            return named
+                        coded = area_by_process_code(
+                            row.get("공정코드"),
+                            hole_from=hole_from,
+                            appearance_from=appearance_from,
+                        )
+                        if coded in ("치수", "Hole", "외관"):
+                            return coded
+                        return None
 
+                    display_area = floor_base.apply(_display_area, axis=1)
                     area_frames: dict[str, pd.DataFrame] = {}
-                    assigned = pd.Series(False, index=floor_base.index)
                     for area in area_tabs_order:
-                        mask = floor_base["공정명"].map(lambda n, a=area: _in_area(n, a))
-                        assigned = assigned | mask
-                        sub = floor_base[mask].copy()
+                        sub = floor_base[display_area == area].copy()
                         if not sub.empty:
                             sub = sub.reset_index(drop=True)
                             sub["처리순서"] = range(1, len(sub) + 1)
                             sub["검사영역"] = area
                         area_frames[area] = sub
-                    unassigned = floor_base[~assigned].copy()
+                    unassigned = floor_base[display_area.isna()].copy()
                     if not unassigned.empty:
                         unassigned = unassigned.reset_index(drop=True)
                         unassigned["처리순서"] = range(1, len(unassigned) + 1)
@@ -1003,8 +1021,9 @@ def render() -> None:
                             )
                     with tabs[4]:
                         st.caption(
-                            "공정명이 비었거나(재공없음·재공부족·완제품충당), "
-                            "치수(저항·3D)·Hole·외관·종합측정실 규칙에 안 맞는 공정."
+                            f"공정코드가 없는 행만 남깁니다. "
+                            f"코드가 있으면 {hole_from:.0f} 미만은 치수, "
+                            f"{hole_from:.0f}부터 Hole, {appearance_from:.0f}부터 외관입니다."
                         )
                         _render_area_block(
                             "미배정",
