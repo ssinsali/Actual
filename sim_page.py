@@ -731,25 +731,25 @@ def render() -> None:
     with tab_sim:
         st.subheader("일별 최적 처리")
         st.caption(
-            "**출하계획 Excel(긴급품 시트)** + **공정 재공 Excel**을 올리면, "
-            "엑셀 일자별 출하 수량 열을 그대로 반영해 재공이 있는 제품을 공정·사업장별로 정리합니다. "
-            "기본은「전체」일자입니다. CSV를 내려받아 현장 관리자에게 전달하세요."
+            "**출하계획**(긴급품 시트 또는 CSV) + **공정 재공** Excel/CSV를 올리면, "
+            "일자별 출하 수량 열을 그대로 반영해 재공이 있는 제품을 공정·사업장별로 정리합니다. "
+            "기본은「전체」일자입니다. 결과는 CSV로 내려받아 현장 관리자에게 전달하세요."
         )
 
         up1, up2 = st.columns(2)
         with up1:
             ship_file = st.file_uploader(
-                "출하계획 Excel (긴급품)",
-                type=["xlsx", "xls"],
+                "출하계획 (긴급품)",
+                type=["xlsx", "xls", "csv"],
                 key="sim_ship_upload",
-                help="일별_출하계획 …xlsx — '긴급품' 시트 사용",
+                help="일별_출하계획 xlsx의 '긴급품' 시트, 또는 templates/출하계획_샘플.csv",
             )
         with up2:
             wip_file = st.file_uploader(
-                "공정 재공 Excel",
-                type=["xlsx", "xls"],
+                "공정 재공",
+                type=["xlsx", "xls", "csv"],
                 key="sim_wip_upload",
-                help="공정 재공 현황 - 재공 리스트 …xlsx",
+                help="공정 재공 현황 xlsx, 또는 templates/공정재공_샘플.csv",
             )
 
         if ship_file is not None:
@@ -757,6 +757,10 @@ def render() -> None:
             if sig != st.session_state.get("sim_ship_sig"):
                 try:
                     raw_ship, _ = read_shipping_excel(ship_file.getvalue())
+                    if raw_ship is None or raw_ship.empty:
+                        raise ValueError(
+                            "데이터 행이 없습니다. 헤더는 우선순위, 품목코드, 재공, 완제품, 부족분, 날짜 열입니다."
+                        )
                     raw_ship = raw_ship.copy()
                     raw_ship.columns = [
                         str(c).replace("\n", " ").strip() for c in raw_ship.columns
@@ -764,22 +768,39 @@ def render() -> None:
                     st.session_state["sim_ship_raw"] = raw_ship
                     st.session_state["sim_ship_sig"] = sig
                     st.session_state["sim_ship_fname"] = ship_file.name
+                    st.session_state.pop("sim_ship_err", None)
                     # 이전 단일일(예: 9/17) 선택이 남지 않도록 전체로 초기화
                     st.session_state["sim_ship_day_v2"] = "전체"
-                    st.rerun()
                 except Exception as e:
+                    st.session_state["sim_ship_raw"] = None
+                    st.session_state["sim_ship_err"] = str(e)
                     st.error(f"출하계획 읽기 실패: {e}")
+        else:
+            st.session_state["sim_ship_raw"] = None
+            st.session_state["sim_ship_sig"] = None
+            st.session_state.pop("sim_ship_err", None)
 
         if wip_file is not None:
             sig = (wip_file.name, int(getattr(wip_file, "size", 0) or 0))
             if sig != st.session_state.get("sim_wip_sig"):
                 try:
-                    st.session_state["sim_wip_df"] = read_wip_excel(wip_file.getvalue())
+                    wip_norm = read_wip_excel(wip_file.getvalue())
+                    if wip_norm is None or wip_norm.empty:
+                        raise ValueError(
+                            "데이터 행이 없습니다. 헤더는 사업장, 공정, 공정명, 제품, 제품구분입니다."
+                        )
+                    st.session_state["sim_wip_df"] = wip_norm
                     st.session_state["sim_wip_sig"] = sig
                     st.session_state["sim_wip_fname"] = wip_file.name
-                    st.rerun()
+                    st.session_state.pop("sim_wip_err", None)
                 except Exception as e:
+                    st.session_state["sim_wip_df"] = None
+                    st.session_state["sim_wip_err"] = str(e)
                     st.error(f"재공 읽기 실패: {e}")
+        else:
+            st.session_state["sim_wip_df"] = None
+            st.session_state["sim_wip_sig"] = None
+            st.session_state.pop("sim_wip_err", None)
 
         ship_raw = st.session_state.get("sim_ship_raw")
         wip_df = st.session_state.get("sim_wip_df")
@@ -790,9 +811,20 @@ def render() -> None:
             ]
 
         if ship_raw is None or wip_df is None:
-            st.info("출하계획 Excel과 공정 재공 Excel을 모두 업로드하세요.")
+            if not (
+                st.session_state.get("sim_ship_err") or st.session_state.get("sim_wip_err")
+            ):
+                missing = []
+                if ship_raw is None:
+                    missing.append("출하계획")
+                if wip_df is None:
+                    missing.append("공정 재공")
+                st.info(
+                    f"{'과 '.join(missing)} 파일을 업로드하세요. Excel(xlsx)과 CSV 모두 됩니다."
+                )
             st.caption(
-                "양식: `templates/`의 일별_출하계획(긴급품 시트), 공정 재공 현황 Excel"
+                "양식: `templates/출하계획_샘플.csv`, `templates/공정재공_샘플.csv` "
+                "(엑셀이면 긴급품 시트 · 재공 리스트)"
             )
         else:
             date_opts = shipping_date_options(ship_raw)
