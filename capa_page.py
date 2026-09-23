@@ -1,400 +1,576 @@
-"""캠퍼스 · 조별 실적 분석 (메인 화면)."""
+"""QA그룹 CAPA 관리 — 월별 치수·홀 필요대수와 가동율."""
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-
-_APP_DIR = Path(__file__).resolve().parent
-if str(_APP_DIR) not in sys.path:
-    sys.path.insert(0, str(_APP_DIR))
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from app_common import (
-    CAMPUSES,
-    apply_basic_filters,
-    load_records,
-    render_data_sidebar,
-    render_process_daily_avg,
-    render_single_slicer,
-    render_slicer,
-    team_stack_order,
-    timeseries_campus_team,
-)
+from app_common import data_dir, render_exit_ui
 from auth import render_logout_controls
-from stats_engine import AREAS, SHIFTS, add_calendar_parts, summary_by
+from capa_engine import (
+    PLAN_COLUMNS,
+    PRODUCT_STEM,
+    QA_PLAN_STEM,
+    QA_STEMS,
+    _LEGACY_TIME_STEM,
+    calc_qa_capa,
+    plan_template,
+)
+from drill_engine import DEFAULT_DAY_HOURS, DEFAULT_UTILIZATION_PCT
+from sim_engine import (
+    DAY_MINUTES,
+    DEFAULT_WORK_DAYS,
+    canonical_master_name,
+    csv_bytes,
+    empty_xlsx_bytes,
+    PRODUCT_COLUMNS,
+    newest_matching,
+    normalize_equipment,
+    product_template,
+    read_csv_table,
+    running_qty,
+    xlsx_bytes,
+)
 
-_GRAIN_OPTS = ("일", "월", "분기", "년")
+
+def master_dir() -> Path:
+    folder = data_dir() / "master"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
-def _grain_period_widgets(records: pd.DataFrame, grain: str) -> dict:
-    """시계열 단위별 기간 설정 → filter_period 인자."""
-    out = {
-        "mode": "전체",
-        "year": None,
-        "quarter": None,
-        "month": None,
-        "day": None,
-        "start": None,
-        "end": None,
-        "months": None,
-        "quarters": None,
-        "years": None,
-    }
-    if records.empty or "일자" not in records.columns:
-        return out
+def _list_paths(stem: str | None = None) -> list[Path]:
+    folder = master_dir()
+    stems = (stem,) if stem else (*QA_STEMS, _LEGACY_TIME_STEM)
+    files: list[Path] = []
+    for s in stems:
+        files.extend(folder.glob(f"{s}*.csv"))
+        files.extend(folder.glob(f"{s}*.xlsx"))
+        files.extend(folder.glob(f"{s}*.xls"))
+    # 중복 경로 제거 (순서 유지)
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in files:
+        if p.name.startswith("~$") or str(p) in seen:
+            continue
+        seen.add(str(p))
+        uniq.append(p)
+    return uniq
 
-    work = add_calendar_parts(records)
-    years = sorted(work["년"].dropna().unique().astype(int).tolist())
-    min_d = work["일자"].min().date()
-    max_d = work["일자"].max().date()
 
-    st.caption("기간 설정")
-    if grain == "일":
-        rng = st.date_input(
-            "일자 범위",
-            value=(min_d, max_d),
-            min_value=min_d,
-            max_value=max_d,
-            key="campus_rng_day",
+def _clear_files(stem: str | None = None) -> list[str]:
+    deleted: list[str] = []
+    for path in _list_paths(stem):
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except OSError:
+            continue
+    return deleted
+
+
+def _save_upload(uploaded, prefix: str) -> Path:
+    """올린 파일을 data/master 에 저장. 제품_기준정보는 설비 시뮬레이션과 같은 파일명을 쓴다."""
+    name = canonical_master_name(uploaded.name, prefix)
+    _clear_files(prefix)
+    if prefix == PRODUCT_STEM:
+        _clear_files(_LEGACY_TIME_STEM)
+    dest = master_dir() / name
+    dest.write_bytes(uploaded.getvalue())
+    return dest
+
+
+def _product_path() -> Path | None:
+    """시뮬레이션과 공유하는 제품_기준정보. 예전 QA_제품측정시간도 허용."""
+    folder = master_dir()
+    return newest_matching(folder, PRODUCT_STEM) or newest_matching(folder, _LEGACY_TIME_STEM)
+
+
+def _owned_from_equipment() -> tuple[int, int, str]:
+    """설비_기준정보의 가동 대수. 치수·Hole 합계."""
+    path = newest_matching(master_dir(), "설비_기준정보")
+    if path is None:
+        return 0, 0, ""
+    try:
+        equip = normalize_equipment(read_csv_table(path))
+    except Exception:
+        return 0, 0, path.name
+    dim = int(round(running_qty(equip, campus=None, area="치수", equip_code="")))
+    hole = int(
+        round(
+            running_qty(equip, campus=None, area="Hole", equip_code="")
+            + running_qty(equip, campus=None, area="홀", equip_code="")
         )
-        if isinstance(rng, (list, tuple)) and len(rng) == 2:
-            out["start"] = pd.Timestamp(rng[0])
-            out["end"] = pd.Timestamp(rng[1])
-            out["mode"] = "기간"
-    elif grain == "월":
-        year_labels = [str(y) for y in years]
-        year_pick = render_single_slicer(
-            "년도",
-            year_labels,
-            key="campus_rng_year_m",
-            default=year_labels[-1] if year_labels else None,
+    )
+    return dim, hole, path.name
+
+
+def _active_files() -> list[dict[str, str]]:
+    folder = master_dir()
+    rows: list[dict[str, str]] = []
+    for label, stem in (("월별 생산계획", QA_PLAN_STEM), ("제품_기준정보", PRODUCT_STEM)):
+        path = newest_matching(folder, stem)
+        if path is None and stem == PRODUCT_STEM:
+            path = newest_matching(folder, _LEGACY_TIME_STEM)
+        if path is None:
+            rows.append({"구분": label, "파일": "(없음)", "상태": "미등록"})
+            continue
+        try:
+            mtime = pd.Timestamp(path.stat().st_mtime, unit="s").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            mtime = "-"
+        rows.append({"구분": label, "파일": path.name, "상태": f"운영중 · {mtime}"})
+    return rows
+
+
+def _load_saved() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    folder = master_dir()
+    notes: list[str] = []
+    plan_path = newest_matching(folder, QA_PLAN_STEM)
+    time_path = _product_path()
+    plan = pd.DataFrame()
+    times = pd.DataFrame()
+    if plan_path:
+        plan = read_csv_table(plan_path)
+        notes.append(f"월별 생산계획: {plan_path.name} ({len(plan)}행)")
+    if time_path:
+        times = read_csv_table(time_path)
+        shared = " · 설비 시뮬레이션과 공유" if time_path.name.startswith(PRODUCT_STEM) else " · 예전 CAPA 파일"
+        notes.append(f"제품_기준정보: {time_path.name} ({len(times)}행){shared}")
+    return plan, times, notes
+
+
+def _render_reset_ui() -> None:
+    flag = "capa_confirm_reset"
+    if flag not in st.session_state:
+        st.session_state[flag] = False
+    files = _list_paths()
+    if not files:
+        st.caption("초기화할 업로드 파일이 없습니다.")
+        return
+    if not st.session_state[flag]:
+        if st.button("업로드 파일 초기화", use_container_width=True, key="capa_btn_reset"):
+            st.session_state[flag] = True
+            st.rerun()
+        return
+    st.warning(
+        "올려 둔 월별 생산계획을 삭제합니다. "
+        "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일이라, 여기서 지우면 시뮬레이션에도 없어집니다."
+    )
+    st.caption("삭제 대상: " + ", ".join(p.name for p in files))
+    yes, no = st.columns(2)
+    with yes:
+        if st.button("삭제", type="primary", use_container_width=True, key="capa_reset_yes"):
+            deleted = _clear_files()
+            st.session_state[flag] = False
+            for k in ("capa_plan_sig", "capa_time_sig"):
+                st.session_state.pop(k, None)
+            st.session_state["capa_flash"] = "초기화 완료: " + (", ".join(deleted) if deleted else "없음")
+            st.rerun()
+    with no:
+        if st.button("취소", use_container_width=True, key="capa_reset_no"):
+            st.session_state[flag] = False
+            st.rerun()
+
+
+def _count_chart(monthly: pd.DataFrame, value_col: str, title: str, color: str) -> None:
+    chart_df = monthly[["월라벨", value_col]].rename(columns={"월라벨": "월", value_col: "대수"})
+    chart_df["표시"] = chart_df["대수"].map(lambda v: f"{int(v)}대")
+    order = list(monthly["월라벨"])
+    y_max = max(float(chart_df["대수"].max()), 1.0) * 1.28
+    bars = (
+        alt.Chart(chart_df)
+        .mark_bar(color=color)
+        .encode(
+            x=alt.X("월:N", sort=order, title="월"),
+            y=alt.Y("대수:Q", title="필요 대수", scale=alt.Scale(domain=[0, y_max])),
+            tooltip=["월", "대수"],
         )
-        year = int(year_pick) if year_pick else (years[-1] if years else None)
-        out["year"] = year
-        out["mode"] = "년"
-        months_avail = sorted(
-            work.loc[work["년"] == year, "월"].dropna().unique().astype(int).tolist()
-        ) if year is not None else list(range(1, 13))
-        if not months_avail:
-            months_avail = list(range(1, 13))
-        month_labels = [f"{m}월" for m in months_avail]
-        month_sel_labels = render_slicer(
-            "월",
-            month_labels,
-            key="campus_rng_months",
-            default_on=True,
+    )
+    labels = (
+        alt.Chart(chart_df)
+        .mark_text(dy=-12, fontSize=16, fontWeight="bold")
+        .encode(
+            x=alt.X("월:N", sort=order),
+            y=alt.Y("대수:Q"),
+            text=alt.Text("표시:N"),
+            color=alt.value("#ffffff"),
         )
-        out["months"] = [int(x.replace("월", "")) for x in month_sel_labels]
-    elif grain == "분기":
-        year_labels = [str(y) for y in years]
-        year_pick = render_single_slicer(
-            "년도",
-            year_labels,
-            key="campus_rng_year_q",
-            default=year_labels[-1] if year_labels else None,
+    )
+    st.altair_chart((bars + labels).properties(height=320, title=title), use_container_width=True)
+
+
+def _util_chart(monthly: pd.DataFrame) -> None:
+    long = monthly.melt(
+        id_vars=["월라벨"],
+        value_vars=["치수_가동율", "홀_가동율"],
+        var_name="구분",
+        value_name="가동율",
+    )
+    long["구분"] = long["구분"].map({"치수_가동율": "치수", "홀_가동율": "홀"})
+    long = long.rename(columns={"월라벨": "월"}).dropna(subset=["가동율"])
+    if long.empty:
+        st.info("보유대수를 입력하면 월별 가동율을 계산합니다.")
+        return
+    long["표시"] = long["가동율"].map(lambda v: f"{float(v):.1f}%")
+    order = list(monthly["월라벨"])
+    y_max = max(float(long["가동율"].max()), 100.0) * 1.18
+    bars = (
+        alt.Chart(long)
+        .mark_bar()
+        .encode(
+            x=alt.X("월:N", sort=order, title="월"),
+            xOffset="구분:N",
+            y=alt.Y("가동율:Q", title="가동율 (%)", scale=alt.Scale(domain=[0, y_max])),
+            color=alt.Color(
+                "구분:N",
+                title="공정",
+                scale=alt.Scale(domain=["치수", "홀"], range=["#60a5fa", "#fbbf24"]),
+                sort=["치수", "홀"],
+            ),
+            tooltip=["월", "구분", "가동율"],
         )
-        year = int(year_pick) if year_pick else (years[-1] if years else None)
-        out["year"] = year
-        out["mode"] = "년"
-        q_avail = sorted(
-            work.loc[work["년"] == year, "분기"].dropna().unique().astype(int).tolist()
-        ) if year is not None else [1, 2, 3, 4]
-        if not q_avail:
-            q_avail = [1, 2, 3, 4]
-        q_labels = [f"{q}분기" for q in q_avail]
-        q_sel_labels = render_slicer(
-            "분기",
-            q_labels,
-            key="campus_rng_quarters",
-            default_on=True,
+    )
+    labels = (
+        alt.Chart(long)
+        .mark_text(dy=-10, fontSize=12, fontWeight="bold")
+        .encode(
+            x=alt.X("월:N", sort=order),
+            xOffset="구분:N",
+            y=alt.Y("가동율:Q"),
+            text=alt.Text("표시:N"),
+            color=alt.value("#ffffff"),
         )
-        out["quarters"] = [int(x.replace("분기", "")) for x in q_sel_labels]
-    elif grain == "년":
-        year_labels = [str(y) for y in years]
-        year_sel_labels = render_slicer(
-            "년도",
-            year_labels,
-            key="campus_rng_years",
-            default_on=True,
-        )
-        out["years"] = [int(x) for x in year_sel_labels]
-    return out
+    )
+    rule = (
+        alt.Chart(pd.DataFrame({"y": [100]}))
+        .mark_rule(strokeDash=[6, 4], color="#f87171")
+        .encode(y="y:Q")
+    )
+    st.altair_chart(
+        (bars + labels + rule).properties(height=340, title="월별 가동율 (빨간 점선 = 100%)"),
+        use_container_width=True,
+    )
 
 
 def render() -> None:
-    st.title("캠퍼스 · 조별 실적 분석")
+    st.title("QA그룹 CAPA 관리")
     st.caption(
-        "캠퍼스별,조별,주야별 분석. "
-        "누적 막대: 아래 A조 · 중간 B조 · 위 C조."
+        "월별 생산계획과 제품_기준정보로 치수·홀 설비 필요대수와 가동율을 계산합니다. "
+        "제품_기준정보는 설비 운영 시뮬레이션과 **같은 파일·같은 양식**입니다. "
+        "시뮬레이션에 이미 올려 둔 제품_기준정보가 있으면 그대로 사용합니다. 홀은 CEL만 봅니다."
     )
 
-    records, notes, _chosen = load_records()
+    flash = st.session_state.pop("capa_flash", None)
+    if flash:
+        st.success(flash)
 
-    period_args = {
-        "mode": "전체",
-        "year": None,
-        "quarter": None,
-        "month": None,
-        "day": None,
-        "start": None,
-        "end": None,
-    }
-    month_filter: list[int] | None = None
-    quarter_filter: list[int] | None = None
-    year_filter: list[int] | None = None
+    dim_default, hole_default, eq_name = _owned_from_equipment()
+    if "capa_owned_dim" not in st.session_state:
+        st.session_state["capa_owned_dim"] = dim_default
+    if "capa_owned_hole" not in st.session_state:
+        st.session_state["capa_owned_hole"] = hole_default
+
+    work_days = float(DEFAULT_WORK_DAYS)
+    day_hours = float(DEFAULT_DAY_HOURS)
+    util_pct = float(DEFAULT_UTILIZATION_PCT)
 
     with st.sidebar:
         st.header("계정")
         render_logout_controls()
         st.divider()
-        st.header("조회 조건")
-        grain = render_single_slicer(
-            "시계열 단위",
-            list(_GRAIN_OPTS),
-            key="campus_grain",
-            default="일",
-        )
-        if not records.empty:
-            scope = _grain_period_widgets(records, grain)
-            period_args = {
-                "mode": scope["mode"],
-                "year": scope["year"],
-                "quarter": scope["quarter"],
-                "month": scope["month"],
-                "day": scope["day"],
-                "start": scope["start"],
-                "end": scope["end"],
-            }
-            month_filter = scope.get("months")
-            quarter_filter = scope.get("quarters")
-            year_filter = scope.get("years")
-        area_sel = render_slicer(
-            "영역",
-            list(AREAS),
-            key="campus_area",
-            default_on=True,
-        )
-        shift_sel: list[str] = []
-        if not records.empty:
-            shifts = sorted(records["주야"].dropna().unique().tolist())
-            prefer_s = [s for s in SHIFTS if s in shifts]
-            shift_opts = prefer_s + [s for s in shifts if s not in prefer_s]
-            shift_sel = render_slicer(
-                "주/야",
-                shift_opts,
-                key="campus_shift",
-                default_on=True,
+        st.header("가동 조건")
+        work_days = float(
+            st.number_input(
+                "월 작업일수",
+                min_value=1.0,
+                max_value=31.0,
+                value=float(DEFAULT_WORK_DAYS),
+                step=1.0,
+                help="한 달 조업일. 모든 월에 동일하게 적용합니다.",
+                key="capa_work_days",
             )
-        else:
-            st.caption("데이터 로드 후 기간·주/야 필터를 사용할 수 있습니다.")
-
-        render_data_sidebar(key_prefix="campus_")
-
-    if records.empty:
-        st.error("표준 데이터가 없습니다. 사이드바에서 양식을 받아 업로드하세요.")
-        st.stop()
-
-    if not area_sel:
-        st.warning("영역 필터에서 항목을 하나 이상 켜 주세요.")
-        st.stop()
-    if not shift_sel:
-        st.warning("주/야 필터에서 항목을 하나 이상 켜 주세요.")
-        st.stop()
-    if grain == "월" and not (month_filter or []):
-        st.warning("월 필터에서 항목을 하나 이상 켜 주세요.")
-        st.stop()
-    if grain == "분기" and not (quarter_filter or []):
-        st.warning("분기 필터에서 항목을 하나 이상 켜 주세요.")
-        st.stop()
-    if grain == "년" and not (year_filter or []):
-        st.warning("년도 필터에서 항목을 하나 이상 켜 주세요.")
-        st.stop()
-
-    with st.expander("로드 정보", expanded=False):
-        for n in notes:
-            st.write("- ", n)
-
-    filtered = apply_basic_filters(
-        records,
-        area_sel=area_sel or list(AREAS),
-        shift_sel=shift_sel or None,
-        mode=period_args["mode"],
-        year=period_args["year"],
-        quarter=period_args["quarter"],
-        month=period_args["month"],
-        day=period_args["day"],
-        start=period_args["start"],
-        end=period_args["end"],
-    )
-    if not filtered.empty:
-        f2 = add_calendar_parts(filtered)
-        if grain == "월" and month_filter:
-            f2 = f2[f2["월"].isin(month_filter)]
-        if grain == "분기" and quarter_filter:
-            f2 = f2[f2["분기"].isin(quarter_filter)]
-        if grain == "년" and year_filter:
-            f2 = f2[f2["년"].isin(year_filter)]
-        filtered = f2
-    if filtered.empty:
-        st.warning("선택 조건에 해당하는 데이터가 없습니다.")
-        st.stop()
-
-    ts = timeseries_campus_team(filtered, grain)
-    if ts.empty:
-        st.warning("시계열로 집계할 데이터가 없습니다.")
-        st.stop()
-
-    teams_all = team_stack_order(sorted(ts["조"].dropna().unique().tolist()))
-    ord_map = {t: i for i, t in enumerate(teams_all)}
-    ts = ts.copy()
-    ts["조순서"] = ts["조"].map(lambda x: ord_map.get(x, 99))
-
-    def _stacked_campus_chart(campus: str) -> None:
-        sub = ts[ts["캠퍼스"] == campus]
-        st.subheader(f"{campus} 캠퍼스")
-        if sub.empty:
-            st.caption(f"{campus} 데이터가 없습니다. (양식 K열 캠퍼스를 확인하세요)")
-            return
-
-        rank = sub.groupby("조", as_index=False).agg(실적합계=("실적", "sum"), 인력합계=("인력", "sum"))
-        rank["인당실적"] = rank.apply(
-            lambda r: r["실적합계"] / r["인력합계"] if r["인력합계"] else None, axis=1
         )
-        rank = rank.sort_values("실적합계", ascending=False)
-        r1, r2, r3 = st.columns(3)
-        if len(rank):
-            top = rank.iloc[0]
-            bot = rank.iloc[-1]
-            diff_out = float(top["실적합계"]) - float(bot["실적합계"])
-            with r1:
-                st.metric("실적 상위 조", f"{top['조']}")
-                st.caption(f"실적 {top['실적합계']:,.0f}")
-            with r2:
-                st.metric("실적 차이", f"{diff_out:,.0f}")
-                st.caption(f"{top['조']} − {bot['조']}")
-            with r3:
-                st.metric("실적 하위 조", f"{bot['조']}")
-                st.caption(f"실적 {bot['실적합계']:,.0f}")
-
-            pp_rank = rank.dropna(subset=["인당실적"]).sort_values("인당실적", ascending=False)
-            if not pp_rank.empty:
-                pp_top = pp_rank.iloc[0]
-                pp_bot = pp_rank.iloc[-1]
-                diff_pp = float(pp_top["인당실적"]) - float(pp_bot["인당실적"])
-                p1, p2, p3 = st.columns(3)
-                with p1:
-                    st.metric("인당실적 상위 조", f"{pp_top['조']}")
-                    st.caption(f"인당실적 {pp_top['인당실적']:,.1f}")
-                with p2:
-                    st.metric("인당실적 차이", f"{diff_pp:,.1f}")
-                    st.caption(f"{pp_top['조']} − {pp_bot['조']}")
-                with p3:
-                    st.metric("인당실적 하위 조", f"{pp_bot['조']}")
-                    st.caption(f"인당실적 {pp_bot['인당실적']:,.1f}")
-
-        chart = (
-            alt.Chart(sub)
-            .mark_bar()
-            .encode(
-                x=alt.X("기간:N", sort=None, title=f"기간 ({grain})"),
-                y=alt.Y("실적:Q", title="실적 (합계)", stack="zero"),
-                color=alt.Color("조:N", title="조", sort=teams_all, scale=alt.Scale(domain=teams_all)),
-                order=alt.Order("조순서:Q", sort="ascending"),
-                tooltip=["기간", "캠퍼스", "조", "실적", "인력", "인당실적"],
+        day_hours = float(
+            st.number_input(
+                "1일 가동시간 (시간)",
+                min_value=1.0,
+                max_value=24.0,
+                value=float(DEFAULT_DAY_HOURS),
+                step=0.5,
+                help="설비 이론능력은 24시간(1440분)입니다.",
+                key="capa_day_hours",
             )
-            .properties(height=360, title=f"{campus} · {grain}별 조 누적 실적 (아래 A→B→위 C)")
         )
-        st.altair_chart(chart, use_container_width=True)
-        st.dataframe(
-            sub.pivot_table(index="기간", columns="조", values="실적", aggfunc="sum", fill_value=0)
-            .reindex(columns=[c for c in teams_all if c in sub["조"].unique()]),
+        util_pct = float(
+            st.number_input(
+                "가동률 (%)",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(DEFAULT_UTILIZATION_PCT),
+                step=1.0,
+                help="셋업·비가동을 빼려면 100보다 낮게. 1대 가용시간 = 작업일 × 일가동 × 60 × 가동률.",
+                key="capa_util",
+            )
+        )
+        owned_dim = int(
+            st.number_input(
+                "치수 보유대수",
+                min_value=0,
+                max_value=999,
+                step=1,
+                help="가동율 분모. 설비_기준정보 치수 가동 대수가 있으면 그 값으로 시작합니다.",
+                key="capa_owned_dim",
+            )
+        )
+        owned_hole = int(
+            st.number_input(
+                "홀 보유대수",
+                min_value=0,
+                max_value=999,
+                step=1,
+                help="가동율 분모. 설비_기준정보 Hole 가동 대수가 있으면 그 값으로 시작합니다.",
+                key="capa_owned_hole",
+            )
+        )
+        avail = work_days * day_hours * 60.0 * (util_pct / 100.0)
+        st.caption(
+            f"1대 월 가용 = {work_days:g}일 × {day_hours:g}시간 × 60 × {util_pct:g}% "
+            f"= **{avail:,.0f}분**. 참고: 24시간 = {DAY_MINUTES}분/일."
+        )
+        if eq_name:
+            st.caption(f"보유대수 초기값: `{eq_name}` 치수 {dim_default}대 · 홀 {hole_default}대")
+
+        st.divider()
+        st.header("파일 업로드")
+        st.caption(
+            "월별 생산계획은 이 페이지에서 올리세요. "
+            "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일입니다 "
+            "(이미 시뮬레이션에 있으면 다시 올릴 필요 없음). "
+            "치수·Hole 행의 매당_설비분이 1매 측정시간입니다."
+        )
+        st.dataframe(pd.DataFrame(_active_files()), use_container_width=True, hide_index=True)
+        _render_reset_ui()
+
+        plan_up = st.file_uploader("① 월별 생산계획", type=["csv", "xlsx"], key="capa_up_plan")
+        time_up = st.file_uploader("② 제품_기준정보", type=["csv", "xlsx"], key="capa_up_time")
+        plan_sig = (plan_up.name, int(getattr(plan_up, "size", 0) or 0)) if plan_up else None
+        time_sig = (time_up.name, int(getattr(time_up, "size", 0) or 0)) if time_up else None
+        if plan_up is not None and plan_sig != st.session_state.get("capa_plan_sig"):
+            path = _save_upload(plan_up, QA_PLAN_STEM)
+            st.session_state["capa_plan_sig"] = plan_sig
+            st.session_state["capa_use_sample"] = False
+            st.session_state["capa_flash"] = f"생산계획 업로드: {path.name}"
+            st.rerun()
+        if time_up is not None and time_sig != st.session_state.get("capa_time_sig"):
+            path = _save_upload(time_up, PRODUCT_STEM)
+            st.session_state["capa_time_sig"] = time_sig
+            st.session_state["capa_use_sample"] = False
+            st.session_state["capa_flash"] = f"제품_기준정보 업로드: {path.name} (설비 시뮬레이션과 공유)"
+            st.rerun()
+
+        st.subheader("양식 받기")
+        st.caption("제품_기준정보 양식은 설비 운영 시뮬레이션과 동일합니다.")
+        st.download_button(
+            "월별 생산계획 엑셀 (예시)",
+            data=xlsx_bytes(plan_template(), "생산계획"),
+            file_name="QA_월별생산계획.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            key="capa_dl_plan_xlsx",
         )
+        st.download_button(
+            "제품_기준정보 엑셀 (예시)",
+            data=xlsx_bytes(product_template(), "제품"),
+            file_name="제품_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="capa_dl_time_xlsx",
+        )
+        with st.expander("빈 양식 · CSV"):
+            st.download_button(
+                "월별 생산계획 빈 엑셀",
+                data=empty_xlsx_bytes(PLAN_COLUMNS, "생산계획"),
+                file_name="QA_월별생산계획_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="capa_dl_plan_empty",
+            )
+            st.download_button(
+                "제품_기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
+                file_name="제품_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="capa_dl_time_empty",
+            )
+            st.download_button(
+                "월별 생산계획 CSV (예시)",
+                data=csv_bytes(plan_template()),
+                file_name="QA_월별생산계획.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="capa_dl_plan_csv",
+            )
+            st.download_button(
+                "제품_기준정보 CSV (예시)",
+                data=csv_bytes(product_template()),
+                file_name="제품_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="capa_dl_time_csv",
+            )
+        if st.button("예시 데이터로 미리보기", use_container_width=True, key="capa_preview"):
+            st.session_state["capa_use_sample"] = True
+            st.rerun()
+        render_exit_ui(key_prefix="capa_")
 
-    c_left, c_right = st.columns(2)
-    with c_left:
-        _stacked_campus_chart("천안")
-    with c_right:
-        _stacked_campus_chart("아산")
+    saved_plan, saved_times, notes = _load_saved()
+    use_sample = bool(st.session_state.get("capa_use_sample"))
+    if use_sample:
+        plan_raw, time_raw = plan_template(), product_template()
+        st.info("예시 양식으로 미리보기 중입니다. 실제 계획이면 사이드바에서 업로드하세요.")
+    else:
+        plan_raw, time_raw = saved_plan, saved_times
 
-    other = [c for c in sorted(ts["캠퍼스"].unique()) if c not in CAMPUSES]
-    if other:
-        st.markdown("##### 기타 캠퍼스")
-        for oc in other:
-            _stacked_campus_chart(oc)
-
-    st.divider()
-    render_process_daily_avg(
-        filtered,
-        period_col="년월",
-        period_label="월",
-        split_campus=True,
+    result = calc_qa_capa(
+        plan_raw,
+        time_raw,
+        work_days=work_days,
+        day_hours=day_hours,
+        utilization_pct=util_pct,
+        owned_dim=owned_dim,
+        owned_hole=owned_hole,
     )
 
-    st.divider()
-    st.subheader("조별 주/야 차이")
-    st.caption("같은 조에서 주간·야간 실적·인당실적 차이를 봅니다.")
-
-    by_cts = summary_by(filtered, ["캠퍼스", "조", "주야"])
-    if by_cts.empty:
-        st.caption("표시할 데이터가 없습니다.")
+    if plan_raw.empty or time_raw.empty:
+        missing = []
+        if plan_raw.empty:
+            missing.append("월별 생산계획")
+        if time_raw.empty:
+            missing.append("제품_기준정보")
+        st.info(
+            "사이드바에서 **월별 생산계획**과 **제품_기준정보** 양식을 받아 올린 뒤 차트를 봅니다. "
+            "바로 보려면 **예시 데이터로 미리보기**를 누르세요. "
+            f"지금 없는 파일: {' · '.join(missing)}."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("##### 월별 생산계획")
+            st.dataframe(plan_template(), use_container_width=True, hide_index=True)
+            st.caption("가로형: 제품코드 + 1월~12월. 세로형(년도, 월, 제품코드, 필요수량)도 가능합니다.")
+        with c2:
+            st.markdown("##### 제품_기준정보")
+            st.dataframe(product_template(), use_container_width=True, hide_index=True)
+            st.caption("설비 운영 시뮬레이션과 같은 양식입니다. 치수·Hole의 매당_설비분이 1매 측정시간입니다. 홀은 CEL만 계산합니다.")
         return
 
-    st.dataframe(by_cts, use_container_width=True)
-    piv = by_cts.pivot_table(
-        index=["캠퍼스", "조"],
-        columns="주야",
-        values=["실적", "인당실적"],
-        aggfunc="sum",
-    )
-    if isinstance(piv.columns, pd.MultiIndex):
-        piv.columns = [f"{a}_{b}" for a, b in piv.columns]
-    piv = piv.reset_index()
-    if "인당실적_주" in piv.columns and "인당실적_야" in piv.columns:
-        piv["인당실적_주야차이"] = piv["인당실적_주"] - piv["인당실적_야"]
-    if "실적_주" in piv.columns and "실적_야" in piv.columns:
-        piv["실적_주야차이"] = piv["실적_주"] - piv["실적_야"]
-    st.markdown("##### 주 − 야 차이 (양수면 주간이 큼)")
-    st.dataframe(piv, use_container_width=True)
+    if result["monthly"].empty:
+        st.warning(
+            "생산계획과 측정시간의 제품코드가 맞지 않거나, 1월~12월 수량을 읽지 못했습니다. "
+            f"생산계획 열: {', '.join(str(c) for c in result.get('plan_columns') or []) or '(없음)'}"
+        )
+        if result["unmatched"]:
+            st.caption("측정시간이 없는 제품코드: " + ", ".join(result["unmatched"][:30]))
+        with st.expander("올린 파일 미리보기", expanded=True):
+            st.dataframe(plan_raw, use_container_width=True, hide_index=True)
+            st.dataframe(time_raw, use_container_width=True, hide_index=True)
+        return
 
-    for campus in [c for c in CAMPUSES if c in by_cts["캠퍼스"].unique()]:
-        sub = by_cts[by_cts["캠퍼스"] == campus]
-        chart = (
-            alt.Chart(sub)
-            .mark_bar()
-            .encode(
-                x=alt.X("조:N", sort=teams_all, title="조"),
-                y=alt.Y("실적:Q", title="실적"),
-                color=alt.Color(
-                    "주야:N",
-                    sort=list(SHIFTS),
-                    scale=alt.Scale(domain=list(SHIFTS)),
-                    title="주/야",
-                ),
-                xOffset=alt.XOffset("주야:N", sort=list(SHIFTS)),
-                tooltip=["캠퍼스", "조", "주야", "실적", "인당실적"],
-            )
-            .properties(height=300, title=f"{campus} · 조별 주/야 실적")
+    monthly = result["monthly"]
+    avail_min = float(result["machine_month_min"])
+
+    st.subheader("월별 치수 설비 필요대수")
+    st.caption(
+        f"필요대수 = ceil(치수 측정시간 합 ÷ 1대 월 가용 {avail_min:,.0f}분). "
+        f"피크 {result['peak_dim_label']} · {result['peak_dim_required']}대. "
+        "치수는 측정시간이 있는 전 제품입니다."
+    )
+    _count_chart(monthly, "치수_필요대수", "월별 치수 설비 필요대수", "#60a5fa")
+
+    st.subheader("월별 홀 설비 필요대수")
+    st.caption(
+        f"필요대수 = ceil(홀 측정시간 합 ÷ 1대 월 가용 {avail_min:,.0f}분). "
+        f"피크 {result['peak_hole_label']} · {result['peak_hole_required']}대. "
+        "홀은 CEL만 포함합니다."
+    )
+    _count_chart(monthly, "홀_필요대수", "월별 홀 설비 필요대수", "#fbbf24")
+
+    st.subheader("월별 가동율")
+    st.caption(
+        f"가동율 = 필요시간 ÷ (보유대수 × {avail_min:,.0f}분) × 100. "
+        f"치수 보유 {owned_dim}대 · 홀 보유 {owned_hole}대. 100%를 넘으면 보유 설비가 부족합니다."
+    )
+    _util_chart(monthly)
+
+    if result["unmatched"]:
+        st.warning("측정시간이 없어 빠진 제품코드: " + ", ".join(result["unmatched"]))
+    if result["hole_skipped"]:
+        st.caption("홀 계산에서 제외(CEL 아님): " + ", ".join(result["hole_skipped"]))
+    if result["unused_times"]:
+        st.caption("생산계획이 없는 측정시간 코드: " + ", ".join(result["unused_times"]))
+
+    show = monthly.copy()
+    for col in ("치수_생산수량", "홀_생산수량"):
+        show[col] = show[col].map(lambda v: f"{float(v):,.0f}")
+    for col in ("치수_필요시간_분", "홀_필요시간_분"):
+        show[col] = show[col].map(lambda v: f"{float(v):,.1f}")
+    for col in ("치수_이론필요대수", "홀_이론필요대수"):
+        show[col] = show[col].map(lambda v: f"{float(v):,.2f}")
+    for col in ("치수_가동율", "홀_가동율"):
+        show[col] = show[col].map(lambda v: "-" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{float(v):,.1f}")
+
+    with st.expander("월별 수치", expanded=False):
+        st.dataframe(
+            show[
+                [
+                    "월라벨",
+                    "치수_생산수량",
+                    "치수_필요시간_분",
+                    "치수_이론필요대수",
+                    "치수_필요대수",
+                    "치수_가동율",
+                    "홀_생산수량",
+                    "홀_필요시간_분",
+                    "홀_이론필요대수",
+                    "홀_필요대수",
+                    "홀_가동율",
+                ]
+            ].rename(
+                columns={
+                    "월라벨": "월",
+                    "치수_필요대수": "치수 필요대수",
+                    "홀_필요대수": "홀 필요대수",
+                    "치수_가동율": "치수 가동율(%)",
+                    "홀_가동율": "홀 가동율(%)",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
         )
-        st.altair_chart(chart, use_container_width=True)
-        chart2 = (
-            alt.Chart(sub)
-            .mark_bar()
-            .encode(
-                x=alt.X("조:N", sort=teams_all, title="조"),
-                y=alt.Y("인당실적:Q", title="인당실적"),
-                color=alt.Color(
-                    "주야:N",
-                    sort=list(SHIFTS),
-                    scale=alt.Scale(domain=list(SHIFTS)),
-                    title="주/야",
-                ),
-                xOffset=alt.XOffset("주야:N", sort=list(SHIFTS)),
-                tooltip=["캠퍼스", "조", "주야", "인력", "실적", "인당실적"],
-            )
-            .properties(height=300, title=f"{campus} · 조별 주/야 인당실적")
+        st.download_button(
+            "월별 결과 CSV",
+            data=monthly.to_csv(index=False).encode("utf-8-sig"),
+            file_name="QA_CAPA_월별.csv",
+            mime="text/csv",
+            key="capa_dl_monthly",
         )
-        st.altair_chart(chart2, use_container_width=True)
+
+    with st.expander("계산식 · 올린 파일"):
+        st.markdown(
+            f"""
+- 치수 필요시간(분) = Σ (월 생산수량 × 치수 공정 매당_설비분) — 전 제품
+- 홀 필요시간(분) = Σ (CEL 월 생산수량 × Hole 공정 매당_설비분)
+- 1대 월 가용 = {work_days:g} × {day_hours:g} × 60 × {util_pct:g}% = **{avail_min:,.0f}분**
+- 필요대수 = ceil(필요시간 ÷ 1대 월 가용)
+- 가동율(%) = 필요시간 ÷ (보유대수 × 1대 월 가용) × 100
+            """
+        )
+        for n in notes:
+            st.write("- ", n)
+        st.markdown("**월별 생산계획**")
+        st.dataframe(plan_raw, use_container_width=True, hide_index=True)
+        st.markdown("**제품_기준정보**")
+        st.dataframe(time_raw, use_container_width=True, hide_index=True)
