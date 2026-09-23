@@ -285,13 +285,18 @@ def calc_qa_capa(
     *,
     work_days: float = 20,
     day_hours: float = 24.0,
+    utilization_pct: float = 100.0,
     owned_dim: float = 0,
     owned_hole: float = 0,
 ) -> dict[str, Any]:
     """월별 치수·홀 필요대수와 가동율."""
     qty = normalize_qty(plan) if plan is not None else pd.DataFrame()
     meas = normalize_measure_times(times)
-    avail = machine_month_minutes(work_days=work_days, day_hours=day_hours, utilization_pct=100)
+    avail = machine_month_minutes(
+        work_days=work_days,
+        day_hours=day_hours,
+        utilization_pct=utilization_pct,
+    )
     empty_monthly = pd.DataFrame(
         columns=[
             "년도",
@@ -321,6 +326,7 @@ def calc_qa_capa(
         "time_columns": list(times.columns) if times is not None else [],
         "work_days": float(work_days),
         "day_hours": float(day_hours),
+        "utilization_pct": float(utilization_pct),
         "machine_month_min": avail,
         "owned_dim": float(owned_dim or 0),
         "owned_hole": float(owned_hole or 0),
