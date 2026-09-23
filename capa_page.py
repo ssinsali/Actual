@@ -11,9 +11,10 @@ from app_common import data_dir, render_exit_ui
 from auth import render_logout_controls
 from capa_engine import (
     PLAN_COLUMNS,
+    PRODUCT_STEM,
     QA_PLAN_STEM,
     QA_STEMS,
-    QA_TIME_STEM,
+    _LEGACY_TIME_STEM,
     calc_qa_capa,
     plan_template,
 )
@@ -41,13 +42,21 @@ def master_dir() -> Path:
 
 def _list_paths(stem: str | None = None) -> list[Path]:
     folder = master_dir()
-    stems = (stem,) if stem else QA_STEMS
+    stems = (stem,) if stem else (*QA_STEMS, _LEGACY_TIME_STEM)
     files: list[Path] = []
     for s in stems:
         files.extend(folder.glob(f"{s}*.csv"))
         files.extend(folder.glob(f"{s}*.xlsx"))
         files.extend(folder.glob(f"{s}*.xls"))
-    return [p for p in files if not p.name.startswith("~$")]
+    # 중복 경로 제거 (순서 유지)
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in files:
+        if p.name.startswith("~$") or str(p) in seen:
+            continue
+        seen.add(str(p))
+        uniq.append(p)
+    return uniq
 
 
 def _clear_files(stem: str | None = None) -> list[str]:
@@ -62,12 +71,20 @@ def _clear_files(stem: str | None = None) -> list[str]:
 
 
 def _save_upload(uploaded, prefix: str) -> Path:
-    """올린 파일만 이 페이지 계산에 쓴다. GitHub templates 로는 보내지 않는다."""
+    """올린 파일을 data/master 에 저장. 제품_기준정보는 설비 시뮬레이션과 같은 파일명을 쓴다."""
     name = canonical_master_name(uploaded.name, prefix)
     _clear_files(prefix)
+    if prefix == PRODUCT_STEM:
+        _clear_files(_LEGACY_TIME_STEM)
     dest = master_dir() / name
     dest.write_bytes(uploaded.getvalue())
     return dest
+
+
+def _product_path() -> Path | None:
+    """시뮬레이션과 공유하는 제품_기준정보. 예전 QA_제품측정시간도 허용."""
+    folder = master_dir()
+    return newest_matching(folder, PRODUCT_STEM) or newest_matching(folder, _LEGACY_TIME_STEM)
 
 
 def _owned_from_equipment() -> tuple[int, int, str]:
@@ -92,8 +109,10 @@ def _owned_from_equipment() -> tuple[int, int, str]:
 def _active_files() -> list[dict[str, str]]:
     folder = master_dir()
     rows: list[dict[str, str]] = []
-    for label, stem in (("월별 생산계획", QA_PLAN_STEM), ("제품_기준정보", QA_TIME_STEM)):
+    for label, stem in (("월별 생산계획", QA_PLAN_STEM), ("제품_기준정보", PRODUCT_STEM)):
         path = newest_matching(folder, stem)
+        if path is None and stem == PRODUCT_STEM:
+            path = newest_matching(folder, _LEGACY_TIME_STEM)
         if path is None:
             rows.append({"구분": label, "파일": "(없음)", "상태": "미등록"})
             continue
@@ -109,7 +128,7 @@ def _load_saved() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     folder = master_dir()
     notes: list[str] = []
     plan_path = newest_matching(folder, QA_PLAN_STEM)
-    time_path = newest_matching(folder, QA_TIME_STEM)
+    time_path = _product_path()
     plan = pd.DataFrame()
     times = pd.DataFrame()
     if plan_path:
@@ -117,7 +136,8 @@ def _load_saved() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
         notes.append(f"월별 생산계획: {plan_path.name} ({len(plan)}행)")
     if time_path:
         times = read_csv_table(time_path)
-        notes.append(f"제품_기준정보: {time_path.name} ({len(times)}행)")
+        shared = " · 설비 시뮬레이션과 공유" if time_path.name.startswith(PRODUCT_STEM) else " · 예전 CAPA 파일"
+        notes.append(f"제품_기준정보: {time_path.name} ({len(times)}행){shared}")
     return plan, times, notes
 
 
@@ -134,7 +154,10 @@ def _render_reset_ui() -> None:
             st.session_state[flag] = True
             st.rerun()
         return
-    st.warning("올려 둔 월별 생산계획·제품_기준정보 파일을 삭제합니다.")
+    st.warning(
+        "올려 둔 월별 생산계획을 삭제합니다. "
+        "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일이라, 여기서 지우면 시뮬레이션에도 없어집니다."
+    )
     st.caption("삭제 대상: " + ", ".join(p.name for p in files))
     yes, no = st.columns(2)
     with yes:
@@ -235,7 +258,8 @@ def render() -> None:
     st.title("QA그룹 CAPA 관리")
     st.caption(
         "월별 생산계획과 제품_기준정보로 치수·홀 설비 필요대수와 가동율을 계산합니다. "
-        "측정시간은 설비 운영 시뮬레이션과 같은 제품_기준정보(공정, 매당_설비분)를 씁니다. 홀은 CEL만 봅니다."
+        "제품_기준정보는 설비 운영 시뮬레이션과 **같은 파일·같은 양식**입니다. "
+        "시뮬레이션에 이미 올려 둔 제품_기준정보가 있으면 그대로 사용합니다. 홀은 CEL만 봅니다."
     )
 
     flash = st.session_state.pop("capa_flash", None)
@@ -309,9 +333,10 @@ def render() -> None:
         st.divider()
         st.header("파일 업로드")
         st.caption(
-            "월별 생산계획과 제품_기준정보를 직접 올리세요. "
-            "제품_기준정보는 설비 운영 시뮬레이션과 같은 양식입니다. "
-            "치수·Hole 행의 매당_설비분을 1매 측정시간으로 사용합니다."
+            "월별 생산계획은 이 페이지에서 올리세요. "
+            "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일입니다 "
+            "(이미 시뮬레이션에 있으면 다시 올릴 필요 없음). "
+            "치수·Hole 행의 매당_설비분이 1매 측정시간입니다."
         )
         st.dataframe(pd.DataFrame(_active_files()), use_container_width=True, hide_index=True)
         _render_reset_ui()
@@ -327,13 +352,14 @@ def render() -> None:
             st.session_state["capa_flash"] = f"생산계획 업로드: {path.name}"
             st.rerun()
         if time_up is not None and time_sig != st.session_state.get("capa_time_sig"):
-            path = _save_upload(time_up, QA_TIME_STEM)
+            path = _save_upload(time_up, PRODUCT_STEM)
             st.session_state["capa_time_sig"] = time_sig
             st.session_state["capa_use_sample"] = False
-            st.session_state["capa_flash"] = f"제품_기준정보 업로드: {path.name}"
+            st.session_state["capa_flash"] = f"제품_기준정보 업로드: {path.name} (설비 시뮬레이션과 공유)"
             st.rerun()
 
         st.subheader("양식 받기")
+        st.caption("제품_기준정보 양식은 설비 운영 시뮬레이션과 동일합니다.")
         st.download_button(
             "월별 생산계획 엑셀 (예시)",
             data=xlsx_bytes(plan_template(), "생산계획"),
