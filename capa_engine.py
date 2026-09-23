@@ -15,23 +15,17 @@ from typing import Any
 import pandas as pd
 
 from drill_engine import _code_key, _month_label, _parse_month_header, machine_month_minutes, normalize_qty
-from sim_engine import _infer_product_family, _norm, _rename_by_alias
+from sim_engine import _infer_product_family, _norm, _rename_by_alias, normalize_products
 
 QA_PLAN_STEM = "QA_월별생산계획"
-QA_TIME_STEM = "QA_제품측정시간"
-QA_STEMS = (QA_PLAN_STEM, QA_TIME_STEM)
+# 설비 운영 시뮬레이션과 동일한 제품 기준정보 파일명
+PRODUCT_STEM = "제품_기준정보"
+QA_STEMS = (QA_PLAN_STEM, PRODUCT_STEM)
+# 예전 CAPA 전용 파일명 (있으면 제품_기준정보 없을 때 fallback)
+_LEGACY_TIME_STEM = "QA_제품측정시간"
 
 PLAN_COLUMNS = ("제품코드", "제품명", *(f"{m}월" for m in range(1, 13)))
 TIME_COLUMNS = ("제품코드", "제품명", "제품군", "치수_측정분", "홀_측정분", "비고")
-
-_TIME_CODE_ALIASES = (
-    "제품코드",
-    "코드구분",
-    "품번",
-    "품목코드",
-    "item",
-    "code",
-)
 
 
 def _ceil_machines(value: float) -> int:
@@ -185,63 +179,55 @@ def _finish_measure(out: pd.DataFrame) -> pd.DataFrame:
     return work[list(TIME_COLUMNS)].reset_index(drop=True)
 
 
-def _measure_from_process_rows(work: pd.DataFrame) -> pd.DataFrame:
-    """제품_기준정보 세로형: 공정이 치수/Hole인 행의 매당_설비분."""
-    empty = pd.DataFrame(columns=list(TIME_COLUMNS))
-    if "제품코드" not in work.columns or "공정" not in work.columns:
-        return empty
-    tact = (
-        pd.to_numeric(work["매당_설비분"], errors="coerce")
-        if "매당_설비분" in work.columns
-        else pd.Series(0, index=work.index)
-    )
-    if "매당_인시분" in work.columns:
-        man = pd.to_numeric(work["매당_인시분"], errors="coerce")
-        tact = tact.where(tact.fillna(0) > 0, man)
-    scoped = work.copy()
-    scoped["_tact"] = pd.to_numeric(tact, errors="coerce").fillna(0)
-    scoped["공정키"] = scoped["공정"].map(_area_name)
-    scoped = scoped[scoped["공정키"].isin(["치수", "홀"])]
-    if scoped.empty:
-        return empty
-    rows: list[dict[str, Any]] = []
-    for code, sub in scoped.groupby(scoped["제품코드"].map(_code_key), sort=False):
-        if not code:
-            continue
-        dim = sub.loc[sub["공정키"] == "치수", "_tact"]
-        hole = sub.loc[sub["공정키"] == "홀", "_tact"]
-        name = next((_norm(x) for x in sub.get("제품명", pd.Series(dtype=str)).tolist() if _norm(x)), "")
-        fam = next((_norm(x) for x in sub.get("제품군", pd.Series(dtype=str)).tolist() if _norm(x)), "")
-        note = next((_norm(x) for x in sub.get("비고", pd.Series(dtype=str)).tolist() if _norm(x)), "")
-        rows.append(
-            {
-                "제품코드": code,
-                "제품명": name,
-                "제품군": fam,
-                "치수_측정분": _positive_mean(dim),
-                "홀_측정분": _positive_mean(hole),
-                "비고": note,
-            }
-        )
-    return _finish_measure(pd.DataFrame(rows))
-
-
 def normalize_measure_times(df: pd.DataFrame) -> pd.DataFrame:
-    """제품 측정시간을 제품코드 1행으로 맞춘다.
+    """제품_기준정보 → 제품코드별 치수·홀 측정분.
 
-    가로형: 제품코드, 치수_측정분, 홀_측정분
-    세로형: 설비 시뮬레이션 `제품_기준정보` (공정=치수/Hole, 매당_설비분)
+    설비 운영 시뮬레이션과 같은 `normalize_products`로 읽은 뒤
+    공정=치수 / Hole 행의 매당_설비분을 사용한다.
     """
     empty = pd.DataFrame(columns=list(TIME_COLUMNS))
     if df is None or df.empty:
         return empty
+
+    products = normalize_products(df)
+    if not products.empty and "공정" in products.columns:
+        work = products.copy()
+        work["공정키"] = work["공정"].map(_area_name)
+        work = work[work["공정키"].isin(["치수", "홀"])]
+        if not work.empty:
+            work["_tact"] = pd.to_numeric(work["매당_설비분"], errors="coerce").fillna(0)
+            man = pd.to_numeric(work["매당_인시분"], errors="coerce").fillna(0)
+            work.loc[work["_tact"] <= 0, "_tact"] = man
+            rows: list[dict[str, Any]] = []
+            for code, sub in work.groupby(work["제품코드"].map(_code_key), sort=False):
+                if not code:
+                    continue
+                dim = sub.loc[sub["공정키"] == "치수", "_tact"]
+                hole = sub.loc[sub["공정키"] == "홀", "_tact"]
+                name = next((_norm(x) for x in sub["제품명"].tolist() if _norm(x)), "")
+                fam = next((_norm(x) for x in sub["제품군"].tolist() if _norm(x)), "")
+                note = next((_norm(x) for x in sub["비고"].tolist() if _norm(x)), "") if "비고" in sub.columns else ""
+                rows.append(
+                    {
+                        "제품코드": code,
+                        "제품명": name,
+                        "제품군": fam,
+                        "치수_측정분": _positive_mean(dim),
+                        "홀_측정분": _positive_mean(hole),
+                        "비고": note,
+                    }
+                )
+            out = _finish_measure(pd.DataFrame(rows))
+            if not out.empty:
+                return out
+
+    # 구형 가로형(치수_측정분/홀_측정분)만 있을 때
     work = _rename_by_alias(
         _clean_frame(df),
         {
-            "제품코드": _TIME_CODE_ALIASES,
+            "제품코드": ("제품코드", "코드구분", "품번", "품목코드", "item", "code"),
             "제품명": ("제품명", "품명", "itemname", "name"),
             "제품군": ("제품군", "제품유형", "품종", "family", "type"),
-            "공정": ("공정", "영역", "공정명"),
             "치수_측정분": (
                 "치수_측정분",
                 "치수측정분",
@@ -261,15 +247,11 @@ def normalize_measure_times(df: pd.DataFrame) -> pd.DataFrame:
                 "Hole측정시간",
                 "매당_홀분",
             ),
-            "매당_설비분": ("매당_설비분", "매당설비분", "설비택트", "매당측정시간_분", "매당측정시간"),
-            "매당_인시분": ("매당_인시분", "매당인시분", "인시택트"),
             "비고": ("비고", "메모", "remark", "note"),
         },
     )
-    if "제품코드" not in work.columns:
+    if "제품코드" not in work.columns or not _has_wide_time_columns(df):
         return empty
-    if not _has_wide_time_columns(df) and "공정" in work.columns:
-        return _measure_from_process_rows(work)
     return _finish_measure(work)
 
 
