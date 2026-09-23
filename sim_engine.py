@@ -1,2102 +1,1355 @@
-"""설비·제품 기준정보와 1440분 운영 시뮬레이션."""
+"""설비 기준 운영 시뮬레이션 · 실적 시간 활용."""
 from __future__ import annotations
 
-import re
-from io import BytesIO
-from pathlib import Path
-from typing import Any
-
+import altair as alt
 import pandas as pd
+import streamlit as st
 
-from stats_engine import AREAS
-
-DAY_MINUTES = 1440
-# 3조 2교대: 기준정보의 인원은 전 조 합계 → 하루 근무인원 = 총인원 × (근무조/총조)
-DEFAULT_SHIFT_TEAMS = 3
-DEFAULT_WORKING_TEAMS = 2
-# 1인 1교대 권장 가용분 (12시간 기준). 설비 24시간 가동과는 별개.
-DEFAULT_SHIFT_MINUTES = 720
-MASTER_STEMS = ("설비_기준정보", "인력_기준정보", "제품_기준정보", "제품별_실적")
-MASTER_GH_FOLDERS = ("templates", "data/master", "data")
-
-EQUIP_COLUMNS = ("캠퍼스", "공정", "설비코드", "설비명", "대수", "가동여부", "비고")
-MANPOWER_COLUMNS = ("캠퍼스", "공정", "인원", "가용분", "가동여부", "비고")
-PRODUCT_COLUMNS = (
-    "제품코드",
-    "제품명",
-    "제품군",
-    "공정",
-    "제약유형",
-    "설비코드",
-    "매당_설비분",
-    "매당_인시분",
-    "필요인원",
-    "비고",
+from app_common import (
+    CAMPUSES,
+    apply_basic_filters,
+    data_dir,
+    load_records,
+    render_slicer,
+    team_stack_order,
 )
-PRODUCT_ACTUAL_COLUMNS = ("일자", "캠퍼스", "조", "주야", "제품코드", "공정", "인력", "실적")
-DEFAULT_MONTHLY_TARGETS = (("CEL", 700.0), ("Ring", 15000.0), ("Wafer", 3000.0))
-PLAN_PRODUCT_FAMILIES = tuple(k for k, _ in DEFAULT_MONTHLY_TARGETS)
-DEFAULT_WORK_DAYS = 20
-MONTHLY_PLAN_COLUMNS = ("제품코드", "월목표매수")
+from pathlib import Path
 
-_YES = {"y", "yes", "1", "true", "가동", "사용", "o", "ㅇ", "예"}
+from io import BytesIO
+
+from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
+from stats_engine import AREAS, SHIFTS, add_calendar_parts
+from sim_engine import (
+    DEFAULT_SHIFT_MINUTES,
+    DEFAULT_SHIFT_TEAMS,
+    DEFAULT_WORK_DAYS,
+    DEFAULT_WORKING_TEAMS,
+    EQUIP_COLUMNS,
+    MANPOWER_COLUMNS,
+    MASTER_STEMS,
+    MONTHLY_PLAN_COLUMNS,
+    PRODUCT_ACTUAL_COLUMNS,
+    PRODUCT_COLUMNS,
+    aggregate_wip,
+    canonical_master_name,
+    csv_bytes,
+    daily_optimal_from_wip_shipping,
+    daily_operation_plan,
+    effective_daily_headcount,
+    empty_csv_bytes,
+    empty_xlsx_bytes,
+    equipment_template,
+    floor_manager_daily_raw,
+    manpower_template,
+    master_github_paths,
+    monthly_plan_family_stats,
+    monthly_plan_feasibility,
+    monthly_plan_template,
+    newest_matching,
+    normalize_equipment,
+    normalize_manpower,
+    normalize_monthly_plan,
+    normalize_product_actuals,
+    normalize_products,
+    normalize_shipping_urgent,
+    normalize_wip,
+    area_by_process_code,
+    process_name_matches_area,
+    route_code_bounds,
+    process_standard_times,
+    product_actual_template,
+    product_template,
+    read_csv_table,
+    read_shipping_excel,
+    read_wip_excel,
+    running_manpower,
+    running_qty,
+    shipping_date_options,
+    xlsx_bytes,
+    utilization_from_actuals,
+)
 
 
-def _norm(v: Any) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
-    return str(v).strip()
+def _daily_avg_from_family_stats(stats: pd.DataFrame, work_days: float) -> dict[str, float]:
+    """계획 요약 → 일평균.
 
-
-_BLANK_CODES = {
-    "",
-    "-",
-    "--",
-    "—",
-    "–",
-    ".",
-    "/",
-    "x",
-    "없음",
-    "무",
-    "n/a",
-    "na",
-    "none",
-    "null",
-}
-
-
-def _code_or_blank(v: Any) -> str:
-    """설비코드 '-', 없음 등은 빈 값으로 취급."""
-    t = _norm(v)
-    if t.lower().replace(" ", "") in _BLANK_CODES:
-        return ""
-    return t
-
-
-def effective_daily_headcount(
-    total_people: float,
-    *,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> float:
-    """총인원(전 조 합) → 하루 실제 근무 가능 인원.
-
-    3조 2교대: 하루 2개조 근무·1개조 휴무 → 총인원 × 2/3.
+    치수: CEL·Ring·Wafer 전부 / Hole: CEL만 / 외관: 전체.
     """
-    people = float(total_people or 0)
-    teams = int(shift_teams or 0)
-    working = int(working_teams or 0)
-    if people <= 0:
-        return 0.0
-    if teams <= 0 or working <= 0:
-        return people
-    if working >= teams:
-        return people
-    return people * working / teams
-
-
-def headcount_factor(
-    *,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> float:
-    teams = int(shift_teams or 0)
-    working = int(working_teams or 0)
-    if teams <= 0 or working <= 0:
-        return 1.0
-    if working >= teams:
-        return 1.0
-    return working / teams
-
-
-def _is_running(v: Any) -> bool:
-    t = _norm(v).lower().replace(" ", "")
-    if not t:
-        return True
-    return t in _YES
-
-
-def _num(v: Any, default: float = 0.0) -> float:
-    try:
-        if v is None or (isinstance(v, float) and pd.isna(v)) or v == "":
-            return default
-        return float(str(v).replace(",", "").strip())
-    except (TypeError, ValueError):
-        return default
-
-
-def equipment_template() -> pd.DataFrame:
-    """설비 공정만 예시. 외관처럼 사람만 하는 공정은 인력_기준정보에 넣습니다."""
-    rows = []
-    samples = [
-        ("천안", "종합측정실", "CMM-01", "3차원측정기", 1),
-        ("천안", "치수", "DIM-01", "2.5D 치수기", 2),
-        ("천안", "Hole", "HOLE-01", "홀검사기", 1),
-        ("아산", "종합측정실", "CMM-A1", "3차원측정기", 1),
-        ("아산", "치수", "DIM-A1", "2.5D 치수기", 1),
-        ("아산", "Hole", "HOLE-A1", "홀검사기", 1),
-    ]
-    for campus, area, code, name, qty in samples:
-        rows.append(
-            {
-                "캠퍼스": campus,
-                "공정": area,
-                "설비코드": code,
-                "설비명": name,
-                "대수": qty,
-                "가동여부": "Y",
-                "비고": "",
-            }
-        )
-    return pd.DataFrame(rows, columns=list(EQUIP_COLUMNS))
-
-
-def manpower_template() -> pd.DataFrame:
-    """인력 기준 — 전 공정. 인원=3개조 합계, 계산 시 ×(2/3), 가용분=1인 1교대 분."""
-    rows = []
-    samples = {
-        "천안": {"종합측정실": 3, "치수": 6, "Hole": 4, "외관": 4},
-        "아산": {"종합측정실": 2, "치수": 3, "Hole": 2, "외관": 2},
-    }
-    for campus, areas in samples.items():
-        for area, people in areas.items():
-            rows.append(
-                {
-                    "캠퍼스": campus,
-                    "공정": area,
-                    "인원": people,
-                    "가용분": DEFAULT_SHIFT_MINUTES,
-                    "가동여부": "Y",
-                    "비고": "인원=전조합계 (3조2교대 → 근무인원 ×2/3)",
-                }
-            )
-    return pd.DataFrame(rows, columns=list(MANPOWER_COLUMNS))
-
-
-def product_template() -> pd.DataFrame:
-    specs = [
-        ("P-CEL", "CEL", "CEL", {"종합측정실": 4.0, "치수": 0.9, "Hole": 2.4, "외관": 1.6}),
-        ("P-RING", "Ring", "Ring", {"종합측정실": 5.2, "치수": 1.1, "Hole": 3.0, "외관": 1.8}),
-        ("P-WAFER", "Wafer", "Wafer", {"종합측정실": 3.5, "치수": 0.7, "Hole": 2.0, "외관": 1.3}),
-    ]
-    equip = {
-        "종합측정실": ("설비", "CMM-01"),
-        "치수": ("설비", "DIM-01"),
-        "Hole": ("설비", "HOLE-01"),
-        "외관": ("인력", ""),
-    }
-    rows = []
-    for code, name, family, times in specs:
-        for area in AREAS:
-            t = times[area]
-            kind, eq = equip[area]
-            rows.append(
-                {
-                    "제품코드": code,
-                    "제품명": name,
-                    "제품군": family,
-                    "공정": area,
-                    "제약유형": kind,
-                    "설비코드": eq,
-                    "매당_설비분": t if kind == "설비" else 0,
-                    "매당_인시분": t,
-                    "필요인원": 1,
-                    "비고": "예시 - 자사 택트로 수정" if kind == "설비" else "외관: 인력 기준",
-                }
-            )
-    return pd.DataFrame(rows, columns=list(PRODUCT_COLUMNS))
-
-
-def product_actual_template() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "일자": "2026-04-01",
-                "캠퍼스": "천안",
-                "조": "A",
-                "주야": "주",
-                "제품코드": "P-A",
-                "공정": "치수",
-                "인력": 2,
-                "실적": 625,
-            }
-        ],
-        columns=list(PRODUCT_ACTUAL_COLUMNS),
-    )
-
-
-def csv_bytes(df: pd.DataFrame) -> bytes:
-    """엑셀이 한글을 읽도록 UTF-8 BOM을 붙인다."""
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-def empty_csv_bytes(columns: tuple[str, ...]) -> bytes:
-    return pd.DataFrame(columns=list(columns)).to_csv(index=False).encode("utf-8-sig")
-
-
-def xlsx_bytes(df: pd.DataFrame, sheet: str = "기준정보") -> bytes:
-    """엑셀에서 한글이 깨지지 않는 양식."""
-    from io import BytesIO
-
-    buf = BytesIO()
-    work = df.copy()
-    if work.empty and list(work.columns):
-        work = pd.DataFrame(columns=list(work.columns))
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        work.to_excel(writer, index=False, sheet_name=sheet[:31] or "기준정보")
-    return buf.getvalue()
-
-
-def empty_xlsx_bytes(columns: tuple[str, ...], sheet: str = "기준정보") -> bytes:
-    return xlsx_bytes(pd.DataFrame(columns=list(columns)), sheet=sheet)
-
-
-def _rename_by_alias(df: pd.DataFrame, aliases: dict[str, tuple[str, ...]]) -> pd.DataFrame:
-    mapping: dict[str, str] = {}
-    used: set[str] = set()
-    for col in df.columns:
-        key = str(col).strip().replace(" ", "").replace("_", "").lower()
-        for dest, opts in aliases.items():
-            if dest in used:
-                continue
-            for opt in opts:
-                if key == opt.replace(" ", "").replace("_", "").lower():
-                    mapping[col] = dest
-                    used.add(dest)
-                    break
-    return df.rename(columns=mapping)
-
-
-def normalize_equipment(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=list(EQUIP_COLUMNS) + ["가동"])
-    work = _rename_by_alias(
-        df.dropna(how="all").copy(),
-        {
-            "캠퍼스": ("캠퍼스", "campus", "공장"),
-            "공정": ("공정", "영역", "공정명"),
-            "설비코드": ("설비코드", "설비id", "코드"),
-            "설비명": ("설비명", "설비이름", "설비"),
-            "대수": ("대수", "수량", "보유대수"),
-            "가동여부": ("가동여부", "상태", "사용"),
-            "비고": ("비고", "메모"),
-        },
-    )
-    for c in EQUIP_COLUMNS:
-        if c not in work.columns:
-            work[c] = "" if c != "대수" else 0
-    work["캠퍼스"] = work["캠퍼스"].map(_norm)
-    work["공정"] = work["공정"].map(_norm)
-    work["설비코드"] = work["설비코드"].map(_norm)
-    work["설비명"] = work["설비명"].map(_norm)
-    work["대수"] = work["대수"].map(lambda v: _num(v, 0))
-    work["가동"] = work["가동여부"].map(_is_running)
-    work = work[work["공정"] != ""]
-    work = work[work["대수"] > 0]
-    return work.reset_index(drop=True)
-
-
-def normalize_manpower(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=list(MANPOWER_COLUMNS) + ["가동"])
-    work = _rename_by_alias(
-        df.dropna(how="all").copy(),
-        {
-            "캠퍼스": ("캠퍼스", "campus", "공장"),
-            "공정": ("공정", "영역", "공정명"),
-            "인원": ("인원", "인력", "보유인원", "명수"),
-            "가용분": ("가용분", "분", "가용시간분", "근무분"),
-            "가동여부": ("가동여부", "상태", "사용"),
-            "비고": ("비고", "메모"),
-        },
-    )
-    for c in MANPOWER_COLUMNS:
-        if c not in work.columns:
-            work[c] = DEFAULT_SHIFT_MINUTES if c == "가용분" else ("" if c not in ("인원",) else 0)
-    work["캠퍼스"] = work["캠퍼스"].map(_norm)
-    work["공정"] = work["공정"].map(_norm)
-    work["인원"] = work["인원"].map(lambda v: _num(v, 0))
-    work["가용분"] = work["가용분"].map(lambda v: _num(v, DEFAULT_SHIFT_MINUTES) or DEFAULT_SHIFT_MINUTES)
-    work["가동"] = work["가동여부"].map(_is_running)
-    work = work[(work["공정"] != "") & (work["인원"] > 0)]
-    return work.reset_index(drop=True)
-
-
-def _infer_product_family(name: Any) -> str:
-    """제품명/제품군에서 CEL·Ring·Wafer 등을 정규화."""
-    t = _norm(name)
-    if not t:
-        return ""
-    u = t.upper().replace(" ", "")
-    if "WAFER" in u or "웨이퍼" in t:
-        return "Wafer"
-    if "RING" in u or "링" == t:
-        return "Ring"
-    if "CEL" in u:
-        return "CEL"
-    return t
-
-
-def normalize_products(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=list(PRODUCT_COLUMNS))
-    work = _rename_by_alias(
-        df.dropna(how="all").copy(),
-        {
-            "제품코드": ("제품코드", "품번", "item"),
-            "제품명": ("제품명", "품명"),
-            "제품군": ("제품군", "제품유형", "품종", "family", "type"),
-            "공정": ("공정", "영역"),
-            "제약유형": ("제약유형", "유형", "기준유형", "타입"),
-            "설비코드": ("설비코드", "설비id"),
-            "매당_설비분": ("매당설비분", "설비택트", "ct", "분매", "cycle"),
-            "매당_인시분": ("매당인시분", "인시택트", "공수", "인당분"),
-            "필요인원": ("필요인원", "인원"),
-            "비고": ("비고", "메모"),
-        },
-    )
-    for c in PRODUCT_COLUMNS:
-        if c not in work.columns:
-            work[c] = "" if c not in ("매당_설비분", "매당_인시분", "필요인원") else 0
-    work["제품코드"] = work["제품코드"].map(_norm)
-    work["제품명"] = work["제품명"].map(_norm)
-    work["제품군"] = work["제품군"].map(_norm)
-    work.loc[work["제품군"] == "", "제품군"] = work["제품명"]
-    work["제품군"] = work["제품군"].map(_infer_product_family)
-    work["공정"] = work["공정"].map(_norm)
-    work["설비코드"] = work["설비코드"].map(_code_or_blank)
-    work["제약유형"] = work["제약유형"].map(_norm)
-    work["매당_설비분"] = work["매당_설비분"].map(lambda v: _num(v, 0))
-    work["매당_인시분"] = work["매당_인시분"].map(lambda v: _num(v, 0))
-    work["필요인원"] = work["필요인원"].map(lambda v: _num(v, 1) or 1)
-    work.loc[work["매당_인시분"] <= 0, "매당_인시분"] = work["매당_설비분"]
-    # 제약유형 비어 있으면 자동 판별
-    # (외관처럼 설비코드='-'·설비분 공란·인시분만 있는 행은 인력)
-    empty_kind = work["제약유형"] == ""
-    man_like = (work["매당_설비분"] <= 0) & (work["매당_인시분"] > 0)
-    eq_like = (work["매당_설비분"] > 0) | (work["설비코드"] != "")
-    work.loc[empty_kind & work["공정"].str.contains("외관", na=False), "제약유형"] = "인력"
-    work.loc[empty_kind & (work["제약유형"] == "") & man_like, "제약유형"] = "인력"
-    work.loc[empty_kind & (work["제약유형"] == "") & eq_like, "제약유형"] = "설비"
-    work.loc[empty_kind & (work["제약유형"] == ""), "제약유형"] = "인력"
-    work["제약유형"] = work["제약유형"].map(
-        lambda x: "인력" if ("인력" in str(x) or "사람" in str(x) or "수작업" in str(x)) else "설비"
-    )
-    # 설비 공정은 설비분, 인력 공정은 인시분 필수
-    ok_eq = (work["제약유형"] == "설비") & (work["매당_설비분"] > 0)
-    ok_man = (work["제약유형"] == "인력") & (work["매당_인시분"] > 0)
-    work = work[(work["제품코드"] != "") & (work["공정"] != "") & (ok_eq | ok_man)]
-    return work.reset_index(drop=True)
-
-
-def _equip_slice(
-    equip: pd.DataFrame,
-    *,
-    campus: str | None,
-    area: str,
-    equip_code: str = "",
-) -> pd.DataFrame:
-    if equip is None or equip.empty:
-        return pd.DataFrame()
-    work = equip[equip["가동"]].copy()
-    if campus:
-        work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
-    work = work[work["공정"] == area]
-    if equip_code:
-        hit = work[work["설비코드"] == equip_code]
-        if not hit.empty:
-            return hit
-    return work
-
-
-def running_qty(equip: pd.DataFrame, *, campus: str | None, area: str, equip_code: str = "") -> float:
-    """가동 대수. 설비코드가 있으면 우선 매칭, 없으면(또는 미스) 해당 공정 전체 합."""
-    work = _equip_slice(equip, campus=campus, area=area, equip_code=equip_code)
-    if work.empty:
-        return 0.0
-    # 코드 지정인데 매칭 실패 시 _equip_slice가 공정 전체로 떨어진 경우도 합산
-    if equip_code:
-        exact = work[work["설비코드"] == equip_code]
-        if not exact.empty:
-            work = exact
-    return float(work["대수"].sum()) if not work.empty else 0.0
-
-
-def running_manpower(
-    manpower: pd.DataFrame,
-    *,
-    campus: str | None,
-    area: str,
-) -> tuple[float, float]:
-    """(인원 합, 인원가중 평균 가용분). 인력_기준정보 기준 — 전 공정 공통."""
-    if manpower is None or manpower.empty:
-        return 0.0, float(DEFAULT_SHIFT_MINUTES)
-    work = manpower[manpower["가동"]].copy()
-    if campus:
-        work = work[(work["캠퍼스"] == campus) | (work["캠퍼스"] == "")]
-    work = work[work["공정"] == area]
-    if work.empty:
-        return 0.0, float(DEFAULT_SHIFT_MINUTES)
-    people = float(work["인원"].sum())
-    avail = float((work["인원"] * work["가용분"]).sum() / people) if people else float(DEFAULT_SHIFT_MINUTES)
-    return people, avail
-
-
-def _spec_tact(specs: pd.DataFrame, equip_code: str) -> tuple[float, float]:
-    """제품 기준에서 설비코드 택트. 없으면 공정 평균."""
-    if specs is None or specs.empty:
-        return 0.0, 0.0
-    code = _norm(equip_code)
-    if code:
-        hit = specs[specs["설비코드"].map(_norm) == code]
-        if not hit.empty:
-            r = hit.iloc[0]
-            eq_t = float(r["매당_설비분"] or 0)
-            man_t = float(r["매당_인시분"] or 0) or eq_t
-            return eq_t, man_t
-    eq_t = float(pd.to_numeric(specs["매당_설비분"], errors="coerce").replace(0, pd.NA).mean() or 0)
-    man_t = float(pd.to_numeric(specs["매당_인시분"], errors="coerce").replace(0, pd.NA).mean() or 0) or eq_t
-    if eq_t <= 0:
-        eq_t = man_t
-    return eq_t, man_t
-
-
-def daily_capacity(
-    products: pd.DataFrame,
-    equip: pd.DataFrame,
-    *,
-    campus: str | None = None,
-    day_minutes: float = DAY_MINUTES,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> pd.DataFrame:
-    """제품×공정 일 능력.
-
-    - 총인원/근무인원: 인력_기준정보의 **캠퍼스+공정** 단위 (설비코드별 배분 없음)
-      같은 공정의 설비 여러 대여도 인원은 공정 공유 → 표에서는 첫 설비 행에만 표시
-    - 설비: 설비_기준정보의 해당 공정 가동 설비를 캠퍼스별로 펼침 (일가능매수는 설비별)
-    - 인력 공정: 근무인원 × 가용분 ÷ 매당_인시분
-    """
-    if products.empty:
-        return pd.DataFrame()
-    man = manpower if manpower is not None else pd.DataFrame()
-    eq = equip if equip is not None else pd.DataFrame()
-    factor = headcount_factor(shift_teams=shift_teams, working_teams=working_teams)
-    rows: list[dict[str, Any]] = []
-
-    for code in products["제품코드"].map(_norm).unique():
-        if not code:
-            continue
-        psub = products[products["제품코드"].map(_norm) == code]
-        pname = _norm(psub["제품명"].iloc[0]) if "제품명" in psub.columns else code
-        for area in psub["공정"].map(_norm).unique():
-            if not area:
-                continue
-            specs = psub[psub["공정"].map(_norm) == area]
-            kind0 = _norm(specs["제약유형"].iloc[0]) if "제약유형" in specs.columns else "설비"
-            eq_work = _equip_slice(eq, campus=campus, area=area, equip_code="")
-            man_probe, _ = running_manpower(man, campus=campus, area=area)
-            use_man = kind0 == "인력" or (eq_work.empty and man_probe > 0)
-
-            if use_man:
-                _, man_tact = _spec_tact(specs, "")
-                if man_tact <= 0:
-                    man_tact = float(specs["매당_인시분"].iloc[0] or 0)
-                # 캠퍼스별 인력 행으로 펼침 (Total일 때 합산 한 줄로 뭉개지 않음)
-                if campus:
-                    man_campuses: list[str | None] = [campus]
-                elif not man.empty and "캠퍼스" in man.columns:
-                    hit = man[man["가동"] & (man["공정"].map(_norm) == area)] if "가동" in man.columns else man[man["공정"].map(_norm) == area]
-                    man_campuses = sorted({_norm(c) for c in hit["캠퍼스"].tolist() if _norm(c)})
-                    if not man_campuses:
-                        man_campuses = [None]
-                else:
-                    man_campuses = [None]
-                for mc in man_campuses:
-                    man_total, man_avail = running_manpower(man, campus=mc, area=area)
-                    man_qty = effective_daily_headcount(
-                        man_total, shift_teams=shift_teams, working_teams=working_teams
-                    )
-                    if man_qty <= 0 and man_total <= 0:
-                        continue
-                    minutes = man_avail if man_avail else DEFAULT_SHIFT_MINUTES
-                    sheets = round(man_qty * minutes / man_tact, 1) if man_tact > 0 else 0.0
-                    rows.append(
-                        {
-                            "제품코드": code,
-                            "제품명": pname,
-                            "공정": area,
-                            "캠퍼스": mc or "합산",
-                            "제약유형": "인력",
-                            "설비코드": "",
-                            "가동대수": 0.0,
-                            "총인원": round(man_total, 1),
-                            "근무인원": round(man_qty, 1),
-                            "조보정": round(factor, 4),
-                            "가용분": round(minutes, 1),
-                            "매당_설비분": float(specs["매당_설비분"].iloc[0] or 0),
-                            "매당_인시분": man_tact,
-                            "필요인원": round(man_qty, 1),
-                            "일가능매수": sheets,
-                        }
-                    )
-                continue
-
-            default_eq, default_man = _spec_tact(specs, "")
-            # 공정 인력은 설비와 무관하게 1회만 조회
-            seen_man_keys: set[tuple[str, str]] = set()
-            for _, eqr in eq_work.iterrows():
-                eq_code = _norm(eqr.get("설비코드"))
-                eq_tact, man_tact = _spec_tact(specs, eq_code)
-                if eq_tact <= 0:
-                    eq_tact = default_eq
-                if man_tact <= 0:
-                    man_tact = default_man or eq_tact
-                qty = float(eqr.get("대수") or 0)
-                row_campus = _norm(eqr.get("캠퍼스")) or campus
-                man_key = (row_campus or "", area)
-                show_man = man_key not in seen_man_keys
-                if show_man:
-                    seen_man_keys.add(man_key)
-                    man_total, _man_avail = running_manpower(
-                        man, campus=row_campus if row_campus else None, area=area
-                    )
-                    man_qty = effective_daily_headcount(
-                        man_total, shift_teams=shift_teams, working_teams=working_teams
-                    )
-                else:
-                    man_total, man_qty = float("nan"), float("nan")
-                sheets = round(qty * day_minutes / eq_tact, 1) if eq_tact > 0 else 0.0
-                need = round(qty * float(specs["필요인원"].iloc[0] or 1), 1)
-                rows.append(
-                    {
-                        "제품코드": code,
-                        "제품명": pname,
-                        "공정": area,
-                        "캠퍼스": row_campus or (campus or ""),
-                        "제약유형": "설비",
-                        "설비코드": eq_code,
-                        "가동대수": qty,
-                        "총인원": round(man_total, 1) if show_man else pd.NA,
-                        "근무인원": round(man_qty, 1) if show_man else pd.NA,
-                        "조보정": round(factor, 4) if show_man else pd.NA,
-                        "가용분": round(day_minutes, 1),
-                        "매당_설비분": eq_tact,
-                        "매당_인시분": man_tact,
-                        "필요인원": need,
-                        "일가능매수": sheets,
-                    }
-                )
-
-    out = pd.DataFrame(rows)
-    return out
-
-
-def mix_simulation(
-    products: pd.DataFrame,
-    equip: pd.DataFrame,
-    mix: pd.DataFrame,
-    *,
-    campus: str | None = None,
-    day_minutes: float = DAY_MINUTES,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> pd.DataFrame:
-    """제품 비중으로 설비·인력 가용분을 나눠 일 가능 매수를 계산."""
-    if products.empty or mix is None or mix.empty:
-        return pd.DataFrame()
-    work = mix.copy()
-    if "제품코드" not in work.columns or "비중" not in work.columns:
-        return pd.DataFrame()
-    man = manpower if manpower is not None else pd.DataFrame()
-    work["비중"] = pd.to_numeric(work["비중"], errors="coerce").fillna(0)
-    total = float(work["비중"].sum())
-    if total <= 0:
-        return pd.DataFrame()
-    work["비중"] = work["비중"] / total
-    rows = []
-    for area in AREAS:
-        eq_qty = running_qty(equip, campus=campus, area=area, equip_code="")
-        man_total, man_avail = running_manpower(man, campus=campus, area=area)
-        man_qty = effective_daily_headcount(
-            man_total, shift_teams=shift_teams, working_teams=working_teams
-        )
-        for _, m in work.iterrows():
-            code = _norm(m["제품코드"])
-            spec = products[(products["제품코드"] == code) & (products["공정"] == area)]
-            if spec.empty:
-                continue
-            row = spec.iloc[0]
-            kind = str(row.get("제약유형") or "설비")
-            eq_tact = float(row["매당_설비분"])
-            man_tact = float(row["매당_인시분"]) or eq_tact
-            use_man = kind == "인력" or (eq_qty <= 0 and man_qty > 0 and man_tact > 0)
-            if use_man:
-                minutes_total = man_qty * (man_avail or day_minutes)
-                tact = man_tact
-                mode = "인력"
-                resource = man_qty
-            else:
-                minutes_total = eq_qty * day_minutes
-                tact = eq_tact if eq_tact > 0 else man_tact
-                mode = "설비"
-                resource = eq_qty
-            mins = minutes_total * float(m["비중"])
-            sheets = round(mins / tact, 1) if tact > 0 else 0.0
-            rows.append(
-                {
-                    "제품코드": code,
-                    "제품명": row["제품명"],
-                    "공정": area,
-                    "제약유형": mode,
-                    "배분분": round(mins, 1),
-                    "매당분": tact,
-                    "일가능매수": sheets,
-                    "자원수": resource,
-                    "총인원": round(man_total, 1),
-                    "근무인원": round(man_qty, 1),
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def default_monthly_targets(products: pd.DataFrame | None = None) -> pd.DataFrame:
-    """월 목표 기본: CEL 700 / Ring 15000 / Wafer 3000."""
-    rows = [{"제품군": k, "월목표매수": float(v)} for k, v in DEFAULT_MONTHLY_TARGETS]
-    if products is not None and not products.empty:
-        col = "제품군" if "제품군" in products.columns else "제품명"
-        found = {_infer_product_family(x) for x in products[col].tolist()}
-        for fam in sorted(found):
-            if fam and fam not in {r["제품군"] for r in rows}:
-                rows.append({"제품군": fam, "월목표매수": 0.0})
-    return pd.DataFrame(rows)
-
-
-def _family_process_spec(products: pd.DataFrame, family: str, area: str) -> dict[str, Any] | None:
-    """제품군×공정의 대표 택트(평균)."""
-    if products.empty:
-        return None
-    fam_col = "제품군" if "제품군" in products.columns else "제품명"
-    fam_key = _infer_product_family(family)
-    sub = products[
-        (products[fam_col].map(_infer_product_family) == fam_key)
-        & (products["공정"].map(_norm) == area)
-    ]
-    if sub.empty:
-        return None
-    kind = "인력" if (sub["제약유형"].map(_norm) == "인력").mean() >= 0.5 else "설비"
-    eq_tact = float(pd.to_numeric(sub["매당_설비분"], errors="coerce").replace(0, pd.NA).mean() or 0)
-    man_tact = float(pd.to_numeric(sub["매당_인시분"], errors="coerce").replace(0, pd.NA).mean() or 0)
-    if man_tact <= 0:
-        man_tact = eq_tact
-    if eq_tact <= 0:
-        eq_tact = man_tact
+    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
+    by: dict[str, float] = {}
+    if stats is not None and not stats.empty:
+        for _, row in stats.iterrows():
+            by[str(row["구분"])] = float(row["월목표합계"])
+    cel = by.get("CEL", 0.0)
+    ring = by.get("Ring", 0.0)
+    wafer = by.get("Wafer", 0.0)
+    total = by.get("합계", 0.0)
     return {
-        "제품군": _norm(family),
-        "공정": area,
-        "제약유형": kind,
-        "매당_설비분": eq_tact,
-        "매당_인시분": man_tact,
-        "품목수": int(sub["제품코드"].nunique()),
-    }
-
-
-def monthly_mix_feasibility(
-    products: pd.DataFrame,
-    equip: pd.DataFrame,
-    targets: pd.DataFrame,
-    *,
-    campus: str | None = None,
-    work_days: float = DEFAULT_WORK_DAYS,
-    day_minutes: float = DAY_MINUTES,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """제품군 월 목표 믹스가 현재 설비·인력으로 가능한지 계산.
-
-    반환: (공정별 상세, 제품군 요약)
-    - 일목표 = 월목표 ÷ 작업일수
-    - 필요분 = 일목표 × 택트 (제품군 평균)
-    - 가용분을 필요분 비중으로 나눠 일가능매수 산출
-    - 월가능매수 = 일가능매수 × 작업일수
-    """
-    empty_detail = pd.DataFrame()
-    empty_sum = pd.DataFrame()
-    if products.empty or targets is None or targets.empty:
-        return empty_detail, empty_sum
-    work = targets.copy()
-    if "제품군" not in work.columns:
-        return empty_detail, empty_sum
-    qty_col = "월목표매수" if "월목표매수" in work.columns else ("목표" if "목표" in work.columns else "")
-    if not qty_col:
-        return empty_detail, empty_sum
-    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
-    work["제품군"] = work["제품군"].map(_norm)
-    work["월목표매수"] = pd.to_numeric(work[qty_col], errors="coerce").fillna(0)
-    work = work[work["제품군"] != ""]
-    work = work[work["월목표매수"] > 0]
-    if work.empty:
-        return empty_detail, empty_sum
-    work["일목표매수"] = (work["월목표매수"] / days).round(2)
-    man = manpower if manpower is not None else pd.DataFrame()
-
-    detail_rows: list[dict[str, Any]] = []
-    for area in AREAS:
-        eq_qty = running_qty(equip, campus=campus, area=area, equip_code="")
-        man_total, man_avail = running_manpower(man, campus=campus, area=area)
-        man_qty = effective_daily_headcount(
-            man_total, shift_teams=shift_teams, working_teams=working_teams
-        )
-        needs: list[dict[str, Any]] = []
-        for _, t in work.iterrows():
-            fam = str(t["제품군"])
-            spec = _family_process_spec(products, fam, area)
-            if spec is None:
-                continue
-            kind = spec["제약유형"]
-            use_man = kind == "인력" or (eq_qty <= 0 and man_qty > 0 and spec["매당_인시분"] > 0)
-            tact = float(spec["매당_인시분"] if use_man else spec["매당_설비분"]) or float(spec["매당_인시분"])
-            if tact <= 0:
-                continue
-            daily = float(t["일목표매수"])
-            need_min = daily * tact
-            needs.append(
-                {
-                    "제품군": fam,
-                    "공정": area,
-                    "제약유형": "인력" if use_man else "설비",
-                    "품목수": spec["품목수"],
-                    "월목표매수": float(t["월목표매수"]),
-                    "일목표매수": daily,
-                    "매당분": round(tact, 4),
-                    "필요분": round(need_min, 1),
-                    "use_man": use_man,
-                }
-            )
-        if not needs:
-            continue
-        use_man_area = all(n["use_man"] for n in needs)
-        if use_man_area:
-            avail = man_qty * (man_avail or day_minutes)
-            resource = man_qty
-            mode = "인력"
-        else:
-            # 설비 공정: 설비 시간 기준 (혼합이면 설비 우선)
-            if any(not n["use_man"] for n in needs):
-                avail = eq_qty * day_minutes
-                resource = eq_qty
-                mode = "설비"
-                needs = [n for n in needs if not n["use_man"]] or needs
-            else:
-                avail = man_qty * (man_avail or day_minutes)
-                resource = man_qty
-                mode = "인력"
-        need_sum = sum(n["필요분"] for n in needs) or 1.0
-        proc_load = round(need_sum / avail * 100, 1) if avail > 0 else None
-        for n in needs:
-            share = n["필요분"] / need_sum
-            alloc = avail * share
-            daily_cap = round(alloc / n["매당분"], 1) if n["매당분"] > 0 else 0.0
-            month_cap = round(daily_cap * days, 1)
-            meet = month_cap + 1e-6 >= n["월목표매수"]
-            detail_rows.append(
-                {
-                    "제품군": n["제품군"],
-                    "공정": area,
-                    "제약유형": "인력" if n["use_man"] else "설비",
-                    "품목수": n["품목수"],
-                    "월목표매수": n["월목표매수"],
-                    "일목표매수": n["일목표매수"],
-                    "매당분": n["매당분"],
-                    "필요분": n["필요분"],
-                    "가용분": round(avail, 1),
-                    "배분분": round(alloc, 1),
-                    "자원수": resource,
-                    "공정부하율%": proc_load,
-                    "일가능매수": daily_cap,
-                    "월가능매수": month_cap,
-                    "달성": "OK" if meet else "부족",
-                }
-            )
-
-    detail = pd.DataFrame(detail_rows)
-    if detail.empty:
-        return detail, empty_sum
-
-    # 전체 공정 합산 부하로 달성 재판정: 공정별로 필요합≤가용이면 그 공정 OK
-    # 제품군 요약: 전 공정 월가능의 최소(병목)가 월 출하 가능량
-    summary = (
-        detail.groupby("제품군", as_index=False)
-        .agg(
-            월목표매수=("월목표매수", "first"),
-            일목표매수=("일목표매수", "first"),
-            품목수=("품목수", "max"),
-            월가능매수=("월가능매수", "min"),
-            일가능매수=("일가능매수", "min"),
-            최대부하율=("공정부하율%", "max"),
-        )
-    )
-    summary["월가능매수"] = summary["월가능매수"].round(1)
-    summary["일가능매수"] = summary["일가능매수"].round(1)
-    summary["달성"] = summary.apply(
-        lambda r: "OK" if float(r["월가능매수"]) + 1e-6 >= float(r["월목표매수"]) else "부족",
-        axis=1,
-    )
-    summary["부족매수"] = (summary["월목표매수"] - summary["월가능매수"]).clip(lower=0).round(1)
-    # 병목 공정
-    bn = (
-        detail.sort_values("월가능매수")
-        .groupby("제품군", as_index=False)
-        .first()[["제품군", "공정"]]
-        .rename(columns={"공정": "병목공정"})
-    )
-    summary = summary.merge(bn, on="제품군", how="left")
-    return detail, summary
-
-
-def monthly_plan_template(products: pd.DataFrame | None = None) -> pd.DataFrame:
-    """월 생산계획 빈 양식 — 제품코드별 목표."""
-    if products is None or products.empty or "제품코드" not in products.columns:
-        return pd.DataFrame(columns=list(MONTHLY_PLAN_COLUMNS))
-    codes = products[["제품코드"]].drop_duplicates()
-    if "제품명" in products.columns:
-        codes = products[["제품코드", "제품명"]].drop_duplicates("제품코드")
-    rows = []
-    for _, r in codes.iterrows():
-        rows.append({"제품코드": _norm(r["제품코드"]), "월목표매수": 0.0})
-    return pd.DataFrame(rows, columns=list(MONTHLY_PLAN_COLUMNS))
-
-
-def normalize_monthly_plan(df: pd.DataFrame) -> pd.DataFrame:
-    """업로드/편집 월 계획 — 제품코드 + 월목표매수."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=list(MONTHLY_PLAN_COLUMNS))
-    work = _rename_by_alias(
-        df.dropna(how="all").copy(),
-        {
-            "제품코드": ("제품코드", "품번", "item", "code"),
-            "월목표매수": ("월목표매수", "월목표", "목표", "목표수량", "수량", "qty"),
-        },
-    )
-    for c in MONTHLY_PLAN_COLUMNS:
-        if c not in work.columns:
-            work[c] = "" if c == "제품코드" else 0
-    work["제품코드"] = work["제품코드"].map(_norm)
-    work["월목표매수"] = pd.to_numeric(work["월목표매수"], errors="coerce").fillna(0)
-    work = work[(work["제품코드"] != "") & (work["월목표매수"] > 0)]
-    return work.drop_duplicates("제품코드", keep="last").reset_index(drop=True)
-
-
-def monthly_plan_family_stats(
-    plan: pd.DataFrame,
-    products: pd.DataFrame,
-) -> pd.DataFrame:
-    """업로드 월 계획 — 합계·CEL·Ring·Wafer별 품목 수·월목표 합계."""
-    empty = pd.DataFrame(columns=["구분", "계획품목수", "월목표합계"])
-    work = normalize_monthly_plan(plan)
-    if work.empty:
-        return empty
-
-    fam_map: dict[str, str] = {}
-    if not products.empty and "제품코드" in products.columns:
-        pc = products[["제품코드", "제품군"]].drop_duplicates("제품코드")
-        fam_map = {
-            _norm(c): _infer_product_family(g)
-            for c, g in zip(pc["제품코드"], pc["제품군"])
-            if _norm(c)
-        }
-
-    tagged = work.copy()
-    tagged["제품군"] = tagged["제품코드"].map(
-        lambda c: fam_map.get(_norm(c), _infer_product_family(c))
-    )
-
-    def _row(label: str, sub: pd.DataFrame) -> dict[str, Any]:
-        return {
-            "구분": label,
-            "계획품목수": int(len(sub)),
-            "월목표합계": float(sub["월목표매수"].sum()) if not sub.empty else 0.0,
-        }
-
-    rows = [_row("합계", tagged)]
-    for fam in PLAN_PRODUCT_FAMILIES:
-        rows.append(_row(fam, tagged[tagged["제품군"] == fam]))
-    other = tagged[~tagged["제품군"].isin(PLAN_PRODUCT_FAMILIES)]
-    if not other.empty:
-        rows.append(_row("기타", other))
-    return pd.DataFrame(rows)
-
-
-def _tagged_monthly_plan(plan: pd.DataFrame, products: pd.DataFrame) -> pd.DataFrame:
-    """월 계획에 제품군을 붙인 표."""
-    work = normalize_monthly_plan(plan)
-    if work.empty:
-        return work
-    fam_map: dict[str, str] = {}
-    if not products.empty and "제품코드" in products.columns and "제품군" in products.columns:
-        pc = products[["제품코드", "제품군"]].drop_duplicates("제품코드")
-        fam_map = {
-            _norm(c): _infer_product_family(g)
-            for c, g in zip(pc["제품코드"], pc["제품군"])
-            if _norm(c)
-        }
-    out = work.copy()
-    out["제품군"] = out["제품코드"].map(
-        lambda c: fam_map.get(_norm(c), _infer_product_family(c))
-    )
-    return out
-
-
-def _campus_resource_share(
-    *,
-    area: str,
-    campus: str,
-    equip: pd.DataFrame | None = None,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> float:
-    """캠퍼스가 해당 공정에서 차지하는 자원 비중 (0~1)."""
-    eq = equip if equip is not None else pd.DataFrame()
-    man = manpower if manpower is not None else pd.DataFrame()
-    if area == "외관":
-        total_h, _ = running_manpower(man, campus=None, area=area)
-        camp_h, _ = running_manpower(man, campus=campus, area=area)
-        total_n = effective_daily_headcount(
-            total_h, shift_teams=shift_teams, working_teams=working_teams
-        )
-        camp_n = effective_daily_headcount(
-            camp_h, shift_teams=shift_teams, working_teams=working_teams
-        )
-        if total_n <= 0:
-            return 0.0
-        return float(camp_n) / float(total_n)
-    total_q = running_qty(eq, campus=None, area=area, equip_code="")
-    camp_q = running_qty(eq, campus=campus, area=area, equip_code="")
-    if total_q <= 0:
-        # 설비 없으면 인력 비중으로
-        total_h, _ = running_manpower(man, campus=None, area=area)
-        camp_h, _ = running_manpower(man, campus=campus, area=area)
-        total_n = effective_daily_headcount(
-            total_h, shift_teams=shift_teams, working_teams=working_teams
-        )
-        camp_n = effective_daily_headcount(
-            camp_h, shift_teams=shift_teams, working_teams=working_teams
-        )
-        if total_n <= 0:
-            return 0.0
-        return float(camp_n) / float(total_n)
-    return float(camp_q) / float(total_q)
-
-
-def monthly_plan_daily_avg(
-    plan: pd.DataFrame,
-    products: pd.DataFrame,
-    *,
-    work_days: float = DEFAULT_WORK_DAYS,
-    campus: str | None = None,
-    equip: pd.DataFrame | None = None,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> dict[str, float]:
-    """일평균 매수 — 치수 CEL/Ring/Wafer · Hole CEL · 외관.
-
-    campus가 있으면 공정 자원 비중(설비/인력)으로 Total 일평균을 배분.
-    """
-    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
-    tagged = _tagged_monthly_plan(plan, products)
-    zero = {
-        "치수_CEL": 0.0,
-        "치수_Ring": 0.0,
-        "치수_Wafer": 0.0,
-        "Hole_CEL": 0.0,
-        "외관": 0.0,
-    }
-    if tagged.empty:
-        return zero
-
-    cel = float(tagged.loc[tagged["제품군"] == "CEL", "월목표매수"].sum())
-    ring = float(tagged.loc[tagged["제품군"] == "Ring", "월목표매수"].sum())
-    wafer = float(tagged.loc[tagged["제품군"] == "Wafer", "월목표매수"].sum())
-    total = float(tagged["월목표매수"].sum())
-    out = {
         "치수_CEL": round(cel / days, 1),
         "치수_Ring": round(ring / days, 1),
         "치수_Wafer": round(wafer / days, 1),
-        "Hole_CEL": round(cel / days, 1),  # Hole은 CEL만
+        "Hole_CEL": round(cel / days, 1),  # Hole = CEL만
         "외관": round(total / days, 1),
-    }
-    if not campus:
-        return out
-
-    dim_share = _campus_resource_share(
-        area="치수",
-        campus=campus,
-        equip=equip,
-        manpower=manpower,
-        shift_teams=shift_teams,
-        working_teams=working_teams,
-    )
-    hole_share = _campus_resource_share(
-        area="Hole",
-        campus=campus,
-        equip=equip,
-        manpower=manpower,
-        shift_teams=shift_teams,
-        working_teams=working_teams,
-    )
-    app_share = _campus_resource_share(
-        area="외관",
-        campus=campus,
-        equip=equip,
-        manpower=manpower,
-        shift_teams=shift_teams,
-        working_teams=working_teams,
-    )
-    return {
-        "치수_CEL": round(out["치수_CEL"] * dim_share, 1),
-        "치수_Ring": round(out["치수_Ring"] * dim_share, 1),
-        "치수_Wafer": round(out["치수_Wafer"] * dim_share, 1),
-        "Hole_CEL": round(out["Hole_CEL"] * hole_share, 1),
-        "외관": round(out["외관"] * app_share, 1),
+        "_월_CEL": cel,
+        "_월_Ring": ring,
+        "_월_Wafer": wafer,
+        "_월_합계": total,
+        "_작업일": days,
     }
 
 
-def _product_process_spec(products: pd.DataFrame, code: str, area: str) -> dict[str, Any] | None:
-    """제품코드×공정 택트 (동일 공정 여러 설비코드면 평균)."""
-    if products.empty:
-        return None
-    sub = products[
-        (products["제품코드"].map(_norm) == _norm(code))
-        & (products["공정"].map(_norm) == area)
-    ]
-    if sub.empty:
-        return None
-    kind = "인력" if (sub["제약유형"].map(_norm) == "인력").mean() >= 0.5 else "설비"
-    eq_tact = float(pd.to_numeric(sub["매당_설비분"], errors="coerce").replace(0, pd.NA).mean() or 0)
-    man_tact = float(pd.to_numeric(sub["매당_인시분"], errors="coerce").replace(0, pd.NA).mean() or 0)
-    if man_tact <= 0:
-        man_tact = eq_tact
-    if eq_tact <= 0:
-        eq_tact = man_tact
-    pname = _norm(sub["제품명"].iloc[0]) if "제품명" in sub.columns else _norm(code)
-    return {
-        "제품코드": _norm(code),
-        "제품명": pname,
-        "공정": area,
-        "제약유형": kind,
-        "매당_설비분": eq_tact,
-        "매당_인시분": man_tact,
-    }
-
-
-def _monthly_capacity_core(
-    products: pd.DataFrame,
+def _campus_share_for_area(
+    area: str,
+    campus: str,
     equip: pd.DataFrame,
-    work: pd.DataFrame,
+    manpower: pd.DataFrame,
     *,
-    key_col: str,
-    spec_fn,
-    campus: str | None = None,
-    work_days: float = DEFAULT_WORK_DAYS,
-    day_minutes: float = DAY_MINUTES,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """공통: 월/일 목표 → 공정별 배분 → 달성."""
-    empty = pd.DataFrame()
-    if work.empty:
-        return empty, empty
-    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
-    man = manpower if manpower is not None else pd.DataFrame()
-    detail_rows: list[dict[str, Any]] = []
-
-    for area in AREAS:
-        eq_qty = running_qty(equip, campus=campus, area=area, equip_code="")
-        man_total, man_avail = running_manpower(man, campus=campus, area=area)
-        man_qty = effective_daily_headcount(
-            man_total, shift_teams=shift_teams, working_teams=working_teams
+    shift_teams: int,
+    working_teams: int,
+) -> float:
+    """캠퍼스 자원 비중 (치수·Hole=설비, 외관=인력)."""
+    if area == "외관":
+        total_h, _ = running_manpower(manpower, campus=None, area=area)
+        camp_h, _ = running_manpower(manpower, campus=campus, area=area)
+        total_n = effective_daily_headcount(
+            total_h, shift_teams=shift_teams, working_teams=working_teams
         )
-        needs: list[dict[str, Any]] = []
-        for _, t in work.iterrows():
-            key = str(t[key_col])
-            spec = spec_fn(products, key, area)
-            if spec is None:
-                continue
-            kind = spec["제약유형"]
-            use_man = kind == "인력" or (eq_qty <= 0 and man_qty > 0 and spec["매당_인시분"] > 0)
-            tact = float(spec["매당_인시분"] if use_man else spec["매당_설비분"]) or float(spec["매당_인시분"])
-            if tact <= 0:
-                continue
-            daily = float(t["일목표매수"])
-            row: dict[str, Any] = {
-                key_col: key,
-                "공정": area,
-                "제약유형": "인력" if use_man else "설비",
-                "월목표매수": float(t["월목표매수"]),
-                "일목표매수": daily,
-                "매당분": round(tact, 4),
-                "필요분": round(daily * tact, 1),
-                "use_man": use_man,
-            }
-            if key_col == "제품코드":
-                row["제품명"] = spec.get("제품명", key)
-            elif "품목수" in spec:
-                row["품목수"] = spec["품목수"]
-            needs.append(row)
-        if not needs:
-            continue
-        if all(n["use_man"] for n in needs):
-            avail = man_qty * (man_avail or day_minutes)
-            resource = man_qty
-        else:
-            if any(not n["use_man"] for n in needs):
-                avail = eq_qty * day_minutes
-                resource = eq_qty
-                needs = [n for n in needs if not n["use_man"]] or needs
-            else:
-                avail = man_qty * (man_avail or day_minutes)
-                resource = man_qty
-        need_sum = sum(n["필요분"] for n in needs) or 1.0
-        proc_load = round(need_sum / avail * 100, 1) if avail > 0 else None
-        for n in needs:
-            share = n["필요분"] / need_sum
-            alloc = avail * share
-            daily_cap = round(alloc / n["매당분"], 1) if n["매당분"] > 0 else 0.0
-            month_cap = round(daily_cap * days, 1)
-            meet = month_cap + 1e-6 >= n["월목표매수"]
-            detail_rows.append(
-                {
-                    **{key_col: n[key_col]},
-                    "제품명": n.get("제품명", ""),
-                    "공정": area,
-                    "제약유형": "인력" if n["use_man"] else "설비",
-                    "품목수": n.get("품목수", 1),
-                    "월목표매수": n["월목표매수"],
-                    "일목표매수": n["일목표매수"],
-                    "매당분": n["매당분"],
-                    "필요분": n["필요분"],
-                    "가용분": round(avail, 1),
-                    "배분분": round(alloc, 1),
-                    "시간배분%": round(share * 100, 1),
-                    "자원수": resource,
-                    "공정부하율%": proc_load,
-                    "일가능매수": daily_cap,
-                    "월가능매수": month_cap,
-                    "달성": "OK" if meet else "부족",
-                }
-            )
+        camp_n = effective_daily_headcount(
+            camp_h, shift_teams=shift_teams, working_teams=working_teams
+        )
+        return (float(camp_n) / float(total_n)) if total_n > 0 else 0.0
+    total_q = running_qty(equip, campus=None, area=area, equip_code="")
+    camp_q = running_qty(equip, campus=campus, area=area, equip_code="")
+    if total_q > 0:
+        return float(camp_q) / float(total_q)
+    total_h, _ = running_manpower(manpower, campus=None, area=area)
+    camp_h, _ = running_manpower(manpower, campus=campus, area=area)
+    total_n = effective_daily_headcount(
+        total_h, shift_teams=shift_teams, working_teams=working_teams
+    )
+    camp_n = effective_daily_headcount(
+        camp_h, shift_teams=shift_teams, working_teams=working_teams
+    )
+    return (float(camp_n) / float(total_n)) if total_n > 0 else 0.0
 
-    detail = pd.DataFrame(detail_rows)
-    if detail.empty:
-        return detail, empty
 
-    agg_cols = {
-        "월목표매수": ("월목표매수", "first"),
-        "일목표매수": ("일목표매수", "first"),
-        "월가능매수": ("월가능매수", "min"),
-        "일가능매수": ("일가능매수", "min"),
-        "최대부하율": ("공정부하율%", "max"),
+def _scale_daily_avg(
+    avg: dict[str, float],
+    *,
+    dim_share: float,
+    hole_share: float,
+    app_share: float,
+) -> dict[str, float]:
+    return {
+        "치수_CEL": round(float(avg.get("치수_CEL", 0)) * dim_share, 1),
+        "치수_Ring": round(float(avg.get("치수_Ring", 0)) * dim_share, 1),
+        "치수_Wafer": round(float(avg.get("치수_Wafer", 0)) * dim_share, 1),
+        "Hole_CEL": round(float(avg.get("Hole_CEL", 0)) * hole_share, 1),
+        "외관": round(float(avg.get("외관", 0)) * app_share, 1),
     }
-    if "제품명" in detail.columns:
-        agg_cols["제품명"] = ("제품명", "first")
-    if "품목수" in detail.columns:
-        agg_cols["품목수"] = ("품목수", "max")
-
-    summary = detail.groupby(key_col, as_index=False).agg(**agg_cols)
-    summary["월가능매수"] = summary["월가능매수"].round(1)
-    summary["일가능매수"] = summary["일가능매수"].round(1)
-    summary["달성"] = summary.apply(
-        lambda r: "OK" if float(r["월가능매수"]) + 1e-6 >= float(r["월목표매수"]) else "부족",
-        axis=1,
-    )
-    summary["부족매수"] = (summary["월목표매수"] - summary["월가능매수"]).clip(lower=0).round(1)
-    bn = (
-        detail.sort_values("월가능매수")
-        .groupby(key_col, as_index=False)
-        .first()[[key_col, "공정"]]
-        .rename(columns={"공정": "병목공정"})
-    )
-    summary = summary.merge(bn, on=key_col, how="left")
-    return detail, summary
 
 
-def monthly_plan_feasibility(
-    products: pd.DataFrame,
-    equip: pd.DataFrame,
-    plan: pd.DataFrame,
-    *,
-    campus: str | None = None,
-    work_days: float = DEFAULT_WORK_DAYS,
-    day_minutes: float = DAY_MINUTES,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """제품코드 월 목표 → 생산 계획 (공정별 상세 + 제품별 요약).
-
-    반환: (공정별 상세, 제품 요약, 기준정보에 없는 제품코드 목록)
-    """
-    empty = pd.DataFrame()
-    if products.empty:
-        return empty, empty, []
-    work = normalize_monthly_plan(plan)
-    if work.empty:
-        return empty, empty, []
-    known = set(products["제품코드"].map(_norm).tolist())
-    missing = sorted({c for c in work["제품코드"].tolist() if c not in known})
-    work = work[~work["제품코드"].isin(missing)]
-    if work.empty:
-        return empty, empty, missing
-    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
-    work["일목표매수"] = (work["월목표매수"] / days).round(2)
-    detail, summary = _monthly_capacity_core(
-        products,
-        equip,
-        work,
-        key_col="제품코드",
-        spec_fn=_product_process_spec,
-        campus=campus,
-        work_days=days,
-        day_minutes=day_minutes,
-        manpower=manpower,
-        shift_teams=shift_teams,
-        working_teams=working_teams,
-    )
-    return detail, summary, missing
+def _render_plan_family_summary(stats: pd.DataFrame) -> None:
+    """합계 · CEL · Ring · Wafer — 계획 품목 수 · 월목표 합계."""
+    if stats is None or stats.empty:
+        return
+    cols = st.columns(len(stats))
+    for col, (_, row) in zip(cols, stats.iterrows()):
+        with col:
+            st.markdown(f"##### {row['구분']}")
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric("계획 품목", f"{int(row['계획품목수'])}종")
+            with m2:
+                st.metric("월목표 합계", f"{float(row['월목표합계']):,.0f}")
 
 
-def daily_operation_plan(detail: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
-    """하루 운영안 — 공정별 제품 시간 배분 + 권장 일 매수."""
-    if detail is None or detail.empty:
-        return pd.DataFrame()
-    cols = [
-        c
-        for c in (
-            "제품코드",
-            "제품명",
-            "공정",
-            "제약유형",
-            "일목표매수",
-            "일가능매수",
-            "필요분",
-            "배분분",
-            "시간배분%",
-            "공정부하율%",
-            "매당분",
-            "달성",
-        )
-        if c in detail.columns
-    ]
-    return detail[cols].sort_values(["공정", "제품코드"]).reset_index(drop=True)
+def _render_daily_avg_row(title: str, avg: dict[str, float]) -> None:
+    """일평균 — 치수 CEL/Ring/Wafer · Hole CEL · 외관."""
+    st.markdown(f"**{title}**")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("치수 CEL", f"{avg.get('치수_CEL', 0):,.1f}매/일")
+    with c2:
+        st.metric("치수 Ring", f"{avg.get('치수_Ring', 0):,.1f}매/일")
+    with c3:
+        st.metric("치수 Wafer", f"{avg.get('치수_Wafer', 0):,.1f}매/일")
+    with c4:
+        st.metric("Hole CEL", f"{avg.get('Hole_CEL', 0):,.1f}매/일")
+    with c5:
+        st.metric("외관", f"{avg.get('외관', 0):,.1f}매/일")
 
 
-def floor_manager_daily_raw(
-    products: pd.DataFrame,
-    plan: pd.DataFrame,
-    *,
-    work_days: float = DEFAULT_WORK_DAYS,
-    campuses: tuple[str, ...] | list[str] = ("천안", "아산"),
-    equip: pd.DataFrame | None = None,
-    manpower: pd.DataFrame | None = None,
-    shift_teams: int = DEFAULT_SHIFT_TEAMS,
-    working_teams: int = DEFAULT_WORKING_TEAMS,
-) -> pd.DataFrame:
-    """현장 관리자용 일별 처리 Raw — 캠퍼스·공정·제품별 권장 매수.
-
-    규칙:
-    - 치수: CEL·Ring·Wafer
-    - Hole: CEL만
-    - 외관·종합측정실: 계획 전체
-    - 캠퍼스 배분: 공정 자원 비중(치수·Hole=설비, 외관=인력)
-    """
-    empty_cols = [
-        "캠퍼스",
-        "공정",
-        "처리순서",
-        "제품코드",
-        "제품명",
-        "제품군",
-        "일목표_전체",
-        "캠퍼스배분매수",
-        "예상소요분",
-        "매당분",
-        "제약유형",
-        "캠퍼스비중%",
-        "비고",
-    ]
-    tagged = _tagged_monthly_plan(plan, products)
-    if tagged.empty or products.empty:
-        return pd.DataFrame(columns=empty_cols)
-
-    days = float(work_days or DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS
-    tagged = tagged.copy()
-    tagged["일목표_전체"] = (tagged["월목표매수"] / days).round(2)
-
-    # 제품명 맵
-    name_map: dict[str, str] = {}
-    if "제품명" in products.columns:
-        for _, r in products.drop_duplicates("제품코드").iterrows():
-            name_map[_norm(r["제품코드"])] = _norm(r["제품명"])
-
-    eq = equip if equip is not None else pd.DataFrame()
-    man = manpower if manpower is not None else pd.DataFrame()
-    camp_list = [c for c in campuses if c]
-
-    def _share(area: str, campus: str) -> float:
-        return _campus_resource_share(
-            area=area,
-            campus=campus,
-            equip=eq,
-            manpower=man,
-            shift_teams=shift_teams,
-            working_teams=working_teams,
-        )
-
-    shares: dict[tuple[str, str], float] = {}
-    for area in AREAS:
-        raw = {c: _share(area, c) for c in camp_list}
-        s = sum(raw.values())
-        if s <= 0 and camp_list:
-            raw = {c: 1.0 / len(camp_list) for c in camp_list}
-        elif s > 0:
-            raw = {c: v / s for c, v in raw.items()}
-        for c, v in raw.items():
-            shares[(c, area)] = v
-
-    rows: list[dict[str, Any]] = []
-    for _, t in tagged.iterrows():
-        code = _norm(t["제품코드"])
-        fam = _norm(t["제품군"])
-        daily_all = float(t["일목표_전체"])
-        pname = name_map.get(code, code)
-        for area in AREAS:
-            # 공정별 대상 제품군 필터
-            if area == "Hole" and fam != "CEL":
-                continue
-            if area == "치수" and fam not in PLAN_PRODUCT_FAMILIES:
-                continue
-            spec = _product_process_spec(products, code, area)
-            if spec is None:
-                continue
-            tact = float(spec["매당_인시분"] if spec["제약유형"] == "인력" else spec["매당_설비분"])
-            if tact <= 0:
-                tact = float(spec["매당_인시분"] or spec["매당_설비분"] or 0)
-            note = ""
-            if area == "Hole":
-                note = "Hole은 CEL만 측정"
-            elif area == "치수":
-                note = "치수=CEL·Ring·Wafer"
-            for camp in camp_list:
-                share = shares.get((camp, area), 0.0)
-                qty = round(daily_all * share, 2)
-                if qty <= 0:
-                    continue
-                rows.append(
-                    {
-                        "캠퍼스": camp,
-                        "공정": area,
-                        "처리순서": 0,
-                        "제품코드": code,
-                        "제품명": pname,
-                        "제품군": fam,
-                        "일목표_전체": daily_all,
-                        "캠퍼스배분매수": qty,
-                        "예상소요분": round(qty * tact, 1),
-                        "매당분": round(tact, 4),
-                        "제약유형": spec["제약유형"],
-                        "캠퍼스비중%": round(share * 100, 1),
-                        "비고": note,
-                    }
-                )
-
-    if not rows:
-        return pd.DataFrame(columns=empty_cols)
-
-    out = pd.DataFrame(rows)
-    # 공정 내: 제품군(CEL→Ring→Wafer) · 배분매수 큰 순 → 처리순서
-    fam_ord = {f: i for i, f in enumerate(PLAN_PRODUCT_FAMILIES)}
-    out["_fam"] = out["제품군"].map(lambda x: fam_ord.get(x, 99))
-    out["_area"] = out["공정"].map(lambda x: list(AREAS).index(x) if x in AREAS else 99)
-    out = out.sort_values(
-        ["캠퍼스", "_area", "_fam", "캠퍼스배분매수", "제품코드"],
-        ascending=[True, True, True, False, True],
-    )
-    out["처리순서"] = out.groupby(["캠퍼스", "공정"]).cumcount() + 1
-    return out.drop(columns=["_fam", "_area"]).reset_index(drop=True)
-
-
-# ----- 공정 재공 + 출하(긴급품) → 일별 최적 처리 -----
-
-WIP_COLUMNS = ("사업장", "공정코드", "공정명", "제품코드", "제품군", "검사영역")
-SHIP_COLUMNS = ("우선순위", "제품코드", "재공_출하표", "완제품", "부족분", "출하예정일", "출하예정수량")
-
-
-def _map_wip_inspect_area(process_name: str) -> str:
-    """재공 공정명 → 검사 영역.
-
-    - 종합측정실: 공정명에 '종합측정실' 포함 (예: 종합측정실 (3D))
-    - 치수: 저항측정 · 3D측정 (예: 저항측정 (Si), SiC 3D측정)
-    - Hole / 외관: 기존과 동일
-    """
-    name = _norm(process_name)
-    if not name:
-        return "기타"
-    compact = name.replace(" ", "").upper()
-
-    # 종합측정실이 들어가면 종합측정실 (3D 포함이어도 종합 우선)
-    if "종합측정실" in name.replace(" ", "") or "종합측정실" in name:
-        return "종합측정실"
-
-    if "외관" in name:
-        return "외관"
-
-    if (
-        "HOLE" in compact
-        or "홀측정" in name.replace(" ", "")
-        or "홀 측정" in name
-        or compact.endswith("홀")
-    ):
-        return "Hole"
-
-    # 치수: 저항측정 / 3D측정 만
-    if "저항" in name and "측정" in name:
-        return "치수"
-    if "3D측정" in compact or "3D 측정" in name:
-        return "치수"
-
-    return "기타"
-
-
-def process_name_matches_area(process_name: str, area: str) -> bool:
-    """공정명 기준으로 표시 탭(치수/Hole/외관/종합측정실) 소속 여부."""
-    return _map_wip_inspect_area(process_name) == area
-
-
-def _priority_rank(label: Any) -> int:
-    t = _norm(label)
-    if not t:
-        return 99
-    if "특" in t and "1" in t:
-        return 0
-    if "1순위" in t or t == "1":
-        return 1
-    if "2순위" in t or t == "2":
-        return 2
-    if "3순위" in t or t == "3":
-        return 3
-    # 숫자 추출
-    for i, ch in enumerate(t):
-        if ch.isdigit():
-            try:
-                return int("".join(c for c in t[i:] if c.isdigit())[:2] or "50")
-            except ValueError:
-                break
-    return 50
-
-
-def normalize_wip(df: pd.DataFrame) -> pd.DataFrame:
-    """공정 재공 리스트 정규화. 행 1개 = 재공 1매. Sub Total 제외."""
-    empty = pd.DataFrame(columns=list(WIP_COLUMNS))
-    if df is None or df.empty:
-        return empty
-    work = _rename_by_alias(
-        df.dropna(how="all").copy(),
+def _render_daily_avg_formula(avg: dict[str, float]) -> None:
+    """일평균 계산식 표 — 검증용."""
+    days = float(avg.get("_작업일", DEFAULT_WORK_DAYS) or DEFAULT_WORK_DAYS)
+    rows = [
         {
-            "사업장": ("사업장", "캠퍼스", "공장", "campus"),
-            "공정코드": ("공정코드", "공정", "공정번호"),
-            "공정명": ("공정명", "설명", "공정이름"),
-            "제품코드": ("제품코드", "제품", "품목코드", "품번"),
-            "제품군": ("제품군", "제품구분", "세부형상", "유형"),
+            "항목": "치수 CEL",
+            "대상": "CEL",
+            "월목표": avg.get("_월_CEL", 0),
+            "식": f"{avg.get('_월_CEL', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("치수_CEL", 0),
         },
-    )
-    for c in ("사업장", "공정코드", "공정명", "제품코드", "제품군"):
-        if c not in work.columns:
-            work[c] = ""
-    work["사업장"] = work["사업장"].map(_norm)
-    work["공정명"] = work["공정명"].map(_norm)
-    work["제품코드"] = work["제품코드"].map(_norm)
-    work["제품군"] = work["제품군"].map(lambda v: _infer_product_family(v) or _norm(v))
-    work["공정코드"] = work["공정코드"].map(lambda v: _norm(v).replace(".0", "") if _norm(v).endswith(".0") else _norm(v))
-    # Sub Total / 합계 행 제거
-    bad = work["제품코드"].str.contains(r"sub\s*total|합계|total", case=False, na=False)
-    work = work[(work["제품코드"] != "") & ~bad]
-    # 사업장 앞으로 채우기(병합 셀)
-    work["사업장"] = work["사업장"].replace("", pd.NA).ffill().fillna("")
-    work["검사영역"] = work["공정명"].map(_map_wip_inspect_area)
-    return work[list(WIP_COLUMNS)].reset_index(drop=True)
-
-
-def aggregate_wip(wip: pd.DataFrame) -> pd.DataFrame:
-    """사업장·공정·제품별 재공 매수."""
-    if wip is None or wip.empty:
-        return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
-    work = wip if "검사영역" in wip.columns and "제품코드" in wip.columns else normalize_wip(wip)
-    if work.empty:
-        return pd.DataFrame(columns=[*WIP_COLUMNS, "재공매수"])
-    # 공정명 규칙 변경 반영(세션에 남은 옛 매핑 보정)
-    if "공정명" in work.columns:
-        work = work.copy()
-        work["검사영역"] = work["공정명"].map(_map_wip_inspect_area)
-    if "재공매수" in work.columns:
-        return work
-    return (
-        work.groupby(["사업장", "공정코드", "공정명", "제품코드", "제품군", "검사영역"], as_index=False)
-        .size()
-        .rename(columns={"size": "재공매수"})
-    )
-
-def _shipping_date_columns(df: pd.DataFrame) -> list[str]:
-    """긴급품 시트의 일자 열만 추출 (우선순위·품목·재공·완제품·부족분 제외)."""
-    skip = {
-        "우선순위",
-        "품목코드",
-        "제품코드",
-        "재공",
-        "재공_출하표",
-        "완제품",
-        "부족분",
-        "순위",
-        "priority",
-    }
-    cols = []
-    for c in df.columns:
-        s = str(c).replace("\n", " ").strip()
-        if s in skip or s.startswith("Unnamed"):
-            continue
-        ts = pd.to_datetime(s, errors="coerce")
-        if pd.notna(ts):
-            cols.append(c)
-            continue
-        # 9/17, 09-17, 2026.9.17 등
-        if re.search(r"\d{1,4}[-/.]\d{1,2}([-/.]\d{1,4})?", s):
-            ts2 = pd.to_datetime(s, errors="coerce")
-            if pd.notna(ts2):
-                cols.append(c)
-    def _key(c):
-        t = pd.to_datetime(str(c), errors="coerce")
-        return t if pd.notna(t) else pd.Timestamp.max
-
-    return sorted(cols, key=_key)
-
-
-def _col_to_date_label(c: Any) -> str:
-    ts = pd.to_datetime(str(c), errors="coerce")
-    if pd.notna(ts):
-        return str(ts.date())
-    return str(c).strip()[:10]
-
-
-def normalize_shipping_urgent(df: pd.DataFrame, ship_date: str | None = None) -> pd.DataFrame:
-    """긴급품 시트 → 일자별 출하 예정 (제품×일자 행).
-
-    ship_date:
-      - None / '' / '전체' → 수량이 있는 모든 일자 펼침
-      - 'YYYY-MM-DD' → 해당 일자만
-    """
-    empty = pd.DataFrame(columns=list(SHIP_COLUMNS))
-    if df is None or df.empty:
-        return empty
-    work = df.dropna(how="all").copy()
-    work.columns = [str(c).replace("\n", " ").strip() for c in work.columns]
-    work = _rename_by_alias(
-        work,
         {
-            "우선순위": ("우선순위", "순위", "priority"),
-            "제품코드": ("제품코드", "품목코드", "품번", "item"),
-            "재공_출하표": ("재공",),
-            "완제품": ("완제품",),
-            "부족분": ("부족분",),
+            "항목": "치수 Ring",
+            "대상": "Ring",
+            "월목표": avg.get("_월_Ring", 0),
+            "식": f"{avg.get('_월_Ring', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("치수_Ring", 0),
         },
-    )
-    for c in ("우선순위", "제품코드", "재공_출하표", "완제품", "부족분"):
-        if c not in work.columns:
-            work[c] = "" if c in ("우선순위", "제품코드") else 0
-    work["제품코드"] = work["제품코드"].map(_norm)
-    work = work[work["제품코드"] != ""]
-    date_cols = _shipping_date_columns(work)
-    if not date_cols:
-        return empty
-
-    want_all = ship_date is None or str(ship_date).strip() in ("", "전체", "all", "ALL")
-    use_cols = date_cols
-    if not want_all:
-        matched = [c for c in date_cols if str(ship_date)[:10] in str(c) or _col_to_date_label(c) == str(ship_date)[:10]]
-        use_cols = matched or date_cols[:1]
-
-    rows: list[dict[str, Any]] = []
-    for _, r in work.iterrows():
-        base = {
-            "우선순위": _norm(r.get("우선순위", "")),
-            "제품코드": _norm(r["제품코드"]),
-            "재공_출하표": pd.to_numeric(r.get("재공_출하표", 0), errors="coerce") or 0,
-            "완제품": pd.to_numeric(r.get("완제품", 0), errors="coerce") or 0,
-            "부족분": pd.to_numeric(r.get("부족분", 0), errors="coerce") or 0,
-        }
-        for dc in use_cols:
-            qty = pd.to_numeric(r.get(dc), errors="coerce")
-            if pd.isna(qty) or float(qty) <= 0:
-                continue
-            rows.append(
-                {
-                    **base,
-                    "출하예정일": _col_to_date_label(dc),
-                    "출하예정수량": float(qty),
-                }
-            )
-
-    if not rows:
-        return empty
-    out = pd.DataFrame(rows)
-    out["우선순위점수"] = out["우선순위"].map(_priority_rank)
-    out = out.sort_values(["출하예정일", "우선순위점수", "제품코드"]).drop(columns=["우선순위점수"])
-    return out.reset_index(drop=True)
-
-
-def shipping_date_options(df: pd.DataFrame) -> list[str]:
-    """긴급품 raw에서 선택 가능한 출하일 목록. 맨 앞에 '전체'."""
-    if df is None or df.empty:
-        return []
-    work = df.copy()
-    work.columns = [str(c).replace("\n", " ").strip() for c in work.columns]
-    date_cols = _shipping_date_columns(work)
-    if not date_cols:
-        return []
-    opts = ["전체"]
-    for c in date_cols:
-        opts.append(_col_to_date_label(c))
-    # 중복 제거 (순서 유지)
-    seen: set[str] = set()
-    uniq = []
-    for o in opts:
-        if o not in seen:
-            seen.add(o)
-            uniq.append(o)
-    return uniq
-
-
-def read_wip_excel(data: bytes | Path) -> pd.DataFrame:
-    """재공 xlsx/csv → 정규화."""
-    if isinstance(data, Path):
-        raw = data.read_bytes()
-    else:
-        raw = data
-    try:
-        df = pd.read_excel(BytesIO(raw), sheet_name=0)
-    except Exception:
-        df = pd.DataFrame()
-        for enc in ("utf-8-sig", "utf-8", "cp949"):
-            try:
-                df = pd.read_csv(BytesIO(raw), encoding=enc)
-                break
-            except Exception:
-                continue
-    return normalize_wip(df)
-
-
-def read_shipping_excel(data: bytes | Path, ship_date: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """출하 xlsx → (긴급품 raw, 선택일 정규화).
-
-    시트 우선: 긴급품 → 출하계획 → 첫 시트.
-    """
-    if isinstance(data, Path):
-        path_or_buf: Any = data
-        raw = data.read_bytes()
-    else:
-        raw = data
-        path_or_buf = BytesIO(raw)
-    try:
-        xl = pd.ExcelFile(path_or_buf)
-        sheet = "긴급품" if "긴급품" in xl.sheet_names else (
-            "출하계획" if "출하계획" in xl.sheet_names else xl.sheet_names[0]
-        )
-        urgent = pd.read_excel(xl, sheet_name=sheet)
-    except Exception:
-        urgent = pd.DataFrame()
-        for enc in ("utf-8-sig", "utf-8", "cp949"):
-            try:
-                urgent = pd.read_csv(BytesIO(raw), encoding=enc)
-                break
-            except Exception:
-                continue
-    return urgent, normalize_shipping_urgent(urgent, ship_date=ship_date)
-
-
-def daily_optimal_from_wip_shipping(
-    wip: pd.DataFrame,
-    shipping: pd.DataFrame,
-    *,
-    products: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """출하 예정(긴급품) ∩ 공정 재공 → 현장용 일별 최적 처리 Raw.
-
-    규칙:
-      1) 제품별 완제품을 출하예정일 빠른 날부터 차감 → 남는 순필요만 현장 처리
-      2) 공정 재공은 외관→Hole→치수 순, 제품·일자 간 재고를 중복 배분하지 않음
-      3) Hole은 CEL만
-    """
-    cols = [
-        "처리순서",
-        "우선순위",
-        "제품코드",
-        "제품군",
-        "출하예정일",
-        "출하예정수량",
-        "완제품사용",
-        "순필요매수",
-        "사업장",
-        "공정코드",
-        "공정명",
-        "검사영역",
-        "재공매수",
-        "권장처리매수",
-        "상태",
-        "비고",
+        {
+            "항목": "치수 Wafer",
+            "대상": "Wafer",
+            "월목표": avg.get("_월_Wafer", 0),
+            "식": f"{avg.get('_월_Wafer', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("치수_Wafer", 0),
+        },
+        {
+            "항목": "Hole CEL",
+            "대상": "CEL만",
+            "월목표": avg.get("_월_CEL", 0),
+            "식": f"{avg.get('_월_CEL', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("Hole_CEL", 0),
+        },
+        {
+            "항목": "외관",
+            "대상": "전체",
+            "월목표": avg.get("_월_합계", 0),
+            "식": f"{avg.get('_월_합계', 0):,.0f} ÷ {days:g}",
+            "일평균": avg.get("외관", 0),
+        },
     ]
-    if shipping is None or shipping.empty:
-        return pd.DataFrame(columns=cols)
-    ship = shipping.copy()
-    if "출하예정수량" not in ship.columns:
-        ship = normalize_shipping_urgent(ship)
-    if ship.empty:
-        return pd.DataFrame(columns=cols)
-
-    wip_agg = aggregate_wip(wip)
-    fam_map: dict[str, str] = {}
-    if products is not None and not products.empty and "제품코드" in products.columns:
-        pc = products[["제품코드", "제품군"]].drop_duplicates("제품코드")
-        fam_map = {_norm(a): _infer_product_family(b) for a, b in zip(pc["제품코드"], pc["제품군"])}
-
-    rows: list[dict[str, Any]] = []
-    area_ord = {"외관": 0, "Hole": 1, "치수": 2, "종합측정실": 3}
-    status_ord = {
-        "처리가능": 0,
-        "재공부족": 1,
-        "재공없음": 2,
-        "대기(재고배분완료)": 3,
-        "완제품충당": 9,
-    }
-
-    ship = ship.copy()
-    ship["제품코드"] = ship["제품코드"].map(_norm)
-    ship["_pri"] = ship["우선순위"].map(_priority_rank) if "우선순위" in ship.columns else 99
-    if "출하예정일" not in ship.columns:
-        ship["출하예정일"] = ""
-    if "완제품" not in ship.columns:
-        ship["완제품"] = 0
-    ship["완제품"] = pd.to_numeric(ship["완제품"], errors="coerce").fillna(0).clip(lower=0)
-    ship["출하예정수량"] = pd.to_numeric(ship["출하예정수량"], errors="coerce").fillna(0)
-    # 일자 빠른 순 → 완제품·재공 모두 앞에서부터 소진
-    ship = ship.sort_values(["제품코드", "출하예정일", "_pri"])
-
-    # 제품별 완제품 잔량 (긴급품 시트 값, 일자 공통)
-    fg_left: dict[str, float] = {}
-    for code, g in ship.groupby("제품코드", sort=False):
-        fg_left[str(code)] = float(g["완제품"].max())
-
-    # 공정 재공 잔량 (배분 시 차감)
-    wip_pool = wip_agg.copy()
-    if wip_pool.empty:
-        wip_pool["_left"] = pd.Series(dtype=float)
-    else:
-        wip_pool["_left"] = pd.to_numeric(wip_pool["재공매수"], errors="coerce").fillna(0)
-
-    for _, s in ship.iterrows():
-        code = _norm(s["제품코드"])
-        gross = float(s["출하예정수량"])
-        if gross <= 0:
-            continue
-        day = _norm(s.get("출하예정일", ""))
-        pri = _norm(s.get("우선순위", ""))
-        fam = fam_map.get(code, "")
-
-        use_fg = min(fg_left.get(code, 0.0), gross)
-        fg_left[code] = fg_left.get(code, 0.0) - use_fg
-        need = gross - use_fg
-
-        if need <= 0.5:
-            rows.append(
-                {
-                    "처리순서": 0,
-                    "우선순위": pri,
-                    "제품코드": code,
-                    "제품군": fam,
-                    "출하예정일": day,
-                    "출하예정수량": gross,
-                    "완제품사용": round(use_fg, 1),
-                    "순필요매수": 0.0,
-                    "사업장": "",
-                    "공정코드": "",
-                    "공정명": "",
-                    "검사영역": "",
-                    "재공매수": 0,
-                    "권장처리매수": 0,
-                    "상태": "완제품충당",
-                    "비고": f"완제품 {use_fg:g}매로 출하 충당(현장 처리 불필요)",
-                }
-            )
-            continue
-
-        hit = (
-            wip_pool[wip_pool["제품코드"] == code].copy()
-            if not wip_pool.empty
-            else pd.DataFrame()
-        )
-        if not hit.empty:
-            hit["_ord"] = hit["검사영역"].map(lambda a: area_ord.get(a, 9))
-            if fam and fam != "CEL":
-                hit = hit[hit["검사영역"] != "Hole"]
-            hit = hit[hit["_left"] > 0.5]
-
-        if hit.empty:
-            note = (
-                f"완제품 {use_fg:g}매 차감 후 순필요 {need:g}매, 공정 재공 없음"
-                if use_fg > 0
-                else "출하 대상이나 공정 재공에 없음"
-            )
-            rows.append(
-                {
-                    "처리순서": 0,
-                    "우선순위": pri,
-                    "제품코드": code,
-                    "제품군": fam,
-                    "출하예정일": day,
-                    "출하예정수량": gross,
-                    "완제품사용": round(use_fg, 1),
-                    "순필요매수": round(need, 1),
-                    "사업장": "",
-                    "공정코드": "",
-                    "공정명": "",
-                    "검사영역": "",
-                    "재공매수": 0,
-                    "권장처리매수": round(need, 1),
-                    "상태": "재공없음",
-                    "비고": note,
-                }
-            )
-            continue
-
-        hit = hit.sort_values(["_ord", "사업장", "공정명"])
-        remain = need
-        fg_note_used = use_fg
-        for idx, w in hit.iterrows():
-            left = float(wip_pool.at[idx, "_left"])
-            stock = float(w["재공매수"])
-            take = min(remain, left) if remain > 0 else 0.0
-            note_bits = []
-            if fg_note_used > 0:
-                note_bits.append(f"완제품 {fg_note_used:g}매 차감")
-                fg_note_used = 0.0
-            if w["검사영역"] == "Hole" and fam == "CEL":
-                note_bits.append("Hole=CEL만")
-            rows.append(
-                {
-                    "처리순서": 0,
-                    "우선순위": pri,
-                    "제품코드": code,
-                    "제품군": fam or _norm(w.get("제품군", "")),
-                    "출하예정일": day,
-                    "출하예정수량": gross,
-                    "완제품사용": round(use_fg, 1),
-                    "순필요매수": round(need, 1),
-                    "사업장": _norm(w["사업장"]),
-                    "공정코드": _norm(w["공정코드"]),
-                    "공정명": _norm(w["공정명"]),
-                    "검사영역": _norm(w["검사영역"]),
-                    "재공매수": stock,
-                    "권장처리매수": round(take, 1),
-                    "상태": "처리가능" if take > 0 else "대기(재고배분완료)",
-                    "비고": " · ".join(note_bits),
-                }
-            )
-            if take > 0:
-                wip_pool.at[idx, "_left"] = left - take
-                remain -= take
-        if remain > 0.5:
-            rows.append(
-                {
-                    "처리순서": 0,
-                    "우선순위": pri,
-                    "제품코드": code,
-                    "제품군": fam,
-                    "출하예정일": day,
-                    "출하예정수량": gross,
-                    "완제품사용": round(use_fg, 1),
-                    "순필요매수": round(need, 1),
-                    "사업장": "",
-                    "공정코드": "",
-                    "공정명": "",
-                    "검사영역": "",
-                    "재공매수": 0,
-                    "권장처리매수": round(remain, 1),
-                    "상태": "재공부족",
-                    "비고": f"순필요 {need:g}매 중 재공 부족 {remain:g}매",
-                }
-            )
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return pd.DataFrame(columns=cols)
-
-    out["_pri"] = out["우선순위"].map(_priority_rank)
-    out["_st"] = out["상태"].map(lambda x: status_ord.get(x, 5))
-    # 현장 처리 필요 건을 위에, 완제품충당은 아래
-    out = out.sort_values(["_st", "출하예정일", "_pri", "제품코드", "사업장"])
-    out["처리순서"] = range(1, len(out) + 1)
-    return out.drop(columns=["_pri", "_st"]).reset_index(drop=True)
+    show = pd.DataFrame(rows)
+    show["월목표"] = show["월목표"].map(lambda v: f"{float(v):,.0f}")
+    show["일평균"] = show["일평균"].map(lambda v: f"{float(v):,.1f}")
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
 
-def process_standard_times(products: pd.DataFrame, product_codes: list[str] | None = None) -> pd.DataFrame:
-    """공정별 평균 매당 인시분·설비분."""
-    if products.empty:
-        return pd.DataFrame(columns=["공정", "매당_인시분", "매당_설비분"])
-    work = products
-    if product_codes:
-        work = work[work["제품코드"].isin(product_codes)]
-    if work.empty:
-        work = products
-    g = work.groupby("공정", as_index=False).agg(
-        매당_인시분=("매당_인시분", "mean"),
-        매당_설비분=("매당_설비분", "mean"),
-    )
-    g["매당_인시분"] = g["매당_인시분"].round(2)
-    g["매당_설비분"] = g["매당_설비분"].round(2)
-    return g
-
-
-def utilization_from_actuals(
-    actuals: pd.DataFrame,
-    standards: pd.DataFrame,
-    *,
-    available_min: float = DAY_MINUTES,
-) -> pd.DataFrame:
-    """실적 × 매당인시분 / (인력 × 가용분) × 100."""
-    if actuals.empty:
-        return pd.DataFrame()
-    work = actuals.copy()
-    if "영역" not in work.columns and "공정" in work.columns:
-        work = work.rename(columns={"공정": "영역"})
-    if "영역" not in work.columns:
-        return pd.DataFrame()
-    if "매당_인시분" not in work.columns:
-        if standards is None or standards.empty:
-            return pd.DataFrame()
-        std = standards.rename(columns={"공정": "영역"})
-        work = work.merge(std[["영역", "매당_인시분"]], on="영역", how="left")
-    work = work[work["매당_인시분"].notna() & (work["매당_인시분"] > 0)]
-    if work.empty:
-        return pd.DataFrame()
-    man = pd.to_numeric(work["인력"], errors="coerce").fillna(0)
-    qty = pd.to_numeric(work["실적"], errors="coerce").fillna(0)
-    work["투입인시분"] = (man * float(available_min)).round(1)
-    work["실적인시분"] = (qty * work["매당_인시분"]).round(1)
-    work["인당시간활용률"] = work.apply(
-        lambda r: round(float(r["실적인시분"]) / float(r["투입인시분"]) * 100, 1) if r["투입인시분"] else None,
-        axis=1,
-    )
-    work["이론인당매수"] = work["매당_인시분"].map(
-        lambda t: round(float(available_min) / float(t), 1) if t else None
-    )
-    work["실적인당매수"] = work.apply(
-        lambda r: round(float(r["실적"]) / float(r["인력"]), 1) if r["인력"] else None,
-        axis=1,
-    )
-    cols = [
-        c
-        for c in (
-            "일자",
-            "캠퍼스",
-            "조",
-            "주야",
-            "제품코드",
-            "영역",
-            "인력",
-            "실적",
-            "매당_인시분",
-            "투입인시분",
-            "실적인시분",
-            "인당시간활용률",
-            "이론인당매수",
-            "실적인당매수",
-        )
-        if c in work.columns
-    ]
-    return work[cols].rename(columns={"영역": "공정"}).reset_index(drop=True)
-
-
-def read_csv_table(path: Path) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix in (".xlsx", ".xls"):
-        df = pd.read_excel(path)
-        return df.dropna(how="all").reset_index(drop=True)
-    last_err: Exception | None = None
+def _read_plan_csv(raw: bytes) -> pd.DataFrame:
     for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
         try:
-            df = pd.read_csv(path, encoding=enc)
-            return df.dropna(how="all").reset_index(drop=True)
-        except UnicodeDecodeError as e:
-            last_err = e
-    if last_err:
-        raise last_err
+            return pd.read_csv(BytesIO(raw), encoding=enc).dropna(how="all")
+        except UnicodeDecodeError:
+            continue
     return pd.DataFrame()
 
 
-def master_github_paths(stem: str) -> list[str]:
-    """저장소에서 찾을 기준정보 경로. 파일명은 설비_기준정보 / 제품_기준정보 / 제품별_실적."""
-    paths: list[str] = []
-    for folder in MASTER_GH_FOLDERS:
-        for ext in (".xlsx", ".csv", ".xls"):
-            paths.append(f"{folder}/{stem}{ext}")
-    for ext in (".xlsx", ".csv", ".xls"):
-        paths.append(f"{stem}{ext}")
-    return paths
+def master_dir():
+    folder = data_dir() / "master"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
-def canonical_master_name(filename: str, prefix: str) -> str:
-    suffix = Path(filename).suffix.lower()
-    if suffix not in (".csv", ".xlsx", ".xls"):
-        suffix = ".csv"
-    return f"{prefix}{suffix}"
+def _list_master_paths(stem: str | None = None) -> list[Path]:
+    folder = master_dir()
+    stems = (stem,) if stem else MASTER_STEMS
+    files: list[Path] = []
+    for s in stems:
+        files.extend(folder.glob(f"{s}*.csv"))
+        files.extend(folder.glob(f"{s}*.xlsx"))
+        files.extend(folder.glob(f"{s}*.xls"))
+    return [p for p in files if not p.name.startswith("~$")]
 
 
-def newest_matching(folder: Path, prefix: str) -> Path | None:
-    files = (
-        list(folder.glob(f"{prefix}*.csv"))
-        + list(folder.glob(f"{prefix}*.xlsx"))
-        + list(folder.glob(f"{prefix}*.xls"))
+def _clear_master_files(stem: str | None = None) -> list[str]:
+    """운영 중 기준정보 파일을 지운다. stem 없으면 전부."""
+    deleted: list[str] = []
+    for path in _list_master_paths(stem):
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except OSError:
+            continue
+    return deleted
+
+
+def _push_master_github(filename: str, content: bytes) -> str:
+    if not github_store_enabled():
+        return ""
+    rel = f"templates/{filename}"
+    try:
+        _, sha = github_file_get(rel)
+        github_file_put(rel, content, f"chore: update {filename}", sha)
+        return f"GitHub 반영: {rel}"
+    except Exception as e:
+        return f"GitHub 저장 실패: {e}"
+
+
+def _sync_master_from_github(*, force: bool = False) -> list[str]:
+    """GitHub templates → data/master.
+
+    - force=False: 로컬에 이미 있는 종류는 유지(업로드분 덮어쓰지 않음). 없는 종류만 가져옴.
+    - force=True: 로컬을 지우고 저장소에서 다시 받음.
+    """
+    if not github_store_enabled():
+        return ["GitHub Secrets([github] token/repo)가 없어 로컬·업로드 파일만 사용합니다."]
+    if not force and st.session_state.get("sim_gh_master_ok"):
+        return list(st.session_state.get("sim_gh_master_notes") or [])
+    notes: list[str] = []
+    folder = master_dir()
+    if force:
+        cleared = _clear_master_files()
+        if cleared:
+            notes.append("로컬 기준정보 초기화: " + ", ".join(cleared))
+    for stem in MASTER_STEMS:
+        local = newest_matching(folder, stem)
+        if local is not None and not force:
+            notes.append(f"{stem}: 로컬 유지 ({local.name})")
+            continue
+        found_rel = None
+        found_raw = None
+        for rel in master_github_paths(stem):
+            try:
+                raw, _sha = github_file_get(rel)
+            except Exception as e:
+                if "404" in str(e):
+                    continue
+                notes.append(f"{stem}: GitHub 오류 ({e})")
+                found_rel = "__error__"
+                break
+            if raw:
+                found_rel, found_raw = rel, raw
+                break
+        if found_rel == "__error__":
+            continue
+        if found_rel and found_raw:
+            dest = folder / Path(found_rel).name
+            if not dest.name.startswith(stem):
+                dest = folder / f"{stem}{Path(found_rel).suffix}"
+            _clear_master_files(stem)
+            dest.write_bytes(found_raw)
+            notes.append(f"GitHub에서 가져옴: {found_rel}")
+        else:
+            notes.append(f"{stem}: 저장소에 없음 (templates/{stem}.csv 또는 .xlsx)")
+    st.session_state["sim_gh_master_ok"] = True
+    st.session_state["sim_gh_master_notes"] = notes
+    return notes
+
+
+def _save_upload(uploaded, prefix: str):
+    """같은 종류 옛 파일을 지우고 새 파일만 운영한다."""
+    name = canonical_master_name(uploaded.name, prefix)
+    _clear_master_files(prefix)
+    dest = master_dir() / name
+    data = uploaded.getvalue()
+    dest.write_bytes(data)
+    # 업로드분을 GitHub 재동기화가 덮어쓰지 않도록
+    st.session_state["sim_gh_master_ok"] = True
+    st.session_state.pop("sim_gh_master_notes", None)
+    gh = _push_master_github(name, data)
+    return dest, gh
+
+
+def _render_master_reset_ui() -> None:
+    flag = "sim_confirm_reset_master"
+    if flag not in st.session_state:
+        st.session_state[flag] = False
+    files = _list_master_paths()
+    if not files:
+        st.caption("초기화할 운영 기준정보가 없습니다.")
+        return
+    if not st.session_state[flag]:
+        if st.button("운영 기준정보 초기화", use_container_width=True, key="sim_btn_reset_master"):
+            st.session_state[flag] = True
+            st.rerun()
+        return
+    st.warning("지금 운영 중인 기준정보 파일을 모두 삭제합니다. 그다음 새로 업로드하면 됩니다.")
+    st.caption("삭제 대상: " + ", ".join(p.name for p in files))
+    yes, no = st.columns(2)
+    with yes:
+        if st.button("삭제", type="primary", use_container_width=True, key="sim_reset_master_yes"):
+            deleted = _clear_master_files()
+            st.session_state[flag] = False
+            st.session_state["sim_gh_master_ok"] = False
+            st.session_state.pop("sim_gh_master_notes", None)
+            for k in ("sim_eq_sig", "sim_man_sig", "sim_pr_sig", "sim_act_sig"):
+                st.session_state.pop(k, None)
+            st.session_state["sim_flash"] = "기준정보 초기화 완료: " + (", ".join(deleted) if deleted else "없음")
+            st.rerun()
+    with no:
+        if st.button("취소", use_container_width=True, key="sim_reset_master_no"):
+            st.session_state[flag] = False
+            st.rerun()
+
+
+def _active_master_files() -> list[dict[str, str]]:
+    """지금 운영에 쓰는 기준정보 파일 목록."""
+    folder = master_dir()
+    rows: list[dict[str, str]] = []
+    for label, stem in (
+        ("설비", "설비_기준정보"),
+        ("인력", "인력_기준정보"),
+        ("제품", "제품_기준정보"),
+        ("제품별 실적", "제품별_실적"),
+    ):
+        path = newest_matching(folder, stem)
+        if path is None:
+            rows.append({"구분": label, "파일": "(없음)", "상태": "미등록"})
+            continue
+        try:
+            mtime = pd.Timestamp(path.stat().st_mtime, unit="s").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            mtime = "-"
+        rows.append({"구분": label, "파일": path.name, "상태": f"운영중 · {mtime}"})
+    return rows
+
+
+def _load_master() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    folder = master_dir()
+    notes: list[str] = []
+    eq_path = newest_matching(folder, "설비_기준정보")
+    man_path = newest_matching(folder, "인력_기준정보")
+    pr_path = newest_matching(folder, "제품_기준정보")
+    act_path = newest_matching(folder, "제품별_실적")
+    equip = pd.DataFrame()
+    manpower = pd.DataFrame()
+    products = pd.DataFrame()
+    actuals = pd.DataFrame()
+    if eq_path:
+        equip = normalize_equipment(read_csv_table(eq_path))
+        notes.append(f"설비: {eq_path.name} ({len(equip)}행)")
+    else:
+        notes.append("설비 기준정보가 없습니다. (설비 공정용)")
+    if man_path:
+        manpower = normalize_manpower(read_csv_table(man_path))
+        notes.append(f"인력: {man_path.name} ({len(manpower)}행)")
+    else:
+        notes.append("인력 기준정보가 없습니다. (외관 등 수작업 공정용)")
+    if pr_path:
+        products = normalize_products(read_csv_table(pr_path))
+        notes.append(f"제품: {pr_path.name} ({len(products)}행)")
+    else:
+        notes.append("제품 기준정보가 없습니다. GitHub templates/ 또는 업로드하세요.")
+    if act_path:
+        actuals = normalize_product_actuals(read_csv_table(act_path))
+        notes.append(f"제품별 실적: {act_path.name} ({len(actuals)}행)")
+    return equip, manpower, products, actuals, notes
+
+
+def render() -> None:
+    st.title("설비 운영 시뮬레이션")
+    st.caption(
+        "보유 설비·인력과 제품 택트로 하루 능력을 보고, 실적 대비 인당 시간 활용률을 계산합니다. "
+        "인력 기준정보의 인원은 **전 공정·3개조 합계**로 두고, 하루 능력은 근무조(기본 2/3)만 반영합니다. "
+        "설비 대수는 설비_기준정보를 캠퍼스·공정으로 합산합니다. "
+        "외관처럼 설비 없이 사람이 하는 공정은 `인력_기준정보`에 넣습니다. "
+        "GitHub `templates/`에 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적을 올리면 자동으로 가져옵니다."
     )
-    files = [p for p in files if not p.name.startswith("~$")]
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
 
+    records, rec_notes, _chosen = load_records()
 
-def normalize_product_actuals(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=list(PRODUCT_ACTUAL_COLUMNS))
-    work = _rename_by_alias(
-        df.dropna(how="all").copy(),
-        {
-            "일자": ("일자", "날짜", "date"),
-            "캠퍼스": ("캠퍼스", "campus"),
-            "조": ("조", "team"),
-            "주야": ("주야", "shift"),
-            "제품코드": ("제품코드", "품번"),
-            "공정": ("공정", "영역"),
-            "인력": ("인력", "인원"),
-            "실적": ("실적", "수량", "매수"),
-        },
-    )
-    for c in PRODUCT_ACTUAL_COLUMNS:
-        if c not in work.columns:
-            work[c] = None
-    work["제품코드"] = work["제품코드"].map(_norm)
-    work["공정"] = work["공정"].map(_norm)
-    work["인력"] = work["인력"].map(lambda v: _num(v, 0))
-    work["실적"] = work["실적"].map(lambda v: _num(v, 0))
-    return work[(work["제품코드"] != "") & (work["공정"] != "")].reset_index(drop=True)
+    # GitHub 다시 가져오기 / 초기화 직후 메시지
+    force_gh = bool(st.session_state.pop("sim_gh_force_refresh", False))
+    if force_gh:
+        _sync_master_from_github(force=True)
+        st.session_state["sim_flash"] = "GitHub 기준정보 다시 가져오기 완료"
+    else:
+        _sync_master_from_github()
+
+    equip, manpower, products, product_actuals, _master_notes = _load_master()
+
+    flash = st.session_state.pop("sim_flash", None)
+    st.session_state.pop("sim_flash_detail", None)
+    if flash:
+        st.success(flash)
+
+    campus_sel: list[str] = []
+    shift_sel: list[str] = []
+    area_sel = list(AREAS)
+    team_sel: list[str] = []
+    available_min = float(DEFAULT_SHIFT_MINUTES)
+    shift_teams = DEFAULT_SHIFT_TEAMS
+    working_teams = DEFAULT_WORKING_TEAMS
+
+    with st.sidebar:
+        st.header("계정")
+        render_logout_controls()
+        st.divider()
+        st.header("조회 조건")
+        campus_opts = []
+        if not equip.empty:
+            campus_opts = sorted(equip["캠퍼스"].dropna().unique().tolist())
+        if not manpower.empty and "캠퍼스" in manpower.columns:
+            campus_opts = sorted(set(campus_opts) | set(manpower["캠퍼스"].dropna().unique().tolist()))
+        if records is not None and not records.empty and "캠퍼스" in records.columns:
+            campus_opts = sorted(set(campus_opts) | set(records["캠퍼스"].dropna().unique().tolist()))
+        if not campus_opts:
+            campus_opts = list(CAMPUSES)
+        prefer = [c for c in CAMPUSES if c in campus_opts]
+        campus_sel = render_slicer(
+            "캠퍼스",
+            prefer + [c for c in campus_opts if c not in prefer],
+            key="sim_campus",
+            default_on=True,
+        )
+        area_sel = render_slicer("공정", list(AREAS), key="sim_area", default_on=True)
+        if not records.empty:
+            shifts = sorted(records["주야"].dropna().unique().tolist()) if "주야" in records.columns else list(SHIFTS)
+            prefer_s = [s for s in SHIFTS if s in shifts]
+            shift_sel = render_slicer(
+                "주/야",
+                prefer_s + [s for s in shifts if s not in prefer_s],
+                key="sim_shift",
+                default_on=True,
+            )
+            teams = sorted(records["조"].dropna().unique().tolist()) if "조" in records.columns else []
+            team_sel = render_slicer("조", teams, key="sim_team", default_on=True) if teams else []
+        st.markdown("**교대·인원 환산 (능력 계산)**")
+        shift_teams = int(
+            st.number_input(
+                "총 조 수",
+                min_value=1,
+                max_value=6,
+                value=DEFAULT_SHIFT_TEAMS,
+                step=1,
+                help="인력 기준정보의 인원에 포함된 조 수. 3조 2교대면 3.",
+                key="sim_shift_teams",
+            )
+        )
+        working_teams = int(
+            st.number_input(
+                "하루 근무 조 수",
+                min_value=1,
+                max_value=shift_teams,
+                value=min(DEFAULT_WORKING_TEAMS, shift_teams),
+                step=1,
+                help="하루 실제로 근무하는 조 수. 3조 2교대면 2 (주·야), 1조는 휴무.",
+                key="sim_working_teams",
+            )
+        )
+        st.caption(
+            f"근무인원 = 총인원 × ({working_teams}/{shift_teams}) = 총인원 × {working_teams / shift_teams:.4g}. "
+            "설비 능력(대수×1440)에는 적용하지 않습니다."
+        )
+        available_min = float(
+            st.number_input(
+                "인당 가용 분 (활용률 분모)",
+                min_value=60,
+                max_value=1440,
+                value=DEFAULT_SHIFT_MINUTES,
+                step=60,
+                help="실적 활용률 분모. 1인 1교대 기준이면 보통 720(12시간). 설비 이론능력은 대수×1440.",
+            )
+        )
+        if github_store_enabled():
+            if st.button("GitHub에서 기준정보 다시 가져오기", use_container_width=True, key="sim_gh_refresh"):
+                st.session_state["sim_gh_force_refresh"] = True
+                st.session_state["sim_gh_master_ok"] = False
+                st.rerun()
+        else:
+            st.caption("GitHub Secrets([github] token/repo)가 없으면 다시 가져오기를 쓸 수 없습니다.")
+
+        st.divider()
+        st.header("기준정보 등록")
+        st.caption(
+            "파일명: 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx). "
+            "외관 등 수작업은 인력_기준정보에 인원을 넣으세요. "
+            "치수·Hole 등 설비 공정도 인력_기준정보에 공정별 인원을 넣으면 총인원/근무인원에 반영됩니다. "
+            "새로 올리면 같은 종류의 이전 운영 파일은 자동으로 교체됩니다."
+        )
+        st.markdown("**지금 운영 중**")
+        active_df = pd.DataFrame(_active_master_files())
+        st.dataframe(active_df, use_container_width=True, hide_index=True)
+        _render_master_reset_ui()
+        eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
+        man_up = st.file_uploader("② 인력_기준정보 (외관 등)", type=["csv", "xlsx"], key="sim_up_man")
+        pr_up = st.file_uploader("③ 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
+        act_up = st.file_uploader("④ 제품별_실적", type=["csv", "xlsx"], key="sim_up_act")
+        eq_sig = (eq_up.name, int(getattr(eq_up, "size", 0) or 0)) if eq_up else None
+        man_sig = (man_up.name, int(getattr(man_up, "size", 0) or 0)) if man_up else None
+        pr_sig = (pr_up.name, int(getattr(pr_up, "size", 0) or 0)) if pr_up else None
+        act_sig = (act_up.name, int(getattr(act_up, "size", 0) or 0)) if act_up else None
+        if eq_up is not None and eq_sig != st.session_state.get("sim_eq_sig"):
+            path, gh = _save_upload(eq_up, "설비_기준정보")
+            st.session_state["sim_eq_sig"] = eq_sig
+            st.session_state["sim_flash"] = f"설비 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+            st.rerun()
+        if man_up is not None and man_sig != st.session_state.get("sim_man_sig"):
+            path, gh = _save_upload(man_up, "인력_기준정보")
+            st.session_state["sim_man_sig"] = man_sig
+            st.session_state["sim_flash"] = f"인력 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+            st.rerun()
+        if pr_up is not None and pr_sig != st.session_state.get("sim_pr_sig"):
+            path, gh = _save_upload(pr_up, "제품_기준정보")
+            st.session_state["sim_pr_sig"] = pr_sig
+            st.session_state["sim_flash"] = f"제품 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+            st.rerun()
+        if act_up is not None and act_sig != st.session_state.get("sim_act_sig"):
+            path, gh = _save_upload(act_up, "제품별_실적")
+            st.session_state["sim_act_sig"] = act_sig
+            st.session_state["sim_flash"] = f"제품별 실적 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+            st.rerun()
+        st.subheader("양식 받기")
+        st.caption("엑셀에서 한글이 깨지면 xlsx를 받으세요.")
+        st.download_button(
+            "인력 기준정보 엑셀 (외관 등)",
+            data=xlsx_bytes(manpower_template(), "인력"),
+            file_name="인력_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_man_xlsx",
+        )
+        st.download_button(
+            "제품 기준정보 엑셀",
+            data=xlsx_bytes(product_template(), "제품"),
+            file_name="제품_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_pr_xlsx",
+        )
+        st.download_button(
+            "설비 기준정보 엑셀",
+            data=xlsx_bytes(equipment_template(), "설비"),
+            file_name="설비_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_eq_xlsx",
+        )
+        st.download_button(
+            "제품별_실적 엑셀",
+            data=xlsx_bytes(product_actual_template(), "제품실적"),
+            file_name="제품별_실적.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="sim_dl_act_xlsx",
+        )
+        with st.expander("빈 양식 · CSV"):
+            st.download_button(
+                "인력 기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(MANPOWER_COLUMNS, "인력"),
+                file_name="인력_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_man_xlsx_empty",
+            )
+            st.download_button(
+                "제품 기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
+                file_name="제품_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_pr_xlsx_empty",
+            )
+            st.download_button(
+                "설비 기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(EQUIP_COLUMNS, "설비"),
+                file_name="설비_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_eq_xlsx_empty",
+            )
+            st.download_button(
+                "제품별_실적 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_ACTUAL_COLUMNS, "제품실적"),
+                file_name="제품별_실적_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="sim_dl_act_xlsx_empty",
+            )
+            st.download_button(
+                "인력 기준정보 CSV",
+                data=csv_bytes(manpower_template()),
+                file_name="인력_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_man_ex",
+            )
+            st.download_button(
+                "설비 기준정보 CSV",
+                data=csv_bytes(equipment_template()),
+                file_name="설비_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_eq_ex",
+            )
+            st.download_button(
+                "제품 기준정보 CSV",
+                data=csv_bytes(product_template()),
+                file_name="제품_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_pr_ex",
+            )
+            st.download_button(
+                "제품별_실적 CSV",
+                data=csv_bytes(product_actual_template()),
+                file_name="제품별_실적.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="sim_dl_act",
+            )
+
+    eq_view = equip.copy()
+    man_view = manpower.copy()
+    pr_view = products.copy()
+    if campus_sel and not eq_view.empty:
+        eq_view = eq_view[eq_view["캠퍼스"].isin(campus_sel) | (eq_view["캠퍼스"] == "")]
+    if campus_sel and not man_view.empty:
+        man_view = man_view[man_view["캠퍼스"].isin(campus_sel) | (man_view["캠퍼스"] == "")]
+    if area_sel and not eq_view.empty:
+        eq_view = eq_view[eq_view["공정"].isin(area_sel)]
+    if area_sel and not man_view.empty:
+        man_view = man_view[man_view["공정"].isin(area_sel)]
+    if area_sel and not pr_view.empty:
+        pr_view = pr_view[pr_view["공정"].isin(area_sel)]
+
+    tab_sim, tab_master, tab_util = st.tabs(["운영 시뮬레이션", "기준정보", "실적 시간 활용"])
+
+    with tab_master:
+        st.subheader("현재 적용 중인 기준")
+        st.markdown("**설비** — 가동여부가 Y/가동/1 이면 시뮬레이션에 포함합니다.")
+        if eq_view.empty:
+            st.info("설비 기준정보를 업로드하세요. (종합측정실·치수·Hole 등)")
+        else:
+            st.dataframe(eq_view.drop(columns=["가동"], errors="ignore"), use_container_width=True)
+            by = eq_view[eq_view["가동"]].groupby(["캠퍼스", "공정"], as_index=False)["대수"].sum()
+            st.caption("가동 대수 합계")
+            st.dataframe(by, use_container_width=True)
+        st.markdown(
+            "**인력** — `인력_기준정보`는 **캠퍼스+공정** 단위로 둡니다. "
+            "치수처럼 설비가 2종이어도 인원을 설비별로 나누지 않습니다. "
+            "`인원`은 3개조 합계, `가용분`은 1인 1교대 분(권장 720). "
+            f"인력 능력 = 총인원×({working_teams}/{shift_teams}) × 가용분 ÷ 매당_인시분."
+        )
+        if man_view.empty:
+            st.info("인력 기준정보를 업로드하세요. (전 공정 인원)")
+        else:
+            st.dataframe(man_view.drop(columns=["가동"], errors="ignore"), use_container_width=True)
+        st.markdown(
+            "**제품** — `제약유형`이 설비가면 매당_설비분, 인력이면 매당_인시분을 씁니다. "
+            "외관은 제약유형=인력, 설비코드는 비워 두면 됩니다."
+        )
+        if pr_view.empty:
+            st.info("제품 기준정보를 업로드하세요.")
+        else:
+            st.dataframe(pr_view, use_container_width=True)
+        st.markdown("**제품별 실적** — 있으면 활용률을 제품 택트 기준으로 계산합니다.")
+        if product_actuals.empty:
+            st.caption("없으면 기존 공정 실적 파일로 계산합니다.")
+        else:
+            st.dataframe(product_actuals, use_container_width=True)
+
+    with tab_sim:
+        st.subheader("일별 최적 처리")
+        st.caption(
+            "아래 두 칸에 **직접 올린** 출하계획·공정 재공 파일로 계산합니다. "
+            "csv, xlsx 모두 됩니다. 일자별 수량 열을 그대로 반영하고, 기본은「전체」일자입니다."
+        )
+
+        up1, up2 = st.columns(2)
+        with up1:
+            ship_file = st.file_uploader(
+                "출하계획 (긴급품)",
+                type=["xlsx", "xls", "csv"],
+                key="sim_ship_upload",
+                help="일별_출하계획 xlsx의 '긴급품' 시트, 또는 templates/출하계획_샘플.csv",
+            )
+        with up2:
+            wip_file = st.file_uploader(
+                "공정 재공",
+                type=["xlsx", "xls", "csv"],
+                key="sim_wip_upload",
+                help="공정 재공 현황 xlsx, 또는 templates/공정재공_샘플.csv",
+            )
+
+        if ship_file is not None:
+            sig = (ship_file.name, int(getattr(ship_file, "size", 0) or 0))
+            if sig != st.session_state.get("sim_ship_sig"):
+                try:
+                    raw_ship, _ = read_shipping_excel(ship_file.getvalue())
+                    if raw_ship is None or raw_ship.empty:
+                        raise ValueError(
+                            "데이터 행이 없습니다. 헤더는 우선순위, 품목코드, 재공, 완제품, 부족분, 날짜 열입니다."
+                        )
+                    raw_ship = raw_ship.copy()
+                    raw_ship.columns = [
+                        str(c).replace("\n", " ").strip() for c in raw_ship.columns
+                    ]
+                    st.session_state["sim_ship_raw"] = raw_ship
+                    st.session_state["sim_ship_sig"] = sig
+                    st.session_state["sim_ship_fname"] = ship_file.name
+                    st.session_state.pop("sim_ship_err", None)
+                    # 이전 단일일(예: 9/17) 선택이 남지 않도록 전체로 초기화
+                    st.session_state["sim_ship_day_v2"] = "전체"
+                except Exception as e:
+                    st.session_state["sim_ship_raw"] = None
+                    st.session_state["sim_ship_err"] = str(e)
+                    st.error(f"출하계획 읽기 실패: {e}")
+        else:
+            st.session_state["sim_ship_raw"] = None
+            st.session_state["sim_ship_sig"] = None
+            st.session_state.pop("sim_ship_err", None)
+
+        if wip_file is not None:
+            sig = (wip_file.name, int(getattr(wip_file, "size", 0) or 0))
+            if sig != st.session_state.get("sim_wip_sig"):
+                try:
+                    wip_norm = read_wip_excel(wip_file.getvalue())
+                    if wip_norm is None or wip_norm.empty:
+                        raise ValueError(
+                            "데이터 행이 없습니다. 헤더는 사업장, 공정, 공정명, 제품, 제품구분입니다."
+                        )
+                    st.session_state["sim_wip_df"] = wip_norm
+                    st.session_state["sim_wip_sig"] = sig
+                    st.session_state["sim_wip_fname"] = wip_file.name
+                    st.session_state.pop("sim_wip_err", None)
+                except Exception as e:
+                    st.session_state["sim_wip_df"] = None
+                    st.session_state["sim_wip_err"] = str(e)
+                    st.error(f"재공 읽기 실패: {e}")
+        else:
+            st.session_state["sim_wip_df"] = None
+            st.session_state["sim_wip_sig"] = None
+            st.session_state.pop("sim_wip_err", None)
+
+        ship_raw = st.session_state.get("sim_ship_raw")
+        wip_df = st.session_state.get("sim_wip_df")
+        if ship_raw is not None and not getattr(ship_raw, "empty", True):
+            ship_raw = ship_raw.copy()
+            ship_raw.columns = [
+                str(c).replace("\n", " ").strip() for c in ship_raw.columns
+            ]
+
+        if ship_raw is None or wip_df is None:
+            if not (
+                st.session_state.get("sim_ship_err") or st.session_state.get("sim_wip_err")
+            ):
+                missing = []
+                if ship_raw is None:
+                    missing.append("출하계획")
+                if wip_df is None:
+                    missing.append("공정 재공")
+                st.info(
+                    f"{'과 '.join(missing)} 파일을 업로드하세요. Excel(xlsx)과 CSV 모두 됩니다."
+                )
+            st.caption(
+                "템플릿 폴더에서 읽지 않습니다. 이 화면에서 올린 파일만 사용합니다."
+            )
+        else:
+            date_opts = shipping_date_options(ship_raw)
+            if not date_opts:
+                st.warning("긴급품 시트에서 출하 일자 열을 찾지 못했습니다.")
+            else:
+                if "sim_ship_day_v2" not in st.session_state:
+                    st.session_state["sim_ship_day_v2"] = "전체"
+                ship_day = st.selectbox(
+                    "출하 기준일",
+                    options=date_opts,
+                    key="sim_ship_day_v2",
+                    help="「전체」= 엑셀의 9/17·9/18·… 수량 열을 각각 출하예정일로 반영. 특정일만 보려면 해당 일자를 선택.",
+                )
+                ship_norm = normalize_shipping_urgent(
+                    ship_raw,
+                    ship_date=None if ship_day == "전체" else ship_day,
+                )
+                wip_agg = aggregate_wip(wip_df)
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("출하 품목", f"{ship_norm['제품코드'].nunique()}종")
+                with c2:
+                    st.metric("출하 예정수량", f"{float(ship_norm['출하예정수량'].sum()):,.0f}매")
+                with c3:
+                    st.metric(
+                        "출하 일자 수",
+                        f"{ship_norm['출하예정일'].nunique()}일" if not ship_norm.empty else "0일",
+                    )
+                with c4:
+                    st.metric(
+                        "재공 매수",
+                        f"{float(wip_agg['재공매수'].sum()) if not wip_agg.empty else 0:,.0f}매",
+                    )
+
+                st.caption(
+                    f"출하: **{st.session_state.get('sim_ship_fname', '')}** · "
+                    f"재공: **{st.session_state.get('sim_wip_fname', '')}** · 기준일 {ship_day}"
+                )
+                if not ship_norm.empty:
+                    by_day = (
+                        ship_norm.groupby("출하예정일", as_index=False)
+                        .agg(품목수=("제품코드", "nunique"), 예정수량=("출하예정수량", "sum"))
+                        .sort_values("출하예정일")
+                    )
+                    st.caption(
+                        "일자별 출하: "
+                        + " · ".join(
+                            f"{r['출하예정일']} {int(r['예정수량'])}매/{int(r['품목수'])}종"
+                            for _, r in by_day.iterrows()
+                        )
+                    )
+
+                with st.expander("출하 예정(일자별 펼침)", expanded=False):
+                    st.dataframe(ship_norm, use_container_width=True, hide_index=True)
+                with st.expander("재공 집계", expanded=False):
+                    st.dataframe(wip_agg, use_container_width=True, hide_index=True)
+
+                floor = daily_optimal_from_wip_shipping(
+                    wip_df, ship_norm, products=pr_view
+                )
+                st.markdown("### 일별 최적 처리 (현장용)")
+                st.caption(
+                    "① 완제품 차감 → ② 순필요만 공정 재공 배분(외관→Hole→치수). Hole은 CEL만. "
+                    "탭은 공정명 우선(치수=저항·3D, 종합측정실, Hole, 외관). "
+                    "이름에 안 맞으면 공정코드가 커질수록 치수 → Hole → 외관."
+                )
+                if floor.empty:
+                    st.warning("결과가 비었습니다. 출하일 수량·재공 제품코드를 확인하세요.")
+                else:
+                    hide_fg = st.checkbox(
+                        "완제품 충당 행 숨기기 (현장 처리 불필요)",
+                        value=True,
+                        key="sim_hide_fg_covered",
+                    )
+                    floor_base = (
+                        floor[floor["상태"] != "완제품충당"].copy()
+                        if hide_fg
+                        else floor.copy()
+                    )
+
+                    day_tag = "전체일자" if ship_day == "전체" else ship_day
+                    area_tabs_order = ("치수", "Hole", "외관", "종합측정실")
+                    hole_from, appearance_from = route_code_bounds(floor_base)
+
+                    def _display_area(row: pd.Series) -> str | None:
+                        named = ""
+                        if process_name_matches_area(row.get("공정명"), "종합측정실"):
+                            named = "종합측정실"
+                        elif process_name_matches_area(row.get("공정명"), "외관"):
+                            named = "외관"
+                        elif process_name_matches_area(row.get("공정명"), "Hole"):
+                            named = "Hole"
+                        elif process_name_matches_area(row.get("공정명"), "치수"):
+                            named = "치수"
+                        if named:
+                            return named
+                        coded = area_by_process_code(
+                            row.get("공정코드"),
+                            hole_from=hole_from,
+                            appearance_from=appearance_from,
+                        )
+                        if coded in ("치수", "Hole", "외관"):
+                            return coded
+                        return None
+
+                    display_area = floor_base.apply(_display_area, axis=1)
+                    area_frames: dict[str, pd.DataFrame] = {}
+                    for area in area_tabs_order:
+                        sub = floor_base[display_area == area].copy()
+                        if not sub.empty:
+                            sub = sub.reset_index(drop=True)
+                            sub["처리순서"] = range(1, len(sub) + 1)
+                            sub["검사영역"] = area
+                        area_frames[area] = sub
+                    unassigned = floor_base[display_area.isna()].copy()
+                    if not unassigned.empty:
+                        unassigned = unassigned.reset_index(drop=True)
+                        unassigned["처리순서"] = range(1, len(unassigned) + 1)
+
+                    tab_labels = [f"{a} ({len(area_frames[a])})" for a in area_tabs_order]
+                    tab_labels.append(f"미배정 ({len(unassigned)})")
+                    tabs = st.tabs(tab_labels)
+
+                    def _render_area_block(
+                        area_name: str,
+                        df_area: pd.DataFrame,
+                        *,
+                        key_prefix: str,
+                    ) -> None:
+                        if df_area.empty:
+                            st.info(f"{area_name}: 표시할 행이 없습니다.")
+                            return
+                        ok_n = int((df_area["상태"] == "처리가능").sum())
+                        miss_n = int((df_area["상태"] == "재공없음").sum())
+                        short_n = int((df_area["상태"] == "재공부족").sum())
+                        wait_n = int((df_area["상태"] == "대기(재고배분완료)").sum())
+                        qty = float(
+                            pd.to_numeric(df_area["권장처리매수"], errors="coerce")
+                            .fillna(0)
+                            .sum()
+                        )
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        with c1:
+                            st.metric("행수", f"{len(df_area)}")
+                        with c2:
+                            st.metric("처리가능", f"{ok_n}")
+                        with c3:
+                            st.metric("재공부족", f"{short_n}")
+                        with c4:
+                            st.metric("재공없음/대기", f"{miss_n + wait_n}")
+                        with c5:
+                            st.metric("권장처리합", f"{qty:,.0f}매")
+                        st.dataframe(df_area, use_container_width=True, hide_index=True)
+
+                        camps = [
+                            c
+                            for c in ("천안", "아산")
+                            if c in set(df_area["사업장"].dropna().astype(str))
+                            or (not campus_sel or c in campus_sel)
+                        ]
+                        if not camps:
+                            camps = ["천안", "아산"]
+                        dl = st.columns(1 + len(camps))
+                        with dl[0]:
+                            st.download_button(
+                                f"{area_name} 전체 CSV",
+                                data=csv_bytes(df_area),
+                                file_name=f"일별_최적처리_{area_name}_{day_tag}.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                                key=f"{key_prefix}_all",
+                            )
+                        for i, camp_name in enumerate(camps):
+                            camp_df = df_area[df_area["사업장"] == camp_name]
+                            with dl[i + 1]:
+                                st.download_button(
+                                    f"{camp_name}",
+                                    data=csv_bytes(camp_df),
+                                    file_name=f"일별_최적처리_{area_name}_{camp_name}_{day_tag}.csv",
+                                    mime="text/csv",
+                                    use_container_width=True,
+                                    key=f"{key_prefix}_{camp_name}",
+                                    disabled=camp_df.empty,
+                                )
+
+                    for tab, area in zip(tabs[:4], area_tabs_order):
+                        with tab:
+                            _render_area_block(
+                                area,
+                                area_frames[area],
+                                key_prefix=f"sim_dl_{area}",
+                            )
+                    with tabs[4]:
+                        st.caption(
+                            f"공정코드가 없는 행만 남깁니다. "
+                            f"코드가 있으면 {hole_from:.0f} 미만은 치수, "
+                            f"{hole_from:.0f}부터 Hole, {appearance_from:.0f}부터 외관입니다."
+                        )
+                        _render_area_block(
+                            "미배정",
+                            unassigned,
+                            key_prefix="sim_dl_unassigned",
+                        )
+
+                    fg_n = int((floor["상태"] == "완제품충당").sum())
+                    st.caption(
+                        f"전체 원본 {len(floor)}행 · 완제품충당 {fg_n}건"
+                        + (" (숨김)" if hide_fg else "")
+                    )
+                    st.download_button(
+                        "전 영역 통합 CSV",
+                        data=csv_bytes(floor),
+                        file_name=f"일별_최적처리_통합_{day_tag}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="sim_dl_opt_all",
+                    )
+
+        # ----- 후순위: 월 생산 계획 (능력 검토) -----
+        st.divider()
+        with st.expander("월 생산 계획 (후순위 · 능력 검토)", expanded=False):
+            st.caption(
+                "재공·출하 일별 처리와 별개입니다. "
+                "제품코드+월목표 CSV로 월/일 가능·병목·일평균을 참고용으로 봅니다."
+            )
+            if pr_view.empty or (eq_view.empty and man_view.empty):
+                st.warning("제품·설비·인력 기준정보가 있어야 월 계획을 검토할 수 있습니다.")
+            else:
+                work_days = int(
+                    st.number_input(
+                        "월 작업일수",
+                        min_value=1,
+                        max_value=31,
+                        value=DEFAULT_WORK_DAYS,
+                        step=1,
+                        key="sim_work_days",
+                        help="일목표 = 월목표 ÷ 작업일수",
+                    )
+                )
+                pdl, pup = st.columns(2)
+                with pdl:
+                    st.download_button(
+                        "월 생산계획 양식 CSV",
+                        data=csv_bytes(monthly_plan_template()),
+                        file_name="월_생산계획.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="sim_dl_plan_csv",
+                    )
+                with pup:
+                    plan_file = st.file_uploader(
+                        "월 생산계획 CSV",
+                        type=["csv"],
+                        key="sim_plan_upload",
+                        help="열: 제품코드, 월목표매수",
+                    )
+                if plan_file is not None:
+                    sig = (plan_file.name, int(getattr(plan_file, "size", 0) or 0))
+                    if sig != st.session_state.get("sim_plan_sig"):
+                        try:
+                            uploaded = _read_plan_csv(plan_file.getvalue())
+                        except Exception:
+                            uploaded = pd.DataFrame()
+                        if uploaded.empty:
+                            st.error("CSV를 읽지 못했습니다.")
+                        else:
+                            st.session_state["sim_plan_upload_df"] = uploaded
+                            st.session_state["sim_plan_sig"] = sig
+                            st.session_state["sim_plan_fname"] = plan_file.name
+                            st.rerun()
+
+                plan_raw = st.session_state.get("sim_plan_upload_df")
+                plan_for_calc = (
+                    normalize_monthly_plan(plan_raw) if plan_raw is not None else pd.DataFrame()
+                )
+                if plan_raw is None:
+                    st.info("월 생산계획 CSV를 업로드하세요. (제품코드, 월목표매수)")
+                elif plan_for_calc.empty:
+                    st.warning("유효한 행이 없습니다.")
+                else:
+                    fname = st.session_state.get("sim_plan_fname", "업로드 파일")
+                    plan_stats = monthly_plan_family_stats(plan_for_calc, pr_view)
+                    st.markdown("**계획 요약**")
+                    _render_plan_family_summary(plan_stats)
+                    total_avg = _daily_avg_from_family_stats(plan_stats, work_days)
+                    st.markdown("**일평균 (참고)**")
+                    st.caption(
+                        "치수=CEL·Ring·Wafer · Hole=CEL만 · 외관=전체 · "
+                        f"월목표÷작업일({work_days}일)"
+                    )
+                    _render_daily_avg_row("전체", total_avg)
+                    with st.expander("일평균 계산식", expanded=False):
+                        _render_daily_avg_formula(total_avg)
+
+                    camp_names = [
+                        c for c in ("천안", "아산") if not campus_sel or c in campus_sel
+                    ]
+                    if camp_names:
+                        dim_shares = {
+                            c: _campus_share_for_area(
+                                "치수", c, eq_view, man_view,
+                                shift_teams=shift_teams, working_teams=working_teams,
+                            )
+                            for c in camp_names
+                        }
+                        hole_shares = {
+                            c: _campus_share_for_area(
+                                "Hole", c, eq_view, man_view,
+                                shift_teams=shift_teams, working_teams=working_teams,
+                            )
+                            for c in camp_names
+                        }
+                        app_shares = {
+                            c: _campus_share_for_area(
+                                "외관", c, eq_view, man_view,
+                                shift_teams=shift_teams, working_teams=working_teams,
+                            )
+                            for c in camp_names
+                        }
+                        if sum(dim_shares.values()) <= 0:
+                            dim_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                        if sum(hole_shares.values()) <= 0:
+                            hole_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                        if sum(app_shares.values()) <= 0:
+                            app_shares = {c: 1.0 / len(camp_names) for c in camp_names}
+                        ccols = st.columns(len(camp_names))
+                        for col, camp_name in zip(ccols, camp_names):
+                            with col:
+                                _render_daily_avg_row(
+                                    camp_name,
+                                    _scale_daily_avg(
+                                        total_avg,
+                                        dim_share=dim_shares[camp_name],
+                                        hole_share=hole_shares[camp_name],
+                                        app_share=app_shares[camp_name],
+                                    ),
+                                )
+
+                    floor_raw = floor_manager_daily_raw(
+                        pr_view,
+                        plan_for_calc,
+                        work_days=work_days,
+                        campuses=tuple(camp_names) if camp_names else ("천안", "아산"),
+                        equip=eq_view,
+                        manpower=man_view,
+                        shift_teams=shift_teams,
+                        working_teams=working_teams,
+                    )
+                    st.markdown("**월계획 기준 하루 배분 (참고 Raw)**")
+                    if floor_raw.empty:
+                        st.caption("표시할 데이터가 없습니다.")
+                    else:
+                        st.dataframe(
+                            floor_raw.head(100),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        st.download_button(
+                            "월계획 기준 일별 Raw CSV",
+                            data=csv_bytes(floor_raw),
+                            file_name="월계획_일별배분_참고.csv",
+                            mime="text/csv",
+                            key="sim_dl_month_floor",
+                        )
+
+                    campus_scopes: list[tuple[str, str | None]] = [("Total", None)]
+                    for c in camp_names:
+                        campus_scopes.append((c, c))
+                    st.caption(f"적용 파일: **{fname}**")
+                    for label, camp in campus_scopes:
+                        detail, summary, missing = monthly_plan_feasibility(
+                            pr_view,
+                            eq_view,
+                            plan_for_calc,
+                            campus=camp,
+                            work_days=work_days,
+                            manpower=man_view,
+                            shift_teams=shift_teams,
+                            working_teams=working_teams,
+                        )
+                        st.markdown(f"**실현성 · {label}**")
+                        if missing:
+                            st.warning(
+                                "기준정보 없는 코드: "
+                                + ", ".join(missing[:15])
+                                + (" …" if len(missing) > 15 else "")
+                            )
+                        if summary.empty:
+                            continue
+                        ok_n = int((summary["달성"] == "OK").sum())
+                        ng_n = int((summary["달성"] != "OK").sum())
+                        a, b, c = st.columns(3)
+                        with a:
+                            st.metric("품목", f"{len(summary)}")
+                        with b:
+                            st.metric("OK", f"{ok_n}")
+                        with c:
+                            st.metric("부족", f"{ng_n}")
+                        show_sum = summary[
+                            [
+                                x
+                                for x in (
+                                    "제품코드",
+                                    "제품명",
+                                    "월목표매수",
+                                    "일목표매수",
+                                    "월가능매수",
+                                    "병목공정",
+                                    "달성",
+                                    "부족매수",
+                                )
+                                if x in summary.columns
+                            ]
+                        ]
+                        st.dataframe(show_sum, use_container_width=True, hide_index=True)
+                        with st.expander(f"{label} 공정 상세", expanded=False):
+                            st.dataframe(detail, use_container_width=True, hide_index=True)
+                            if not detail.empty:
+                                daily = daily_operation_plan(detail, summary)
+                                st.dataframe(daily, use_container_width=True, hide_index=True)
+
+    with tab_util:
+        st.subheader("실적 기준 인당 시간 활용")
+        st.caption(
+            f"인당시간활용률(%) = (실적 × 매당_인시분) ÷ (인력 × {available_min:g}분) × 100. "
+            "여기서 인력은 실적에 적힌 당일·당조 인원입니다(전 조 합계에 2/3를 또 적용하지 않음). "
+            "100%면 기준 택트만큼 시간을 다 쓴 것이고, 낮으면 여유·대기·다른 일이 있는 쪽으로 봅니다."
+        )
+        util = pd.DataFrame()
+        pa = product_actuals.copy()
+        if not pa.empty:
+            if campus_sel and "캠퍼스" in pa.columns:
+                pa = pa[pa["캠퍼스"].isin(campus_sel) | (pa["캠퍼스"].fillna("") == "")]
+            if area_sel and "공정" in pa.columns:
+                pa = pa[pa["공정"].isin(area_sel)]
+            if team_sel and "조" in pa.columns:
+                pa = pa[pa["조"].isin(team_sel)]
+            if shift_sel and "주야" in pa.columns:
+                pa = pa[pa["주야"].isin(shift_sel)]
+        if not pa.empty and not pr_view.empty:
+            tact = pr_view[["제품코드", "공정", "매당_인시분"]].drop_duplicates()
+            merged = pa.merge(tact, on=["제품코드", "공정"], how="left")
+            util = utilization_from_actuals(merged, pd.DataFrame(), available_min=available_min)
+            st.caption("제품별_실적 파일과 제품 택트로 계산합니다.")
+        elif records.empty:
+            util = pd.DataFrame()
+            st.info("제품별_실적 또는 홈 화면 실적 파일이 있어야 활용률을 봅니다.")
+        elif pr_view.empty:
+            util = pd.DataFrame()
+            st.warning("제품 기준정보의 매당_인시분이 있어야 활용률을 계산합니다.")
+        else:
+            filtered = apply_basic_filters(
+                records,
+                area_sel=area_sel,
+                campus_sel=campus_sel,
+                shift_sel=shift_sel or None,
+                team_sel=team_sel or None,
+                mode="전체",
+            )
+            if filtered.empty:
+                util = pd.DataFrame()
+                st.warning("선택 조건에 해당하는 실적이 없습니다.")
+            else:
+                std = process_standard_times(
+                    pr_view,
+                    pr_view["제품코드"].dropna().unique().tolist() if not pr_view.empty else None,
+                )
+                util = utilization_from_actuals(filtered, std, available_min=available_min)
+                st.caption("공정 실적 파일과 제품 평균 택트로 계산합니다.")
+        if not pa.empty and not pr_view.empty and util.empty:
+            st.warning("제품별 실적과 기준정보의 제품코드·공정이 맞지 않습니다.")
+        elif not util.empty:
+            avg_u = float(pd.to_numeric(util["인당시간활용률"], errors="coerce").mean())
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("평균 인당시간활용률", f"{avg_u:.1f}%")
+            with c2:
+                st.metric("실적 합", f"{pd.to_numeric(util['실적'], errors='coerce').sum():,.0f}매")
+            with c3:
+                st.metric("인력 합(행)", f"{pd.to_numeric(util['인력'], errors='coerce').sum():,.0f}명")
+            st.dataframe(util, use_container_width=True)
+            by_area = (
+                util.groupby("공정", as_index=False)
+                .agg(인당시간활용률=("인당시간활용률", "mean"), 실적=("실적", "sum"), 인력=("인력", "sum"))
+                .round(1)
+            )
+            st.altair_chart(
+                alt.Chart(by_area)
+                .mark_bar()
+                .encode(
+                    x=alt.X("공정:N", sort=list(AREAS), title="공정"),
+                    y=alt.Y("인당시간활용률:Q", title="평균 활용률 %"),
+                    tooltip=list(by_area.columns),
+                )
+                .properties(height=300, title="공정별 평균 인당 시간 활용률"),
+                use_container_width=True,
+            )
+            if "조" in util.columns:
+                teams_all = team_stack_order(sorted(util["조"].dropna().unique().tolist()))
+                by_team = util.groupby("조", as_index=False)["인당시간활용률"].mean().round(1)
+                st.altair_chart(
+                    alt.Chart(by_team)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("조:N", sort=teams_all),
+                        y=alt.Y("인당시간활용률:Q", title="평균 활용률 %"),
+                        tooltip=["조", "인당시간활용률"],
+                    )
+                    .properties(height=280, title="조별 평균 인당 시간 활용률"),
+                    use_container_width=True,
+                )
+            st.download_button(
+                "활용률 계산 CSV",
+                data=util.to_csv(index=False).encode("utf-8-sig"),
+                file_name="인당시간활용률.csv",
+                mime="text/csv",
+                key="sim_dl_util",
+            )
+
+        with st.expander("로드된 실적 파일", expanded=False):
+            for n in rec_notes:
+                st.write("- ", n)
+            if records.empty:
+                st.caption("실적이 없습니다.")
+            else:
+                st.caption(f"실적 행 수: {len(add_calendar_parts(records))}")
