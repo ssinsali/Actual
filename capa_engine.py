@@ -1,512 +1,607 @@
-"""QA그룹 CAPA — 월별 생산계획 × 제품 측정시간 → 치수·홀 필요대수·가동율.
-
-설비 운영 시뮬레이션과 같은 규칙:
-- 치수: CEL·Ring·Wafer 등 측정시간이 있는 전 제품
-- 홀(Hole): CEL만
-- 1대 월 가용(분) = 작업일수 × 1일 가동시간 × 60 × 가동률
-- 필요대수 = ceil(그 달 필요시간 합 ÷ 1대 월 가용)
-- 가동율(%) = 필요시간 ÷ (보유대수 × 1대 월 가용) × 100
-"""
+"""QA그룹 CAPA 관리 — 월별 치수·홀 필요대수와 가동율."""
 from __future__ import annotations
 
-import math
-import re
-from typing import Any
+from pathlib import Path
 
+import altair as alt
 import pandas as pd
+import streamlit as st
 
-# 공개 API만 사용 (Cloud에서 drill/sim 비공개 심볼 ImportError 방지)
-from drill_engine import machine_month_minutes, normalize_qty
-from sim_engine import normalize_products
-
-QA_PLAN_STEM = "QA_월별생산계획"
-# 설비 운영 시뮬레이션과 동일한 제품 기준정보 파일명
-PRODUCT_STEM = "제품_기준정보"
-QA_STEMS = (QA_PLAN_STEM, PRODUCT_STEM)
-# 예전 CAPA 전용 파일명 (있으면 제품_기준정보 없을 때 fallback)
-_LEGACY_TIME_STEM = "QA_제품측정시간"
-
-PLAN_COLUMNS = ("제품코드", "제품명", *(f"{m}월" for m in range(1, 13)))
-TIME_COLUMNS = ("제품코드", "제품명", "제품군", "치수_측정분", "홀_측정분", "비고")
-
-DEFAULT_DAY_HOURS = 24.0
-DEFAULT_UTILIZATION_PCT = 100.0
-
-_MONTH_HEADER_RE = re.compile(
-    r"^(?:(?P<year>20\d{2})\s*[-./년]?\s*)?(?P<month>1[0-2]|0?[1-9])\s*월?$"
+from app_common import data_dir, render_exit_ui
+from auth import render_logout_controls
+from capa_engine import (
+    DEFAULT_DAY_HOURS,
+    DEFAULT_UTILIZATION_PCT,
+    PLAN_COLUMNS,
+    PRODUCT_STEM,
+    QA_PLAN_STEM,
+    QA_STEMS,
+    _LEGACY_TIME_STEM,
+    calc_qa_capa,
+    plan_template,
 )
-_YM_COMPACT_RE = re.compile(r"^(?P<year>20\d{2})(?P<month>1[0-2]|0[1-9])$")
+from sim_engine import (
+    DAY_MINUTES,
+    DEFAULT_WORK_DAYS,
+    canonical_master_name,
+    csv_bytes,
+    empty_xlsx_bytes,
+    PRODUCT_COLUMNS,
+    newest_matching,
+    normalize_equipment,
+    product_template,
+    read_csv_table,
+    running_qty,
+    xlsx_bytes,
+)
 
 
-def _norm(v: Any) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
-    return str(v).strip()
+def master_dir() -> Path:
+    folder = data_dir() / "master"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
-def _code_key(v: Any) -> str:
-    t = _norm(v).replace("\ufeff", "").replace("\u00a0", " ")
-    for ch in ("－", "–", "—", "−", "﹣"):
-        t = t.replace(ch, "-")
-    return re.sub(r"\s+", "", t).upper()
-
-
-def _parse_month_header(col: Any) -> tuple[str, int] | None:
-    text = _norm(col).replace(" ", "")
-    if not text:
-        return None
-    compact = _YM_COMPACT_RE.match(text)
-    if compact:
-        return compact.group("year"), int(compact.group("month"))
-    matched = _MONTH_HEADER_RE.match(text)
-    if not matched:
-        return None
-    month = int(matched.group("month"))
-    year = matched.group("year") or ""
-    return year, month
-
-
-def _month_label(year: str, month: int) -> str:
-    if year:
-        return f"{year}-{int(month):02d}"
-    return f"{int(month)}월"
-
-
-def _rename_by_alias(df: pd.DataFrame, aliases: dict[str, tuple[str, ...]]) -> pd.DataFrame:
-    mapping: dict[str, str] = {}
-    used: set[str] = set()
-    for col in df.columns:
-        key = str(col).strip().replace(" ", "").replace("_", "").lower()
-        for dest, opts in aliases.items():
-            if dest in used:
-                continue
-            for opt in opts:
-                if key == opt.replace(" ", "").replace("_", "").lower():
-                    mapping[col] = dest
-                    used.add(dest)
-                    break
-    return df.rename(columns=mapping)
-
-
-def _infer_product_family(name: Any) -> str:
-    t = _norm(name)
-    if not t:
-        return ""
-    u = t.upper().replace(" ", "")
-    if "WAFER" in u or "웨이퍼" in t:
-        return "Wafer"
-    if "RING" in u or "링" == t:
-        return "Ring"
-    if "CEL" in u:
-        return "CEL"
-    return t
-
-
-def _ceil_machines(value: float) -> int:
-    v = float(value or 0)
-    if v <= 1e-9:
-        return 0
-    return int(math.ceil(v - 1e-9))
-
-
-def plan_template() -> pd.DataFrame:
-    """월별 생산계획 예시 (1월~12월 가로형)."""
-    return pd.DataFrame(
-        [
-            {
-                "제품코드": "P-CEL",
-                "제품명": "CEL",
-                "1월": 700,
-                "2월": 650,
-                "3월": 800,
-                "4월": 820,
-                "5월": 780,
-                "6월": 720,
-                "7월": 700,
-                "8월": 760,
-                "9월": 800,
-                "10월": 780,
-                "11월": 740,
-                "12월": 680,
-            },
-            {
-                "제품코드": "P-RING",
-                "제품명": "Ring",
-                "1월": 15000,
-                "2월": 14000,
-                "3월": 16000,
-                "4월": 15800,
-                "5월": 15200,
-                "6월": 14800,
-                "7월": 14500,
-                "8월": 15000,
-                "9월": 15500,
-                "10월": 15200,
-                "11월": 14800,
-                "12월": 14200,
-            },
-            {
-                "제품코드": "P-WAFER",
-                "제품명": "Wafer",
-                "1월": 3000,
-                "2월": 2800,
-                "3월": 3200,
-                "4월": 3100,
-                "5월": 3000,
-                "6월": 2900,
-                "7월": 2800,
-                "8월": 3000,
-                "9월": 3150,
-                "10월": 3050,
-                "11월": 2950,
-                "12월": 2700,
-            },
-        ],
-        columns=list(PLAN_COLUMNS),
-    )
-
-
-def _clean_frame(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.dropna(how="all").copy()
-    work.columns = [_norm(c) for c in work.columns]
-    return work
-
-
-def _positive_mean(series: pd.Series) -> float:
-    vals = pd.to_numeric(series, errors="coerce")
-    vals = vals[vals > 0]
-    if vals.empty:
-        return 0.0
-    return float(vals.mean())
-
-
-def _area_name(v: Any) -> str:
-    name = _norm(v).replace(" ", "")
-    upper = name.upper()
-    if "홀" in name or upper == "HOLE" or "HOLE" in upper:
-        return "홀"
-    if "치수" in name:
-        return "치수"
-    return ""
-
-
-def _family_of(row: pd.Series) -> str:
-    fam = _infer_product_family(row.get("제품군", ""))
-    if fam in ("CEL", "Ring", "Wafer"):
-        return fam
-    fam = _infer_product_family(row.get("제품명", ""))
-    if fam in ("CEL", "Ring", "Wafer"):
-        return fam
-    return _infer_product_family(row.get("제품코드", ""))
-
-
-_WIDE_TIME_KEYS = {
-    "치수측정분",
-    "치수매당분",
-    "치수측정시간",
-    "매당치수분",
-    "홀측정분",
-    "hole매당분",
-    "홀매당분",
-    "홀측정시간",
-    "hole측정시간",
-    "매당홀분",
-}
-
-
-def _has_wide_time_columns(df: pd.DataFrame) -> bool:
-    keys = {_norm(c).replace(" ", "").replace("_", "").lower() for c in df.columns}
-    return bool(keys & _WIDE_TIME_KEYS)
-
-
-def _finish_measure(out: pd.DataFrame) -> pd.DataFrame:
-    empty = pd.DataFrame(columns=list(TIME_COLUMNS))
-    if out is None or out.empty:
-        return empty
-    work = out.copy()
-    for col in TIME_COLUMNS:
-        if col not in work.columns:
-            work[col] = "" if col not in ("치수_측정분", "홀_측정분") else 0
-    work["제품코드"] = work["제품코드"].map(_code_key)
-    work["제품명"] = work["제품명"].map(_norm)
-    work["제품군"] = work["제품군"].map(_norm)
-    work["비고"] = work["비고"].map(_norm)
-    work["치수_측정분"] = pd.to_numeric(work["치수_측정분"], errors="coerce").fillna(0)
-    work["홀_측정분"] = pd.to_numeric(work["홀_측정분"], errors="coerce").fillna(0)
-    work = work[work["제품코드"] != ""]
-    if work.empty:
-        return empty
-    work = (
-        work.groupby("제품코드", as_index=False)
-        .agg(
-            제품명=("제품명", "last"),
-            제품군=("제품군", "last"),
-            치수_측정분=("치수_측정분", "max"),
-            홀_측정분=("홀_측정분", "max"),
-            비고=("비고", "last"),
-        )
-    )
-    work["제품군"] = work.apply(_family_of, axis=1)
-    work = work[(work["치수_측정분"] > 0) | (work["홀_측정분"] > 0)]
-    if work.empty:
-        return empty
-    return work[list(TIME_COLUMNS)].reset_index(drop=True)
-
-
-def normalize_measure_times(df: pd.DataFrame) -> pd.DataFrame:
-    """제품_기준정보 → 제품코드별 치수·홀 측정분.
-
-    설비 운영 시뮬레이션과 같은 `normalize_products`로 읽은 뒤
-    공정=치수 / Hole 행의 매당_설비분을 사용한다.
-    """
-    empty = pd.DataFrame(columns=list(TIME_COLUMNS))
-    if df is None or df.empty:
-        return empty
-
-    products = normalize_products(df)
-    if not products.empty and "공정" in products.columns:
-        work = products.copy()
-        work["공정키"] = work["공정"].map(_area_name)
-        work = work[work["공정키"].isin(["치수", "홀"])]
-        if not work.empty:
-            work["_tact"] = pd.to_numeric(work["매당_설비분"], errors="coerce").fillna(0)
-            man = pd.to_numeric(work["매당_인시분"], errors="coerce").fillna(0)
-            work.loc[work["_tact"] <= 0, "_tact"] = man
-            rows: list[dict[str, Any]] = []
-            for code, sub in work.groupby(work["제품코드"].map(_code_key), sort=False):
-                if not code:
-                    continue
-                dim = sub.loc[sub["공정키"] == "치수", "_tact"]
-                hole = sub.loc[sub["공정키"] == "홀", "_tact"]
-                name = next((_norm(x) for x in sub["제품명"].tolist() if _norm(x)), "")
-                fam = next((_norm(x) for x in sub["제품군"].tolist() if _norm(x)), "")
-                note = next((_norm(x) for x in sub["비고"].tolist() if _norm(x)), "") if "비고" in sub.columns else ""
-                rows.append(
-                    {
-                        "제품코드": code,
-                        "제품명": name,
-                        "제품군": fam,
-                        "치수_측정분": _positive_mean(dim),
-                        "홀_측정분": _positive_mean(hole),
-                        "비고": note,
-                    }
-                )
-            out = _finish_measure(pd.DataFrame(rows))
-            if not out.empty:
-                return out
-
-    # 구형 가로형(치수_측정분/홀_측정분)만 있을 때
-    work = _rename_by_alias(
-        _clean_frame(df),
-        {
-            "제품코드": ("제품코드", "코드구분", "품번", "품목코드", "item", "code"),
-            "제품명": ("제품명", "품명", "itemname", "name"),
-            "제품군": ("제품군", "제품유형", "품종", "family", "type"),
-            "치수_측정분": (
-                "치수_측정분",
-                "치수측정분",
-                "치수_매당분",
-                "치수매당분",
-                "치수측정시간",
-                "치수_측정시간",
-                "매당_치수분",
-            ),
-            "홀_측정분": (
-                "홀_측정분",
-                "홀측정분",
-                "Hole_매당분",
-                "홀_매당분",
-                "홀매당분",
-                "홀측정시간",
-                "Hole측정시간",
-                "매당_홀분",
-            ),
-            "비고": ("비고", "메모", "remark", "note"),
-        },
-    )
-    if "제품코드" not in work.columns or not _has_wide_time_columns(df):
-        return empty
-    return _finish_measure(work)
-
-
-def _declared_months(plan: pd.DataFrame) -> pd.DataFrame:
-    """가로형 생산계획에 적힌 월. 수량이 0이어도 차트 축에 남긴다."""
-    cols = ["년도", "월", "월라벨"]
-    empty = pd.DataFrame(columns=cols)
-    if plan is None or plan.empty:
-        return empty
-    rows: list[dict[str, Any]] = []
-    for col in plan.columns:
-        parsed = _parse_month_header(_norm(col))
-        if not parsed:
+def _list_paths(stem: str | None = None) -> list[Path]:
+    folder = master_dir()
+    stems = (stem,) if stem else (*QA_STEMS, _LEGACY_TIME_STEM)
+    files: list[Path] = []
+    for s in stems:
+        files.extend(folder.glob(f"{s}*.csv"))
+        files.extend(folder.glob(f"{s}*.xlsx"))
+        files.extend(folder.glob(f"{s}*.xls"))
+    # 중복 경로 제거 (순서 유지)
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in files:
+        if p.name.startswith("~$") or str(p) in seen:
             continue
-        year, month = parsed
-        rows.append(
-            {
-                "년도": year or "",
-                "월": int(month),
-                "월라벨": _month_label(year or "", int(month)),
-            }
+        seen.add(str(p))
+        uniq.append(p)
+    return uniq
+
+
+def _clear_files(stem: str | None = None) -> list[str]:
+    deleted: list[str] = []
+    for path in _list_paths(stem):
+        try:
+            path.unlink()
+            deleted.append(path.name)
+        except OSError:
+            continue
+    return deleted
+
+
+def _save_upload(uploaded, prefix: str) -> Path:
+    """올린 파일을 data/master 에 저장. 제품_기준정보는 설비 시뮬레이션과 같은 파일명을 쓴다."""
+    name = canonical_master_name(uploaded.name, prefix)
+    _clear_files(prefix)
+    if prefix == PRODUCT_STEM:
+        _clear_files(_LEGACY_TIME_STEM)
+    dest = master_dir() / name
+    dest.write_bytes(uploaded.getvalue())
+    return dest
+
+
+def _product_path() -> Path | None:
+    """시뮬레이션과 공유하는 제품_기준정보. 예전 QA_제품측정시간도 허용."""
+    folder = master_dir()
+    return newest_matching(folder, PRODUCT_STEM) or newest_matching(folder, _LEGACY_TIME_STEM)
+
+
+def _owned_from_equipment() -> tuple[int, int, str]:
+    """설비_기준정보의 가동 대수. 치수·Hole 합계."""
+    path = newest_matching(master_dir(), "설비_기준정보")
+    if path is None:
+        return 0, 0, ""
+    try:
+        equip = normalize_equipment(read_csv_table(path))
+    except Exception:
+        return 0, 0, path.name
+    dim = int(round(running_qty(equip, campus=None, area="치수", equip_code="")))
+    hole = int(
+        round(
+            running_qty(equip, campus=None, area="Hole", equip_code="")
+            + running_qty(equip, campus=None, area="홀", equip_code="")
         )
-    if not rows:
-        return empty
-    return pd.DataFrame(rows).drop_duplicates().sort_values(["년도", "월"]).reset_index(drop=True)
+    )
+    return dim, hole, path.name
 
 
-def calc_qa_capa(
-    plan: pd.DataFrame,
-    times: pd.DataFrame,
-    *,
-    work_days: float = 20,
-    day_hours: float = 24.0,
-    utilization_pct: float = 100.0,
-    owned_dim: float = 0,
-    owned_hole: float = 0,
-) -> dict[str, Any]:
-    """월별 치수·홀 필요대수와 가동율."""
-    qty = normalize_qty(plan) if plan is not None else pd.DataFrame()
-    meas = normalize_measure_times(times)
-    avail = machine_month_minutes(
+def _active_files() -> list[dict[str, str]]:
+    folder = master_dir()
+    rows: list[dict[str, str]] = []
+    for label, stem in (("월별 생산계획", QA_PLAN_STEM), ("제품_기준정보", PRODUCT_STEM)):
+        path = newest_matching(folder, stem)
+        if path is None and stem == PRODUCT_STEM:
+            path = newest_matching(folder, _LEGACY_TIME_STEM)
+        if path is None:
+            rows.append({"구분": label, "파일": "(없음)", "상태": "미등록"})
+            continue
+        try:
+            mtime = pd.Timestamp(path.stat().st_mtime, unit="s").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            mtime = "-"
+        rows.append({"구분": label, "파일": path.name, "상태": f"운영중 · {mtime}"})
+    return rows
+
+
+def _load_saved() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    folder = master_dir()
+    notes: list[str] = []
+    plan_path = newest_matching(folder, QA_PLAN_STEM)
+    time_path = _product_path()
+    plan = pd.DataFrame()
+    times = pd.DataFrame()
+    if plan_path:
+        plan = read_csv_table(plan_path)
+        notes.append(f"월별 생산계획: {plan_path.name} ({len(plan)}행)")
+    if time_path:
+        times = read_csv_table(time_path)
+        shared = " · 설비 시뮬레이션과 공유" if time_path.name.startswith(PRODUCT_STEM) else " · 예전 CAPA 파일"
+        notes.append(f"제품_기준정보: {time_path.name} ({len(times)}행){shared}")
+    return plan, times, notes
+
+
+def _render_reset_ui() -> None:
+    flag = "capa_confirm_reset"
+    if flag not in st.session_state:
+        st.session_state[flag] = False
+    files = _list_paths()
+    if not files:
+        st.caption("초기화할 업로드 파일이 없습니다.")
+        return
+    if not st.session_state[flag]:
+        if st.button("업로드 파일 초기화", use_container_width=True, key="capa_btn_reset"):
+            st.session_state[flag] = True
+            st.rerun()
+        return
+    st.warning(
+        "올려 둔 월별 생산계획을 삭제합니다. "
+        "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일이라, 여기서 지우면 시뮬레이션에도 없어집니다."
+    )
+    st.caption("삭제 대상: " + ", ".join(p.name for p in files))
+    yes, no = st.columns(2)
+    with yes:
+        if st.button("삭제", type="primary", use_container_width=True, key="capa_reset_yes"):
+            deleted = _clear_files()
+            st.session_state[flag] = False
+            for k in ("capa_plan_sig", "capa_time_sig"):
+                st.session_state.pop(k, None)
+            st.session_state["capa_flash"] = "초기화 완료: " + (", ".join(deleted) if deleted else "없음")
+            st.rerun()
+    with no:
+        if st.button("취소", use_container_width=True, key="capa_reset_no"):
+            st.session_state[flag] = False
+            st.rerun()
+
+
+def _count_chart(monthly: pd.DataFrame, value_col: str, title: str, color: str) -> None:
+    chart_df = monthly[["월라벨", value_col]].rename(columns={"월라벨": "월", value_col: "대수"})
+    chart_df["표시"] = chart_df["대수"].map(lambda v: f"{int(v)}대")
+    order = list(monthly["월라벨"])
+    y_max = max(float(chart_df["대수"].max()), 1.0) * 1.28
+    bars = (
+        alt.Chart(chart_df)
+        .mark_bar(color=color)
+        .encode(
+            x=alt.X("월:N", sort=order, title="월"),
+            y=alt.Y("대수:Q", title="필요 대수", scale=alt.Scale(domain=[0, y_max])),
+            tooltip=["월", "대수"],
+        )
+    )
+    labels = (
+        alt.Chart(chart_df)
+        .mark_text(dy=-12, fontSize=16, fontWeight="bold")
+        .encode(
+            x=alt.X("월:N", sort=order),
+            y=alt.Y("대수:Q"),
+            text=alt.Text("표시:N"),
+            color=alt.value("#ffffff"),
+        )
+    )
+    st.altair_chart((bars + labels).properties(height=320, title=title), use_container_width=True)
+
+
+def _util_chart(monthly: pd.DataFrame) -> None:
+    long = monthly.melt(
+        id_vars=["월라벨"],
+        value_vars=["치수_가동율", "홀_가동율"],
+        var_name="구분",
+        value_name="가동율",
+    )
+    long["구분"] = long["구분"].map({"치수_가동율": "치수", "홀_가동율": "홀"})
+    long = long.rename(columns={"월라벨": "월"}).dropna(subset=["가동율"])
+    if long.empty:
+        st.info("보유대수를 입력하면 월별 가동율을 계산합니다.")
+        return
+    long["표시"] = long["가동율"].map(lambda v: f"{float(v):.1f}%")
+    order = list(monthly["월라벨"])
+    y_max = max(float(long["가동율"].max()), 100.0) * 1.18
+    bars = (
+        alt.Chart(long)
+        .mark_bar()
+        .encode(
+            x=alt.X("월:N", sort=order, title="월"),
+            xOffset="구분:N",
+            y=alt.Y("가동율:Q", title="가동율 (%)", scale=alt.Scale(domain=[0, y_max])),
+            color=alt.Color(
+                "구분:N",
+                title="공정",
+                scale=alt.Scale(domain=["치수", "홀"], range=["#60a5fa", "#fbbf24"]),
+                sort=["치수", "홀"],
+            ),
+            tooltip=["월", "구분", "가동율"],
+        )
+    )
+    labels = (
+        alt.Chart(long)
+        .mark_text(dy=-10, fontSize=12, fontWeight="bold")
+        .encode(
+            x=alt.X("월:N", sort=order),
+            xOffset="구분:N",
+            y=alt.Y("가동율:Q"),
+            text=alt.Text("표시:N"),
+            color=alt.value("#ffffff"),
+        )
+    )
+    rule = (
+        alt.Chart(pd.DataFrame({"y": [100]}))
+        .mark_rule(strokeDash=[6, 4], color="#f87171")
+        .encode(y="y:Q")
+    )
+    st.altair_chart(
+        (bars + labels + rule).properties(height=340, title="월별 가동율 (빨간 점선 = 100%)"),
+        use_container_width=True,
+    )
+
+
+def render() -> None:
+    st.title("QA그룹 CAPA 관리")
+    st.caption(
+        "월별 생산계획과 제품_기준정보로 치수·홀 설비 필요대수와 가동율을 계산합니다. "
+        "제품_기준정보는 설비 운영 시뮬레이션과 **같은 파일·같은 양식**입니다. "
+        "시뮬레이션에 이미 올려 둔 제품_기준정보가 있으면 그대로 사용합니다. 홀은 CEL만 봅니다."
+    )
+
+    flash = st.session_state.pop("capa_flash", None)
+    if flash:
+        st.success(flash)
+
+    dim_default, hole_default, eq_name = _owned_from_equipment()
+    if "capa_owned_dim" not in st.session_state:
+        st.session_state["capa_owned_dim"] = dim_default
+    if "capa_owned_hole" not in st.session_state:
+        st.session_state["capa_owned_hole"] = hole_default
+
+    work_days = float(DEFAULT_WORK_DAYS)
+    day_hours = float(DEFAULT_DAY_HOURS)
+    util_pct = float(DEFAULT_UTILIZATION_PCT)
+
+    with st.sidebar:
+        st.header("계정")
+        render_logout_controls()
+        st.divider()
+        st.header("가동 조건")
+        work_days = float(
+            st.number_input(
+                "월 작업일수",
+                min_value=1.0,
+                max_value=31.0,
+                value=float(DEFAULT_WORK_DAYS),
+                step=1.0,
+                help="한 달 조업일. 모든 월에 동일하게 적용합니다.",
+                key="capa_work_days",
+            )
+        )
+        day_hours = float(
+            st.number_input(
+                "1일 가동시간 (시간)",
+                min_value=1.0,
+                max_value=24.0,
+                value=float(DEFAULT_DAY_HOURS),
+                step=0.5,
+                help="설비 이론능력은 24시간(1440분)입니다.",
+                key="capa_day_hours",
+            )
+        )
+        util_pct = float(
+            st.number_input(
+                "가동률 (%)",
+                min_value=1.0,
+                max_value=100.0,
+                value=float(DEFAULT_UTILIZATION_PCT),
+                step=1.0,
+                help="셋업·비가동·인력 제약을 반영. 상단 「가동률 기준 필요대수」와 1대 월 가용에 그대로 적용됩니다.",
+                key="capa_util",
+            )
+        )
+        owned_dim = int(
+            st.number_input(
+                "치수 보유대수",
+                min_value=0,
+                max_value=999,
+                step=1,
+                help="가동율 분모. 설비_기준정보 치수 가동 대수가 있으면 그 값으로 시작합니다.",
+                key="capa_owned_dim",
+            )
+        )
+        owned_hole = int(
+            st.number_input(
+                "홀 보유대수",
+                min_value=0,
+                max_value=999,
+                step=1,
+                help="가동율 분모. 설비_기준정보 Hole 가동 대수가 있으면 그 값으로 시작합니다.",
+                key="capa_owned_hole",
+            )
+        )
+        avail = work_days * day_hours * 60.0 * (util_pct / 100.0)
+        st.caption(
+            f"1대 월 가용 = {work_days:g}일 × {day_hours:g}시간 × 60 × {util_pct:g}% "
+            f"= **{avail:,.0f}분**. 참고: 24시간 = {DAY_MINUTES}분/일."
+        )
+        if eq_name:
+            st.caption(f"보유대수 초기값: `{eq_name}` 치수 {dim_default}대 · 홀 {hole_default}대")
+
+        st.divider()
+        st.header("파일 업로드")
+        st.caption(
+            "월별 생산계획은 이 페이지에서 올리세요. "
+            "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일입니다 "
+            "(이미 시뮬레이션에 있으면 다시 올릴 필요 없음). "
+            "치수·Hole 행의 매당_설비분이 1매 측정시간입니다."
+        )
+        st.dataframe(pd.DataFrame(_active_files()), use_container_width=True, hide_index=True)
+        _render_reset_ui()
+
+        plan_up = st.file_uploader("① 월별 생산계획", type=["csv", "xlsx"], key="capa_up_plan")
+        time_up = st.file_uploader("② 제품_기준정보", type=["csv", "xlsx"], key="capa_up_time")
+        plan_sig = (plan_up.name, int(getattr(plan_up, "size", 0) or 0)) if plan_up else None
+        time_sig = (time_up.name, int(getattr(time_up, "size", 0) or 0)) if time_up else None
+        if plan_up is not None and plan_sig != st.session_state.get("capa_plan_sig"):
+            path = _save_upload(plan_up, QA_PLAN_STEM)
+            st.session_state["capa_plan_sig"] = plan_sig
+            st.session_state["capa_use_sample"] = False
+            st.session_state["capa_flash"] = f"생산계획 업로드: {path.name}"
+            st.rerun()
+        if time_up is not None and time_sig != st.session_state.get("capa_time_sig"):
+            path = _save_upload(time_up, PRODUCT_STEM)
+            st.session_state["capa_time_sig"] = time_sig
+            st.session_state["capa_use_sample"] = False
+            st.session_state["capa_flash"] = f"제품_기준정보 업로드: {path.name} (설비 시뮬레이션과 공유)"
+            st.rerun()
+
+        st.subheader("양식 받기")
+        st.caption("제품_기준정보 양식은 설비 운영 시뮬레이션과 동일합니다.")
+        st.download_button(
+            "월별 생산계획 엑셀 (예시)",
+            data=xlsx_bytes(plan_template(), "생산계획"),
+            file_name="QA_월별생산계획.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="capa_dl_plan_xlsx",
+        )
+        st.download_button(
+            "제품_기준정보 엑셀 (예시)",
+            data=xlsx_bytes(product_template(), "제품"),
+            file_name="제품_기준정보.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="capa_dl_time_xlsx",
+        )
+        with st.expander("빈 양식 · CSV"):
+            st.download_button(
+                "월별 생산계획 빈 엑셀",
+                data=empty_xlsx_bytes(PLAN_COLUMNS, "생산계획"),
+                file_name="QA_월별생산계획_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="capa_dl_plan_empty",
+            )
+            st.download_button(
+                "제품_기준정보 빈 엑셀",
+                data=empty_xlsx_bytes(PRODUCT_COLUMNS, "제품"),
+                file_name="제품_기준정보_빈양식.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="capa_dl_time_empty",
+            )
+            st.download_button(
+                "월별 생산계획 CSV (예시)",
+                data=csv_bytes(plan_template()),
+                file_name="QA_월별생산계획.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="capa_dl_plan_csv",
+            )
+            st.download_button(
+                "제품_기준정보 CSV (예시)",
+                data=csv_bytes(product_template()),
+                file_name="제품_기준정보.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="capa_dl_time_csv",
+            )
+        if st.button("예시 데이터로 미리보기", use_container_width=True, key="capa_preview"):
+            st.session_state["capa_use_sample"] = True
+            st.rerun()
+        render_exit_ui(key_prefix="capa_")
+
+    saved_plan, saved_times, notes = _load_saved()
+    use_sample = bool(st.session_state.get("capa_use_sample"))
+    if use_sample:
+        plan_raw, time_raw = plan_template(), product_template()
+        st.info("예시 양식으로 미리보기 중입니다. 실제 계획이면 사이드바에서 업로드하세요.")
+    else:
+        plan_raw, time_raw = saved_plan, saved_times
+
+    result = calc_qa_capa(
+        plan_raw,
+        time_raw,
         work_days=work_days,
         day_hours=day_hours,
-        utilization_pct=utilization_pct,
+        utilization_pct=util_pct,
+        owned_dim=owned_dim,
+        owned_hole=owned_hole,
     )
-    empty_monthly = pd.DataFrame(
-        columns=[
-            "년도",
-            "월",
-            "월라벨",
-            "치수_생산수량",
-            "치수_필요시간_분",
-            "치수_이론필요대수",
-            "치수_필요대수",
-            "치수_가동율",
-            "홀_생산수량",
-            "홀_필요시간_분",
-            "홀_이론필요대수",
-            "홀_필요대수",
-            "홀_가동율",
-        ]
-    )
-    result: dict[str, Any] = {
-        "qty": qty,
-        "times": meas,
-        "detail": pd.DataFrame(),
-        "monthly": empty_monthly,
-        "unmatched": [],
-        "unused_times": [],
-        "hole_skipped": [],
-        "plan_columns": list(plan.columns) if plan is not None else [],
-        "time_columns": list(times.columns) if times is not None else [],
-        "work_days": float(work_days),
-        "day_hours": float(day_hours),
-        "utilization_pct": float(utilization_pct),
-        "machine_month_min": avail,
-        "owned_dim": float(owned_dim or 0),
-        "owned_hole": float(owned_hole or 0),
-        "peak_dim_label": "",
-        "peak_hole_label": "",
-        "peak_dim_required": 0,
-        "peak_hole_required": 0,
-    }
-    if qty.empty or meas.empty or avail <= 0:
-        return result
 
-    meas = meas.copy()
-    meas["제품코드"] = meas["제품코드"].map(_code_key)
-    time_codes = set(meas["제품코드"])
-    qty_codes = set(qty["제품코드"].map(_code_key))
-    result["unmatched"] = sorted(qty_codes - time_codes)
-    result["unused_times"] = sorted(time_codes - qty_codes)
-
-    merged = qty.merge(
-        meas[["제품코드", "제품명", "제품군", "치수_측정분", "홀_측정분"]],
-        on="제품코드",
-        how="inner",
-        suffixes=("", "_기준"),
-    )
-    if merged.empty:
-        return result
-    if "제품명_기준" in merged.columns:
-        merged["제품명"] = merged["제품명"].where(merged["제품명"].astype(str).str.strip() != "", merged["제품명_기준"])
-        merged = merged.drop(columns=["제품명_기준"])
-
-    merged["치수_필요시간_분"] = merged["필요수량"] * merged["치수_측정분"]
-    is_cel = merged["제품군"] == "CEL"
-    merged["홀_적용"] = is_cel & (merged["홀_측정분"] > 0)
-    merged["홀_필요시간_분"] = 0.0
-    merged.loc[merged["홀_적용"], "홀_필요시간_분"] = (
-        merged.loc[merged["홀_적용"], "필요수량"] * merged.loc[merged["홀_적용"], "홀_측정분"]
-    )
-    skipped = sorted(
-        {
-            c
-            for c, fam, hole_t in zip(merged["제품코드"], merged["제품군"], merged["홀_측정분"])
-            if fam != "CEL" and float(hole_t or 0) > 0
-        }
-    )
-    result["hole_skipped"] = skipped
-    result["detail"] = merged.sort_values(["년도", "월", "제품코드"]).reset_index(drop=True)
-
-    def _util(minutes: float, owned: float) -> float | None:
-        if owned <= 0 or avail <= 0:
-            return None
-        return round(float(minutes) / (owned * avail) * 100, 1)
-
-    rows: list[dict[str, Any]] = []
-    for (year, month, label), sub in result["detail"].groupby(["년도", "월", "월라벨"], sort=False):
-        dim_min = float(sub["치수_필요시간_분"].sum())
-        hole_min = float(sub["홀_필요시간_분"].sum())
-        dim_qty = float(sub.loc[sub["치수_측정분"] > 0, "필요수량"].sum())
-        hole_qty = float(sub.loc[sub["홀_적용"], "필요수량"].sum())
-        dim_theo = dim_min / avail
-        hole_theo = hole_min / avail
-        rows.append(
-            {
-                "년도": year,
-                "월": int(month),
-                "월라벨": label,
-                "치수_생산수량": dim_qty,
-                "치수_필요시간_분": round(dim_min, 1),
-                "치수_이론필요대수": round(dim_theo, 4),
-                "치수_필요대수": _ceil_machines(dim_theo),
-                "치수_가동율": _util(dim_min, float(owned_dim or 0)),
-                "홀_생산수량": hole_qty,
-                "홀_필요시간_분": round(hole_min, 1),
-                "홀_이론필요대수": round(hole_theo, 4),
-                "홀_필요대수": _ceil_machines(hole_theo),
-                "홀_가동율": _util(hole_min, float(owned_hole or 0)),
-            }
+    if plan_raw.empty or time_raw.empty:
+        missing = []
+        if plan_raw.empty:
+            missing.append("월별 생산계획")
+        if time_raw.empty:
+            missing.append("제품_기준정보")
+        st.info(
+            "사이드바에서 **월별 생산계획**과 **제품_기준정보** 양식을 받아 올린 뒤 차트를 봅니다. "
+            "바로 보려면 **예시 데이터로 미리보기**를 누르세요. "
+            f"지금 없는 파일: {' · '.join(missing)}."
         )
-    monthly = pd.DataFrame(rows)
-    if monthly.empty:
-        return result
-    declared = _declared_months(plan)
-    if not declared.empty:
-        monthly = declared.merge(monthly, on=["년도", "월", "월라벨"], how="left")
-        for col in (
-            "치수_생산수량",
-            "치수_필요시간_분",
-            "치수_이론필요대수",
-            "치수_필요대수",
-            "홀_생산수량",
-            "홀_필요시간_분",
-            "홀_이론필요대수",
-            "홀_필요대수",
-        ):
-            monthly[col] = monthly[col].fillna(0)
-        if float(owned_dim or 0) > 0:
-            monthly["치수_가동율"] = monthly["치수_가동율"].fillna(0)
-        if float(owned_hole or 0) > 0:
-            monthly["홀_가동율"] = monthly["홀_가동율"].fillna(0)
-        monthly["치수_필요대수"] = monthly["치수_필요대수"].astype(int)
-        monthly["홀_필요대수"] = monthly["홀_필요대수"].astype(int)
-    monthly = monthly.sort_values(["년도", "월"]).reset_index(drop=True)
-    result["monthly"] = monthly
-    dim_idx = monthly["치수_이론필요대수"].idxmax()
-    hole_idx = monthly["홀_이론필요대수"].idxmax()
-    result["peak_dim_label"] = str(monthly.loc[dim_idx, "월라벨"])
-    result["peak_hole_label"] = str(monthly.loc[hole_idx, "월라벨"])
-    result["peak_dim_required"] = int(monthly["치수_필요대수"].max())
-    result["peak_hole_required"] = int(monthly["홀_필요대수"].max())
-    return result
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("##### 월별 생산계획")
+            st.dataframe(plan_template(), use_container_width=True, hide_index=True)
+            st.caption("가로형: 제품코드 + 1월~12월. 세로형(년도, 월, 제품코드, 필요수량)도 가능합니다.")
+        with c2:
+            st.markdown("##### 제품_기준정보")
+            st.dataframe(product_template(), use_container_width=True, hide_index=True)
+            st.caption("설비 운영 시뮬레이션과 같은 양식입니다. 치수·Hole의 매당_설비분이 1매 측정시간입니다. 홀은 CEL만 계산합니다.")
+        return
+
+    if result["monthly"].empty:
+        st.warning(
+            "생산계획과 측정시간의 제품코드가 맞지 않거나, 1월~12월 수량을 읽지 못했습니다. "
+            f"생산계획 열: {', '.join(str(c) for c in result.get('plan_columns') or []) or '(없음)'}"
+        )
+        if result["unmatched"]:
+            st.caption("측정시간이 없는 제품코드: " + ", ".join(result["unmatched"][:30]))
+        with st.expander("올린 파일 미리보기", expanded=True):
+            st.dataframe(plan_raw, use_container_width=True, hide_index=True)
+            st.dataframe(time_raw, use_container_width=True, hide_index=True)
+        return
+
+    monthly = result["monthly"]
+    avail_min = float(result["machine_month_min"])
+    peak_dim = int(result["peak_dim_required"])
+    peak_hole = int(result["peak_hole_required"])
+    short_dim = max(peak_dim - owned_dim, 0)
+    short_hole = max(peak_hole - owned_hole, 0)
+
+    st.subheader(f"가동률 {util_pct:g}% 기준 필요대수")
+    st.caption(
+        f"사이드바 **가동 조건 → 가동률**({util_pct:g}%)을 반영한 값입니다. "
+        f"1대 월 가용 = {work_days:g}일 × {day_hours:g}시간 × 60 × {util_pct:g}% = **{avail_min:,.0f}분**. "
+        "필요대수 = ceil(월 측정시간 합 ÷ 1대 월 가용). 인력 제약이 있으면 가동률을 낮춰 보세요."
+    )
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("치수 피크 필요", f"{peak_dim}대", help=f"피크월 {result['peak_dim_label']}")
+    with k2:
+        st.metric("치수 부족", f"{short_dim}대", help=f"피크 필요 {peak_dim} − 보유 {owned_dim}")
+    with k3:
+        st.metric("홀 피크 필요", f"{peak_hole}대", help=f"피크월 {result['peak_hole_label']}")
+    with k4:
+        st.metric("홀 부족", f"{short_hole}대", help=f"피크 필요 {peak_hole} − 보유 {owned_hole}")
+
+    st.markdown("##### 월별 치수 필요대수")
+    st.caption(
+        f"치수 = 측정시간이 있는 전 제품. 피크 {result['peak_dim_label']} · {peak_dim}대 "
+        f"(보유 {owned_dim}대 → 부족 {short_dim}대)."
+    )
+    _count_chart(
+        monthly,
+        "치수_필요대수",
+        f"가동률 {util_pct:g}% 기준 · 월별 치수 필요대수",
+        "#60a5fa",
+    )
+
+    st.markdown("##### 월별 홀 필요대수")
+    st.caption(
+        f"홀 = CEL만. 피크 {result['peak_hole_label']} · {peak_hole}대 "
+        f"(보유 {owned_hole}대 → 부족 {short_hole}대)."
+    )
+    _count_chart(
+        monthly,
+        "홀_필요대수",
+        f"가동률 {util_pct:g}% 기준 · 월별 홀 필요대수",
+        "#fbbf24",
+    )
+
+    st.divider()
+    st.subheader("월별 가동율")
+    st.caption(
+        f"가동율 = 필요시간 ÷ (보유대수 × {avail_min:,.0f}분) × 100. "
+        f"분모의 1대 가용에도 가동률 {util_pct:g}%가 들어가 있습니다. "
+        f"치수 보유 {owned_dim}대 · 홀 보유 {owned_hole}대. 100%를 넘으면 보유 설비가 부족합니다."
+    )
+    _util_chart(monthly)
+
+    if result["unmatched"]:
+        st.warning("측정시간이 없어 빠진 제품코드: " + ", ".join(result["unmatched"]))
+    if result["hole_skipped"]:
+        st.caption("홀 계산에서 제외(CEL 아님): " + ", ".join(result["hole_skipped"]))
+    if result["unused_times"]:
+        st.caption("생산계획이 없는 측정시간 코드: " + ", ".join(result["unused_times"]))
+
+    show = monthly.copy()
+    for col in ("치수_생산수량", "홀_생산수량"):
+        show[col] = show[col].map(lambda v: f"{float(v):,.0f}")
+    for col in ("치수_필요시간_분", "홀_필요시간_분"):
+        show[col] = show[col].map(lambda v: f"{float(v):,.1f}")
+    for col in ("치수_이론필요대수", "홀_이론필요대수"):
+        show[col] = show[col].map(lambda v: f"{float(v):,.2f}")
+    for col in ("치수_가동율", "홀_가동율"):
+        show[col] = show[col].map(lambda v: "-" if v is None or (isinstance(v, float) and pd.isna(v)) else f"{float(v):,.1f}")
+
+    with st.expander("월별 수치", expanded=False):
+        st.dataframe(
+            show[
+                [
+                    "월라벨",
+                    "치수_생산수량",
+                    "치수_필요시간_분",
+                    "치수_이론필요대수",
+                    "치수_필요대수",
+                    "치수_가동율",
+                    "홀_생산수량",
+                    "홀_필요시간_분",
+                    "홀_이론필요대수",
+                    "홀_필요대수",
+                    "홀_가동율",
+                ]
+            ].rename(
+                columns={
+                    "월라벨": "월",
+                    "치수_필요대수": "치수 필요대수",
+                    "홀_필요대수": "홀 필요대수",
+                    "치수_가동율": "치수 가동율(%)",
+                    "홀_가동율": "홀 가동율(%)",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "월별 결과 CSV",
+            data=monthly.to_csv(index=False).encode("utf-8-sig"),
+            file_name="QA_CAPA_월별.csv",
+            mime="text/csv",
+            key="capa_dl_monthly",
+        )
+
+    with st.expander("계산식 · 올린 파일"):
+        st.markdown(
+            f"""
+- 치수 필요시간(분) = Σ (월 생산수량 × 치수 공정 매당_설비분) — 전 제품
+- 홀 필요시간(분) = Σ (CEL 월 생산수량 × Hole 공정 매당_설비분)
+- 1대 월 가용 = {work_days:g} × {day_hours:g} × 60 × {util_pct:g}% = **{avail_min:,.0f}분**
+- 필요대수 = ceil(필요시간 ÷ 1대 월 가용)
+- 가동율(%) = 필요시간 ÷ (보유대수 × 1대 월 가용) × 100
+            """
+        )
+        for n in notes:
+            st.write("- ", n)
+        st.markdown("**월별 생산계획**")
+        st.dataframe(plan_raw, use_container_width=True, hide_index=True)
+        st.markdown("**제품_기준정보**")
+        st.dataframe(time_raw, use_container_width=True, hide_index=True)
