@@ -1,7 +1,7 @@
 {
   "capa_work_days": 30.0,
   "capa_day_hours": 24.0,
-  "capa_util": 85.0,
+  "capa_util": 40.0,
   "capa_owned_dim": 7,
   "capa_owned_hole": 11
 }
