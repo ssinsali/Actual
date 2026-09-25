@@ -1,7 +1,7 @@
 {
   "drill_work_days": 31.0,
   "drill_day_hours": 24.0,
-  "drill_util": 100.0,
+  "drill_util": 85.0,
   "drill_owned": 315,
   "drill_deduct_rows": [
     {
