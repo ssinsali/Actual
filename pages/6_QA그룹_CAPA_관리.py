@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import traceback
 from pathlib import Path
 
 import streamlit as st
@@ -27,7 +28,7 @@ def _load_local(name: str):
     return mod
 
 
-_needed = ("capa_engine", "capa_page", "auth", "drill_engine", "sim_engine")
+_needed = ("capa_engine", "capa_page", "auth", "drill_engine", "sim_engine", "app_common")
 _missing = [f"{n}.py" for n in _needed if not (_APP_DIR / f"{n}.py").is_file()]
 if _missing:
     st.error(
@@ -38,12 +39,21 @@ if _missing:
     st.caption(f"현재 앱 폴더: `{_APP_DIR}`")
     st.stop()
 
-for _name in ("drill_engine", "sim_engine", "capa_engine", "capa_page"):
-    if _name not in sys.modules:
-        _load_local(_name)
-
-from auth import render_auth_gate  # noqa: E402
-from capa_page import render  # noqa: E402
+try:
+    for _name in ("drill_engine", "sim_engine", "capa_engine", "capa_page"):
+        if _name not in sys.modules:
+            _load_local(_name)
+    from auth import render_auth_gate  # noqa: E402
+    from capa_page import render  # noqa: E402
+except Exception as e:
+    st.error("QA그룹 CAPA 관리 모듈을 불러오지 못했습니다.")
+    st.code(f"{type(e).__name__}: {e}")
+    st.code(traceback.format_exc())
+    st.caption(
+        "GitHub 루트에 capa_engine.py, capa_page.py가 있고, "
+        "drill_engine.py / sim_engine.py도 최신인지 확인하세요."
+    )
+    st.stop()
 
 if not render_auth_gate():
     st.stop()
