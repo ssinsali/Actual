@@ -1,6 +1,7 @@
 """QA그룹 CAPA 관리 — 월별 치수·홀 필요대수와 가동율."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import altair as alt
@@ -8,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from app_common import data_dir, render_exit_ui
-from auth import render_logout_controls
+from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
 from capa_engine import (
     PLAN_COLUMNS,
     PRODUCT_STEM,
@@ -25,6 +26,7 @@ from sim_engine import (
     csv_bytes,
     empty_xlsx_bytes,
     PRODUCT_COLUMNS,
+    master_github_paths,
     newest_matching,
     normalize_equipment,
     product_template,
@@ -33,15 +35,142 @@ from sim_engine import (
     xlsx_bytes,
 )
 
-# capa_engine 버전과 무관하게 페이지에서 직접 사용
 DEFAULT_DAY_HOURS = 24.0
 DEFAULT_UTILIZATION_PCT = 100.0
+
+SETTINGS_STEM = "QA_가동조건"
+SETTINGS_FILE = f"{SETTINGS_STEM}.json"
+SETTINGS_KEYS = (
+    "capa_work_days",
+    "capa_day_hours",
+    "capa_util",
+    "capa_owned_dim",
+    "capa_owned_hole",
+)
 
 
 def master_dir() -> Path:
     folder = data_dir() / "master"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def _settings_path() -> Path:
+    return master_dir() / SETTINGS_FILE
+
+
+def _default_settings(*, dim: int = 0, hole: int = 0) -> dict:
+    return {
+        "capa_work_days": float(DEFAULT_WORK_DAYS),
+        "capa_day_hours": float(DEFAULT_DAY_HOURS),
+        "capa_util": float(DEFAULT_UTILIZATION_PCT),
+        "capa_owned_dim": int(dim),
+        "capa_owned_hole": int(hole),
+    }
+
+
+def _push_github(filename: str, content: bytes) -> str:
+    if not github_store_enabled():
+        return ""
+    rel = f"templates/{filename}"
+    try:
+        _, sha = github_file_get(rel)
+        github_file_put(rel, content, f"chore: update {filename}", sha)
+        return f"GitHub 반영: {rel}"
+    except Exception as e:
+        return f"GitHub 저장 실패: {e}"
+
+
+def _save_settings(settings: dict) -> str:
+    path = _settings_path()
+    payload = {k: settings.get(k) for k in SETTINGS_KEYS}
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    path.write_bytes(raw)
+    return _push_github(SETTINGS_FILE, raw)
+
+
+def _read_settings_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for key in SETTINGS_KEYS:
+        if key not in data:
+            continue
+        try:
+            if key in ("capa_owned_dim", "capa_owned_hole"):
+                out[key] = int(float(data[key]))
+            else:
+                out[key] = float(data[key])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _load_settings_local() -> dict:
+    path = _settings_path()
+    if not path.is_file():
+        return {}
+    return _read_settings_file(path)
+
+
+def _sync_settings_from_github(*, force: bool = False) -> str:
+    if not github_store_enabled():
+        return ""
+    local = _settings_path()
+    if local.is_file() and not force:
+        return "가동조건: 로컬 유지"
+    for rel in (f"templates/{SETTINGS_FILE}", f"data/master/{SETTINGS_FILE}", SETTINGS_FILE):
+        try:
+            raw, _sha = github_file_get(rel)
+        except Exception as e:
+            if "404" in str(e):
+                continue
+            return f"가동조건 GitHub 오류: {e}"
+        if raw:
+            local.write_bytes(raw)
+            return f"가동조건 GitHub에서 가져옴: {rel}"
+    return "가동조건: 저장소에 없음"
+
+
+def _apply_settings_to_session(settings: dict) -> None:
+    for key, val in settings.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+def _current_settings_from_session() -> dict:
+    base = _default_settings()
+    out = {}
+    for key in SETTINGS_KEYS:
+        out[key] = st.session_state[key] if key in st.session_state else base[key]
+    return out
+
+
+def _normalize_settings(settings: dict) -> dict:
+    return {
+        "capa_work_days": float(settings.get("capa_work_days", DEFAULT_WORK_DAYS)),
+        "capa_day_hours": float(settings.get("capa_day_hours", DEFAULT_DAY_HOURS)),
+        "capa_util": float(settings.get("capa_util", DEFAULT_UTILIZATION_PCT)),
+        "capa_owned_dim": int(float(settings.get("capa_owned_dim", 0) or 0)),
+        "capa_owned_hole": int(float(settings.get("capa_owned_hole", 0) or 0)),
+    }
+
+
+def _persist_settings_if_changed() -> None:
+    now = _normalize_settings(_current_settings_from_session())
+    prev = st.session_state.get("capa_settings_saved")
+    if isinstance(prev, dict):
+        prev = _normalize_settings(prev)
+    if prev == now:
+        return
+    gh = _save_settings(now)
+    st.session_state["capa_settings_saved"] = dict(now)
+    if gh and "실패" not in gh:
+        st.session_state["capa_settings_note"] = gh
 
 
 def _list_paths(stem: str | None = None) -> list[Path]:
@@ -52,7 +181,6 @@ def _list_paths(stem: str | None = None) -> list[Path]:
         files.extend(folder.glob(f"{s}*.csv"))
         files.extend(folder.glob(f"{s}*.xlsx"))
         files.extend(folder.glob(f"{s}*.xls"))
-    # 중복 경로 제거 (순서 유지)
     seen: set[str] = set()
     uniq: list[Path] = []
     for p in files:
@@ -74,19 +202,69 @@ def _clear_files(stem: str | None = None) -> list[str]:
     return deleted
 
 
-def _save_upload(uploaded, prefix: str) -> Path:
-    """올린 파일을 data/master 에 저장. 제품_기준정보는 설비 시뮬레이션과 같은 파일명을 쓴다."""
+def _save_upload(uploaded, prefix: str) -> tuple[Path, str]:
+    """올린 파일을 data/master 에 저장하고 GitHub templates/ 에도 고정."""
     name = canonical_master_name(uploaded.name, prefix)
     _clear_files(prefix)
     if prefix == PRODUCT_STEM:
         _clear_files(_LEGACY_TIME_STEM)
     dest = master_dir() / name
-    dest.write_bytes(uploaded.getvalue())
-    return dest
+    data = uploaded.getvalue()
+    dest.write_bytes(data)
+    gh = _push_github(name, data)
+    return dest, gh
+
+
+def _sync_master_from_github(*, force: bool = False) -> list[str]:
+    if not github_store_enabled():
+        return ["GitHub Secrets가 없어 로컬 업로드 파일만 사용합니다."]
+    if not force and st.session_state.get("capa_gh_ok"):
+        return list(st.session_state.get("capa_gh_notes") or [])
+    notes: list[str] = []
+    folder = master_dir()
+    if force:
+        cleared = _clear_files()
+        if cleared:
+            notes.append("로컬 CAPA 파일 초기화: " + ", ".join(cleared))
+    for stem in QA_STEMS:
+        local = newest_matching(folder, stem)
+        if local is not None and not force:
+            notes.append(f"{stem}: 로컬 유지 ({local.name})")
+            continue
+        found_rel = None
+        found_raw = None
+        for rel in master_github_paths(stem):
+            try:
+                raw, _sha = github_file_get(rel)
+            except Exception as e:
+                if "404" in str(e):
+                    continue
+                notes.append(f"{stem}: GitHub 오류 ({e})")
+                found_rel = "__error__"
+                break
+            if raw:
+                found_rel, found_raw = rel, raw
+                break
+        if found_rel == "__error__":
+            continue
+        if found_rel and found_raw:
+            dest = folder / Path(found_rel).name
+            if not dest.name.startswith(stem):
+                dest = folder / f"{stem}{Path(found_rel).suffix}"
+            _clear_files(stem)
+            dest.write_bytes(found_raw)
+            notes.append(f"GitHub에서 가져옴: {found_rel}")
+        else:
+            notes.append(f"{stem}: 저장소에 없음 (templates/{stem}.csv 또는 .xlsx)")
+    note_set = _sync_settings_from_github(force=force)
+    if note_set:
+        notes.append(note_set)
+    st.session_state["capa_gh_ok"] = True
+    st.session_state["capa_gh_notes"] = notes
+    return notes
 
 
 def _product_path() -> Path | None:
-    """시뮬레이션과 공유하는 제품_기준정보. 예전 QA_제품측정시간도 허용."""
     folder = master_dir()
     return newest_matching(folder, PRODUCT_STEM) or newest_matching(folder, _LEGACY_TIME_STEM)
 
@@ -168,6 +346,8 @@ def _render_reset_ui() -> None:
         if st.button("삭제", type="primary", use_container_width=True, key="capa_reset_yes"):
             deleted = _clear_files()
             st.session_state[flag] = False
+            st.session_state["capa_gh_ok"] = False
+            st.session_state.pop("capa_gh_notes", None)
             for k in ("capa_plan_sig", "capa_time_sig"):
                 st.session_state.pop(k, None)
             st.session_state["capa_flash"] = "초기화 완료: " + (", ".join(deleted) if deleted else "없음")
@@ -262,35 +442,46 @@ def render() -> None:
     st.title("QA그룹 CAPA 관리")
     st.caption(
         "월별 생산계획과 제품_기준정보로 치수·홀 설비 필요대수와 가동율을 계산합니다. "
-        "제품_기준정보는 설비 운영 시뮬레이션과 **같은 파일·같은 양식**입니다. "
-        "시뮬레이션에 이미 올려 둔 제품_기준정보가 있으면 그대로 사용합니다. 홀은 CEL만 봅니다."
+        "가동 조건·업로드 파일은 로컬에 고정 저장되고, GitHub Secrets가 있으면 Cloud 재시작 후에도 유지됩니다. "
+        "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일입니다. 홀은 CEL만 봅니다."
     )
+
+    force_gh = bool(st.session_state.pop("capa_gh_force_refresh", False))
+    if force_gh:
+        _sync_master_from_github(force=True)
+        st.session_state["capa_flash"] = "GitHub에서 CAPA 데이터 다시 가져오기 완료"
+    else:
+        _sync_master_from_github()
 
     flash = st.session_state.pop("capa_flash", None)
     if flash:
         st.success(flash)
 
     dim_default, hole_default, eq_name = _owned_from_equipment()
-    if "capa_owned_dim" not in st.session_state:
-        st.session_state["capa_owned_dim"] = dim_default
-    if "capa_owned_hole" not in st.session_state:
-        st.session_state["capa_owned_hole"] = hole_default
-
-    work_days = float(DEFAULT_WORK_DAYS)
-    day_hours = float(DEFAULT_DAY_HOURS)
-    util_pct = float(DEFAULT_UTILIZATION_PCT)
+    saved = _load_settings_local()
+    if not saved:
+        saved = _default_settings(dim=dim_default, hole=hole_default)
+    else:
+        # 보유대수가 설정에 없고 설비 기준이 있으면 그 값으로 시작
+        if "capa_owned_dim" not in saved and dim_default:
+            saved["capa_owned_dim"] = dim_default
+        if "capa_owned_hole" not in saved and hole_default:
+            saved["capa_owned_hole"] = hole_default
+    _apply_settings_to_session(saved)
+    if "capa_settings_saved" not in st.session_state:
+        st.session_state["capa_settings_saved"] = dict(_current_settings_from_session())
 
     with st.sidebar:
         st.header("계정")
         render_logout_controls()
         st.divider()
         st.header("가동 조건")
+        st.caption("값을 바꾸면 자동으로 저장됩니다. Cloud에서는 GitHub에도 반영됩니다.")
         work_days = float(
             st.number_input(
                 "월 작업일수",
                 min_value=1.0,
                 max_value=31.0,
-                value=float(DEFAULT_WORK_DAYS),
                 step=1.0,
                 help="한 달 조업일. 모든 월에 동일하게 적용합니다.",
                 key="capa_work_days",
@@ -301,7 +492,6 @@ def render() -> None:
                 "1일 가동시간 (시간)",
                 min_value=1.0,
                 max_value=24.0,
-                value=float(DEFAULT_DAY_HOURS),
                 step=0.5,
                 help="설비 이론능력은 24시간(1440분)입니다.",
                 key="capa_day_hours",
@@ -312,7 +502,6 @@ def render() -> None:
                 "가동률 (%)",
                 min_value=1.0,
                 max_value=100.0,
-                value=float(DEFAULT_UTILIZATION_PCT),
                 step=1.0,
                 help="셋업·비가동·인력 제약을 반영. 상단 「가동률 기준 필요대수」와 1대 월 가용에 그대로 적용됩니다.",
                 key="capa_util",
@@ -324,7 +513,7 @@ def render() -> None:
                 min_value=0,
                 max_value=999,
                 step=1,
-                help="가동율 분모. 설비_기준정보 치수 가동 대수가 있으면 그 값으로 시작합니다.",
+                help="가동율 분모. 저장해 두면 다음에도 같은 값으로 시작합니다.",
                 key="capa_owned_dim",
             )
         )
@@ -334,24 +523,37 @@ def render() -> None:
                 min_value=0,
                 max_value=999,
                 step=1,
-                help="가동율 분모. 설비_기준정보 Hole 가동 대수가 있으면 그 값으로 시작합니다.",
+                help="가동율 분모. 저장해 두면 다음에도 같은 값으로 시작합니다.",
                 key="capa_owned_hole",
             )
         )
+        _persist_settings_if_changed()
         avail = work_days * day_hours * 60.0 * (util_pct / 100.0)
         st.caption(
             f"1대 월 가용 = {work_days:g}일 × {day_hours:g}시간 × 60 × {util_pct:g}% "
             f"= **{avail:,.0f}분**. 참고: 24시간 = {DAY_MINUTES}분/일."
         )
         if eq_name:
-            st.caption(f"보유대수 초기값: `{eq_name}` 치수 {dim_default}대 · 홀 {hole_default}대")
+            st.caption(f"설비_기준정보 참고: `{eq_name}` 치수 {dim_default}대 · 홀 {hole_default}대")
+        note = st.session_state.pop("capa_settings_note", None)
+        if note:
+            st.caption(note)
+        if github_store_enabled():
+            if st.button("GitHub에서 다시 가져오기", use_container_width=True, key="capa_gh_refresh"):
+                st.session_state["capa_gh_force_refresh"] = True
+                st.session_state["capa_gh_ok"] = False
+                for k in SETTINGS_KEYS:
+                    st.session_state.pop(k, None)
+                st.session_state.pop("capa_settings_saved", None)
+                st.rerun()
+        else:
+            st.caption("GitHub Secrets가 없으면 이 서버의 로컬 파일만 유지됩니다.")
 
         st.divider()
         st.header("파일 업로드")
         st.caption(
-            "월별 생산계획은 이 페이지에서 올리세요. "
-            "제품_기준정보는 설비 운영 시뮬레이션과 같은 파일입니다 "
-            "(이미 시뮬레이션에 있으면 다시 올릴 필요 없음). "
+            "올린 파일은 저장되어 다음에도 그대로 사용합니다. "
+            "제품_기준정보는 설비 운영 시뮬레이션과 공유됩니다. "
             "치수·Hole 행의 매당_설비분이 1매 측정시간입니다."
         )
         st.dataframe(pd.DataFrame(_active_files()), use_container_width=True, hide_index=True)
@@ -362,16 +564,21 @@ def render() -> None:
         plan_sig = (plan_up.name, int(getattr(plan_up, "size", 0) or 0)) if plan_up else None
         time_sig = (time_up.name, int(getattr(time_up, "size", 0) or 0)) if time_up else None
         if plan_up is not None and plan_sig != st.session_state.get("capa_plan_sig"):
-            path = _save_upload(plan_up, QA_PLAN_STEM)
+            path, gh = _save_upload(plan_up, QA_PLAN_STEM)
             st.session_state["capa_plan_sig"] = plan_sig
             st.session_state["capa_use_sample"] = False
-            st.session_state["capa_flash"] = f"생산계획 업로드: {path.name}"
+            st.session_state["capa_gh_ok"] = True
+            st.session_state["capa_flash"] = f"생산계획 저장: {path.name}" + (f" · {gh}" if gh else "")
             st.rerun()
         if time_up is not None and time_sig != st.session_state.get("capa_time_sig"):
-            path = _save_upload(time_up, PRODUCT_STEM)
+            path, gh = _save_upload(time_up, PRODUCT_STEM)
             st.session_state["capa_time_sig"] = time_sig
             st.session_state["capa_use_sample"] = False
-            st.session_state["capa_flash"] = f"제품_기준정보 업로드: {path.name} (설비 시뮬레이션과 공유)"
+            st.session_state["capa_gh_ok"] = True
+            st.session_state["capa_flash"] = (
+                f"제품_기준정보 저장: {path.name} (설비 시뮬레이션과 공유)"
+                + (f" · {gh}" if gh else "")
+            )
             st.rerun()
 
         st.subheader("양식 받기")
