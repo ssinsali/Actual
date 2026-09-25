@@ -1,6 +1,7 @@
 """드릴 설비 필요 분석 — 월별 수량 × 제품 가공시간 → 필요대수."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import altair as alt
@@ -40,6 +41,151 @@ def master_dir() -> Path:
     folder = data_dir() / "master"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+SETTINGS_STEM = "드릴_가동조건"
+SETTINGS_FILE = f"{SETTINGS_STEM}.json"
+SETTINGS_KEYS = (
+    "drill_work_days",
+    "drill_day_hours",
+    "drill_util",
+    "drill_owned",
+)
+
+
+def _settings_path() -> Path:
+    return master_dir() / SETTINGS_FILE
+
+
+def _default_settings() -> dict:
+    return {
+        "drill_work_days": float(DEFAULT_WORK_DAYS),
+        "drill_day_hours": float(DEFAULT_DAY_HOURS),
+        "drill_util": float(DEFAULT_UTILIZATION_PCT),
+        "drill_owned": 0,
+        "drill_deduct_rows": [],
+    }
+
+
+def _read_settings_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = _default_settings()
+    for key in SETTINGS_KEYS:
+        if key not in data:
+            continue
+        try:
+            if key == "drill_owned":
+                out[key] = int(float(data[key]))
+            else:
+                out[key] = float(data[key])
+        except (TypeError, ValueError):
+            continue
+    rows = data.get("drill_deduct_rows")
+    cleaned: list[dict] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("제품코드", "")).strip()
+            try:
+                amt = int(float(row.get("매월차감") or 0))
+            except (TypeError, ValueError):
+                amt = 0
+            if code and amt > 0:
+                cleaned.append({"제품코드": code, "매월차감": amt})
+    out["drill_deduct_rows"] = cleaned
+    return out
+
+
+def _load_settings_local() -> dict:
+    path = _settings_path()
+    if not path.is_file():
+        return {}
+    return _read_settings_file(path)
+
+
+def _save_settings(settings: dict) -> str:
+    path = _settings_path()
+    payload = {k: settings.get(k) for k in SETTINGS_KEYS}
+    payload["drill_deduct_rows"] = list(settings.get("drill_deduct_rows") or [])
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    path.write_bytes(raw)
+    return _push_github(SETTINGS_FILE, raw)
+
+
+def _sync_settings_from_github(*, force: bool = False) -> str:
+    if not github_store_enabled():
+        return ""
+    local = _settings_path()
+    if local.is_file() and not force:
+        return "가동조건: 로컬 유지"
+    for rel in (f"templates/{SETTINGS_FILE}", f"data/master/{SETTINGS_FILE}", SETTINGS_FILE):
+        try:
+            raw, _sha = github_file_get(rel)
+        except Exception as e:
+            if "404" in str(e):
+                continue
+            return f"가동조건 GitHub 오류: {e}"
+        if raw:
+            local.write_bytes(raw)
+            return f"가동조건 GitHub에서 가져옴: {rel}"
+    return "가동조건: 저장소에 없음"
+
+
+def _apply_settings_to_session(settings: dict) -> None:
+    for key in SETTINGS_KEYS:
+        if key not in st.session_state and key in settings:
+            st.session_state[key] = settings[key]
+    if "drill_deduct_rows" not in st.session_state:
+        st.session_state["drill_deduct_rows"] = list(settings.get("drill_deduct_rows") or [])
+
+
+def _current_settings_from_session() -> dict:
+    base = _default_settings()
+    out: dict = {}
+    for key in SETTINGS_KEYS:
+        out[key] = st.session_state[key] if key in st.session_state else base[key]
+    out["drill_deduct_rows"] = list(st.session_state.get("drill_deduct_rows") or [])
+    return out
+
+
+def _normalize_settings(settings: dict) -> dict:
+    rows = []
+    for row in settings.get("drill_deduct_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("제품코드", "")).strip()
+        try:
+            amt = int(float(row.get("매월차감") or 0))
+        except (TypeError, ValueError):
+            amt = 0
+        if code and amt > 0:
+            rows.append({"제품코드": code, "매월차감": amt})
+    return {
+        "drill_work_days": float(settings.get("drill_work_days", DEFAULT_WORK_DAYS)),
+        "drill_day_hours": float(settings.get("drill_day_hours", DEFAULT_DAY_HOURS)),
+        "drill_util": float(settings.get("drill_util", DEFAULT_UTILIZATION_PCT)),
+        "drill_owned": int(float(settings.get("drill_owned", 0) or 0)),
+        "drill_deduct_rows": rows,
+    }
+
+
+def _persist_settings_if_changed() -> None:
+    now = _normalize_settings(_current_settings_from_session())
+    prev = st.session_state.get("drill_settings_saved")
+    if isinstance(prev, dict):
+        prev = _normalize_settings(prev)
+    if prev == now:
+        return
+    gh = _save_settings(now)
+    st.session_state["drill_settings_saved"] = dict(now)
+    if gh and "실패" not in gh:
+        st.session_state["drill_settings_note"] = gh
 
 
 def _list_drill_paths(stem: str | None = None) -> list[Path]:
@@ -118,6 +264,9 @@ def _sync_from_github(*, force: bool = False) -> list[str]:
             notes.append(f"GitHub에서 가져옴: {found_rel}")
         else:
             notes.append(f"{stem}: 저장소에 없음 (templates/{stem}.csv 또는 .xlsx)")
+    note_set = _sync_settings_from_github(force=force)
+    if note_set:
+        notes.append(note_set)
     st.session_state["drill_gh_ok"] = True
     st.session_state["drill_gh_notes"] = notes
     return notes
@@ -247,6 +396,7 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
             kept = [r for r in rows if str(r.get("제품코드", "")).strip().upper() != code.upper()]
             kept.append({"제품코드": code, "매월차감": amt})
             st.session_state.drill_deduct_rows = kept
+            _persist_settings_if_changed()
             st.rerun()
 
     if rows:
@@ -260,9 +410,11 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
             with d3:
                 if st.button("삭제", key=f"drill_deduct_del_{i}", use_container_width=True):
                     st.session_state.drill_deduct_rows = [r for j, r in enumerate(rows) if j != i]
+                    _persist_settings_if_changed()
                     st.rerun()
         if st.button("차감 목록 비우기", key="drill_deduct_clear"):
             st.session_state.drill_deduct_rows = []
+            _persist_settings_if_changed()
             st.rerun()
     else:
         st.caption("차감할 제품코드와 매월 차감매수를 넣고 추가하세요.")
@@ -274,6 +426,25 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
 
 def render() -> None:
     st.title("드릴설비 필요 분석")
+
+    force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False))
+    if force_gh:
+        _sync_from_github(force=True)
+        for k in SETTINGS_KEYS:
+            st.session_state.pop(k, None)
+        st.session_state.pop("drill_deduct_rows", None)
+        st.session_state.pop("drill_settings_saved", None)
+        st.session_state["drill_flash"] = "GitHub 드릴 데이터 다시 가져오기 완료"
+    else:
+        _sync_from_github()
+
+    saved = _load_settings_local() or _default_settings()
+    _apply_settings_to_session(saved)
+    if "drill_settings_saved" not in st.session_state:
+        st.session_state["drill_settings_saved"] = dict(
+            _normalize_settings(_current_settings_from_session())
+        )
+
     own_col, own_help = st.columns([1, 3])
     with own_col:
         owned = int(
@@ -281,7 +452,6 @@ def render() -> None:
                 "현재 보유 대수",
                 min_value=0,
                 max_value=999,
-                value=0,
                 step=1,
                 help="지금 가동 중인 드릴 설비 대수. 부족대수 = 월 필요대수 − 보유대수.",
                 key="drill_owned",
@@ -291,36 +461,24 @@ def render() -> None:
         st.caption(
             "월별 제품코드 필요수량과 제품별 가공시간(1매당 분)을 올리면 "
             "드릴 설비 **총 필요대수**와 **보유 대비 부족대수**를 계산합니다. "
-            "부족대수 = 월 필요대수(올림) − 현재 보유 (0 미만은 0). "
-            "GitHub `templates/`에 드릴_월별필요수량 / 드릴_제품가공시간을 올리면 Cloud 재시작 후에도 가져옵니다."
+            "가동 조건·업로드 파일·수동 차감은 저장되며, GitHub Secrets가 있으면 Cloud 재시작 후에도 유지됩니다."
         )
-
-    force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False))
-    if force_gh:
-        _sync_from_github(force=True)
-        st.session_state["drill_flash"] = "GitHub 드릴 데이터 다시 가져오기 완료"
-    else:
-        _sync_from_github()
 
     flash = st.session_state.pop("drill_flash", None)
     if flash:
         st.success(flash)
-
-    work_days = float(DEFAULT_WORK_DAYS)
-    day_hours = float(DEFAULT_DAY_HOURS)
-    util_pct = float(DEFAULT_UTILIZATION_PCT)
 
     with st.sidebar:
         st.header("계정")
         render_logout_controls()
         st.divider()
         st.header("가동 조건")
+        st.caption("값을 바꾸면 자동으로 저장됩니다. Cloud에서는 GitHub에도 반영됩니다.")
         work_days = float(
             st.number_input(
                 "월 작업일수",
                 min_value=1.0,
                 max_value=31.0,
-                value=float(DEFAULT_WORK_DAYS),
                 step=1.0,
                 help="한 달 실제 조업일. 모든 월에 동일하게 적용합니다.",
                 key="drill_work_days",
@@ -331,7 +489,6 @@ def render() -> None:
                 "1일 가동시간 (시간)",
                 min_value=1.0,
                 max_value=24.0,
-                value=float(DEFAULT_DAY_HOURS),
                 step=0.5,
                 help="드릴 설비 하루 가동 시간. 3조 연속이면 24.",
                 key="drill_day_hours",
@@ -342,25 +499,28 @@ def render() -> None:
                 "가동률 (%)",
                 min_value=1.0,
                 max_value=100.0,
-                value=float(DEFAULT_UTILIZATION_PCT),
                 step=1.0,
                 help="셋업·비가동을 빼려면 100보다 낮게. 1대 가용시간 = 작업일 × 일가동 × 60 × 가동률.",
                 key="drill_util",
             )
         )
+        _persist_settings_if_changed()
         avail = work_days * day_hours * 60.0 * (util_pct / 100.0)
         st.caption(
             f"1대 월 가용 = {work_days:g}일 × {day_hours:g}시간 × 60 × {util_pct:g}% "
             f"= **{avail:,.0f}분** ({avail / 60:,.0f}시간). "
             f"참고: 24시간 기준 {DAY_MINUTES}분/일."
         )
+        note = st.session_state.pop("drill_settings_note", None)
+        if note:
+            st.caption(note)
         if github_store_enabled():
             if st.button("GitHub에서 다시 가져오기", use_container_width=True, key="drill_gh_refresh"):
                 st.session_state["drill_gh_force_refresh"] = True
                 st.session_state["drill_gh_ok"] = False
                 st.rerun()
         else:
-            st.caption("GitHub Secrets([github] token/repo)가 없으면 다시 가져오기를 쓸 수 없습니다.")
+            st.caption("GitHub Secrets가 없으면 이 서버의 로컬 파일만 유지됩니다.")
 
         st.divider()
         st.header("데이터 등록")
@@ -461,6 +621,7 @@ def render() -> None:
         if not qty_norm.empty and "제품코드" in qty_norm.columns:
             code_options = sorted({str(c) for c in qty_norm["제품코드"].tolist() if str(c).strip()})
     deduct_edit = _render_deduct_ui(code_options)
+    _persist_settings_if_changed()
 
     result = calc_drill_requirement(
         qty_raw,
