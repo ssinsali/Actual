@@ -3,19 +3,21 @@
 설비 운영 시뮬레이션과 같은 규칙:
 - 치수: CEL·Ring·Wafer 등 측정시간이 있는 전 제품
 - 홀(Hole): CEL만
-- 1대 월 가용(분) = 작업일수 × 1일 가동시간 × 60  (설비 24시간이면 작업일 × 1440)
+- 1대 월 가용(분) = 작업일수 × 1일 가동시간 × 60 × 가동률
 - 필요대수 = ceil(그 달 필요시간 합 ÷ 1대 월 가용)
 - 가동율(%) = 필요시간 ÷ (보유대수 × 1대 월 가용) × 100
 """
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 import pandas as pd
 
-from drill_engine import _code_key, _month_label, _parse_month_header, machine_month_minutes, normalize_qty
-from sim_engine import _infer_product_family, _norm, _rename_by_alias, normalize_products
+# 공개 API만 사용 (Cloud에서 drill/sim 비공개 심볼 ImportError 방지)
+from drill_engine import machine_month_minutes, normalize_qty
+from sim_engine import normalize_products
 
 QA_PLAN_STEM = "QA_월별생산계획"
 # 설비 운영 시뮬레이션과 동일한 제품 기준정보 파일명
@@ -26,6 +28,78 @@ _LEGACY_TIME_STEM = "QA_제품측정시간"
 
 PLAN_COLUMNS = ("제품코드", "제품명", *(f"{m}월" for m in range(1, 13)))
 TIME_COLUMNS = ("제품코드", "제품명", "제품군", "치수_측정분", "홀_측정분", "비고")
+
+DEFAULT_DAY_HOURS = 24.0
+DEFAULT_UTILIZATION_PCT = 100.0
+
+_MONTH_HEADER_RE = re.compile(
+    r"^(?:(?P<year>20\d{2})\s*[-./년]?\s*)?(?P<month>1[0-2]|0?[1-9])\s*월?$"
+)
+_YM_COMPACT_RE = re.compile(r"^(?P<year>20\d{2})(?P<month>1[0-2]|0[1-9])$")
+
+
+def _norm(v: Any) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(v).strip()
+
+
+def _code_key(v: Any) -> str:
+    t = _norm(v).replace("\ufeff", "").replace("\u00a0", " ")
+    for ch in ("－", "–", "—", "−", "﹣"):
+        t = t.replace(ch, "-")
+    return re.sub(r"\s+", "", t).upper()
+
+
+def _parse_month_header(col: Any) -> tuple[str, int] | None:
+    text = _norm(col).replace(" ", "")
+    if not text:
+        return None
+    compact = _YM_COMPACT_RE.match(text)
+    if compact:
+        return compact.group("year"), int(compact.group("month"))
+    matched = _MONTH_HEADER_RE.match(text)
+    if not matched:
+        return None
+    month = int(matched.group("month"))
+    year = matched.group("year") or ""
+    return year, month
+
+
+def _month_label(year: str, month: int) -> str:
+    if year:
+        return f"{year}-{int(month):02d}"
+    return f"{int(month)}월"
+
+
+def _rename_by_alias(df: pd.DataFrame, aliases: dict[str, tuple[str, ...]]) -> pd.DataFrame:
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for col in df.columns:
+        key = str(col).strip().replace(" ", "").replace("_", "").lower()
+        for dest, opts in aliases.items():
+            if dest in used:
+                continue
+            for opt in opts:
+                if key == opt.replace(" ", "").replace("_", "").lower():
+                    mapping[col] = dest
+                    used.add(dest)
+                    break
+    return df.rename(columns=mapping)
+
+
+def _infer_product_family(name: Any) -> str:
+    t = _norm(name)
+    if not t:
+        return ""
+    u = t.upper().replace(" ", "")
+    if "WAFER" in u or "웨이퍼" in t:
+        return "Wafer"
+    if "RING" in u or "링" == t:
+        return "Ring"
+    if "CEL" in u:
+        return "CEL"
+    return t
 
 
 def _ceil_machines(value: float) -> int:
