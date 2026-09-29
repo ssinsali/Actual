@@ -788,7 +788,8 @@ def render() -> None:
     st.subheader("월별 필요대수")
     st.caption(
         "필요수량합 = 올린 월별 제품코드 필요수량 파일의 해당 월 합계(가공시간 유무와 무관). "
-        "차감분 반영 합 = 필요수량합 − 가공시간 없는 제품 − 수동 차감. "
+        "차감분 반영 합 = 가공시간 있는 제품의 (원 필요수량 − 수동 차감). "
+        "수동 차감은 제품·월마다 한 번만 적용합니다. "
         "필요시간 = Σ (차감분 반영 매수 × 매당가공시간)."
     )
     st.dataframe(
@@ -825,16 +826,16 @@ def render() -> None:
         for r in deduct_rows
         if str(r.get("제품코드", "")).strip() and int(r.get("매월차감") or 0) > 0
     ]
-    explain = "차감분 반영 합은 : "
+    explain = "차감분 반영 합 구성: "
     if no_time_codes:
-        explain += "가공시간 없는 제품코드 " + ", ".join(no_time_codes)
+        explain += "가공시간 없는 제품코드 " + ", ".join(no_time_codes) + " 제외"
     else:
         explain += "가공시간 없는 제품코드 없음"
-    explain += " + "
+    explain += " · "
     if deduct_bits:
-        explain += "현재 차감 " + ", ".join(deduct_bits)
+        explain += "수동 차감(제품·월당 1회) " + ", ".join(deduct_bits)
     else:
-        explain += "현재 차감 없음"
+        explain += "수동 차감 없음"
     st.caption(explain)
 
     peak_detail = result["detail"][result["detail"]["월라벨"] == peak_label].copy()
