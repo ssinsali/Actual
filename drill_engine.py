@@ -278,7 +278,12 @@ def normalize_qty(df: pd.DataFrame) -> pd.DataFrame:
         melted["필요수량"] = pd.to_numeric(melted["필요수량"], errors="coerce").fillna(0)
         melted = melted[melted["월"].between(1, 12) & (melted["필요수량"] > 0)]
         melted["월라벨"] = melted.apply(lambda r: _month_label(str(r["년도"]), int(r["월"])), axis=1)
-        return melted[["년도", "월", "월라벨", "제품코드", "제품명", "필요수량"]].reset_index(drop=True)
+        # 같은 제품·월이 여러 행/중복 월헤더면 합친 뒤 차감이 한 번만 들어가게 한다.
+        return (
+            melted.groupby(["년도", "월", "월라벨", "제품코드"], as_index=False)
+            .agg(제품명=("제품명", "last"), 필요수량=("필요수량", "sum"))
+            .reset_index(drop=True)
+        )
 
     # 세로형
     if "년월" in work.columns:
@@ -450,6 +455,7 @@ def apply_qty_deduct(
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
     """필요수량에서 수동 차감을 뺀다. 0 미만은 0.
 
+    같은 제품·월이 여러 행이어도 차감은 합산 수량에 대해 한 번만 적용한다.
     반환: (차감 후 qty, 적용 메모, 수량 파일에 없는 코드)
     """
     notes: list[str] = []
@@ -457,12 +463,20 @@ def apply_qty_deduct(
     if qty is None or qty.empty:
         return qty if qty is not None else pd.DataFrame(), notes, missing
     out = qty.copy()
-    if "필요수량_원" not in out.columns:
-        out["필요수량_원"] = out["필요수량"]
+    out["제품코드"] = out["제품코드"].map(_code_key)
+    # 제품·월 단위로 합쳐 중복 행에 차감이 두 번 들어가지 않게 한다.
+    if "제품명" not in out.columns:
+        out["제품명"] = ""
+    group_cols = [c for c in ("년도", "월", "월라벨", "제품코드") if c in out.columns]
+    out = (
+        out.groupby(group_cols, as_index=False)
+        .agg(제품명=("제품명", "last"), 필요수량=("필요수량", "sum"))
+    )
+    out["필요수량_원"] = out["필요수량"].astype(float)
     out["차감매수"] = 0.0
     plan = normalize_deduct(deduct)
     if plan.empty:
-        return out, notes, missing
+        return out.reset_index(drop=True), notes, missing
 
     qty_codes = set(out["제품코드"].map(_code_key))
     for _, row in plan.iterrows():
@@ -486,6 +500,7 @@ def apply_qty_deduct(
             mask = (out["제품코드"].map(_code_key) == code) & (out["월"] == month)
             if not mask.any():
                 continue
+            # 해당 제품·월 합계에 대해 한 번만 차감 (행마다 500씩 빼지 않음)
             out.loc[mask, "차감매수"] = amt
             applied_months.append(f"{mcol} {amt:g}")
         if applied_months:
@@ -497,8 +512,8 @@ def apply_qty_deduct(
             notes.append(f"{code}: 해당 월 수량이 없어 차감하지 않음")
 
     out["필요수량"] = (out["필요수량_원"].astype(float) - out["차감매수"].astype(float)).clip(lower=0)
-    out = out[out["필요수량"] > 0].reset_index(drop=True)
-    return out, notes, missing
+    # 0매 행도 남겨 수동차감 합계가 빠지지 않게 한다. 필요시간 계산에서 제외.
+    return out.reset_index(drop=True), notes, missing
 
 
 def calc_drill_requirement(
@@ -592,6 +607,7 @@ def calc_drill_requirement(
     result["unused_times"] = sorted(time_codes - qty_codes)
 
     detail = qty_n.copy()
+    detail = detail[detail["필요수량"].astype(float) > 0].copy()
     detail["매당가공시간_분"] = detail["제품코드"].map(time_map)
     detail = detail[detail["매당가공시간_분"].notna() & (detail["매당가공시간_분"] > 0)].copy()
     if detail.empty:
@@ -600,6 +616,14 @@ def calc_drill_requirement(
         lambda r: r["제품명"] or name_map.get(_code_key(r["제품코드"]), ""),
         axis=1,
     )
+    if "필요수량_원" not in detail.columns:
+        detail["필요수량_원"] = detail["필요수량"]
+    if "차감매수" not in detail.columns:
+        detail["차감매수"] = 0
+    detail["유효차감"] = (
+        detail["필요수량_원"].astype(float) - detail["필요수량"].astype(float)
+    ).clip(lower=0)
+    # 필요시간은 차감분 반영 수량 × 매당가공시간 (차감은 제품·월당 1회)
     detail["필요시간_분"] = detail["필요수량"] * detail["매당가공시간_분"]
     detail["이론필요대수"] = (detail["필요시간_분"] / avail).round(4)
     result["detail"] = detail.sort_values(["년도", "월", "제품코드"]).reset_index(drop=True)
@@ -608,17 +632,19 @@ def calc_drill_requirement(
     excl = qty_all[qty_all["제품코드"].map(_code_key).isin(set(result["unmatched"]))]
     excl_m = excl.groupby(["년도", "월", "월라벨"], as_index=False).agg(가공시간없음=("필요수량", "sum"))
     orig_m = sum_uploaded_qty_by_month(qty)
-    if "필요수량_원" not in detail.columns:
-        detail["필요수량_원"] = detail["필요수량"]
-    if "차감매수" not in detail.columns:
-        detail["차감매수"] = 0
-    detail["유효차감"] = (
-        detail["필요수량_원"].astype(float) - detail["필요수량"].astype(float)
+
+    # 수동차감 = 가공시간 있는 제품에서 실제로 빠진 매수 (요청액이 원수량보다 커도 원수량까지만)
+    timed_deduct = qty_n[qty_n["제품코드"].map(_code_key).isin(time_codes)].copy()
+    if "필요수량_원" not in timed_deduct.columns:
+        timed_deduct["필요수량_원"] = timed_deduct["필요수량"]
+    if "차감매수" not in timed_deduct.columns:
+        timed_deduct["차감매수"] = 0.0
+    timed_deduct["유효차감"] = (
+        timed_deduct["필요수량_원"].astype(float) - timed_deduct["필요수량"].astype(float)
     ).clip(lower=0)
-    # 필요시간은 차감분 반영 수량 × 매당가공시간
-    detail["필요시간_분"] = detail["필요수량"] * detail["매당가공시간_분"]
-    detail["이론필요대수"] = (detail["필요시간_분"] / avail).round(4)
-    result["detail"] = detail.sort_values(["년도", "월", "제품코드"]).reset_index(drop=True)
+    deduct_m = timed_deduct.groupby(["년도", "월", "월라벨"], as_index=False).agg(
+        수동차감=("유효차감", "sum")
+    )
 
     monthly = (
         detail.groupby(["년도", "월", "월라벨"], as_index=False)
@@ -630,11 +656,11 @@ def calc_drill_requirement(
     monthly = orig_m.merge(monthly, on=["년도", "월", "월라벨"], how="left")
     monthly = monthly.merge(csv_m, on=["년도", "월", "월라벨"], how="left")
     monthly = monthly.merge(excl_m, on=["년도", "월", "월라벨"], how="left")
-    for col in ("필요수량합", "차감분반영합", "필요시간_분", "가공시간없음", "CSV원합"):
+    monthly = monthly.merge(deduct_m, on=["년도", "월", "월라벨"], how="left")
+    for col in ("필요수량합", "차감분반영합", "필요시간_분", "가공시간없음", "CSV원합", "수동차감"):
         if col not in monthly.columns:
             monthly[col] = 0
         monthly[col] = monthly[col].fillna(0)
-    monthly["수동차감"] = (monthly["필요수량합"] - monthly["차감분반영합"]).clip(lower=0)
     monthly["1대월가용_분"] = avail
     monthly["이론필요대수"] = (monthly["필요시간_분"] / avail).round(4)
     monthly["필요대수"] = monthly["이론필요대수"].map(_ceil_machines)
