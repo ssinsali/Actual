@@ -438,15 +438,35 @@ def normalize_deduct(df: pd.DataFrame) -> pd.DataFrame:
         work["매월차감"] = 0
     work["제품코드"] = work["제품코드"].map(_code_key)
     work["매월차감"] = pd.to_numeric(work["매월차감"], errors="coerce").fillna(0)
+    # 입력에 실제로 있는 월 열만 숫자로 둔다. 빈 월 열을 NA로 채우면
+    # 이후 로직이 NA를 '값 있음'으로 오인해 차감이 NaN이 된다.
     for mcol in MONTH_COLUMNS:
         if mcol in work.columns:
             work[mcol] = pd.to_numeric(work[mcol], errors="coerce")
-        else:
-            work[mcol] = pd.NA
     work = work[work["제품코드"] != ""].copy()
     if work.empty:
         return empty
     return work.drop_duplicates("제품코드", keep="last").reset_index(drop=True)
+
+
+def _deduct_amount_for_month(row: pd.Series, month: int, default_amt: float) -> float:
+    """해당 월 차감매수. 월별 열이 없거나 비어 있으면 매월차감(default)을 쓴다."""
+    mcol = f"{month}월"
+    if mcol not in row.index:
+        return float(default_amt)
+    raw = row.get(mcol)
+    try:
+        if raw is None or pd.isna(raw):
+            return float(default_amt)
+    except (TypeError, ValueError):
+        pass
+    text = str(raw).strip()
+    if text == "" or text.lower() in {"<na>", "nan", "none", "nat"}:
+        return float(default_amt)
+    val = pd.to_numeric(raw, errors="coerce")
+    if pd.isna(val):
+        return float(default_amt)
+    return float(val)
 
 
 def apply_qty_deduct(
@@ -467,10 +487,16 @@ def apply_qty_deduct(
     # 제품·월 단위로 합쳐 중복 행에 차감이 두 번 들어가지 않게 한다.
     if "제품명" not in out.columns:
         out["제품명"] = ""
-    group_cols = [c for c in ("년도", "월", "월라벨", "제품코드") if c in out.columns]
+    # 년도가 달라도 같은 월이면 한곳으로 합친다 (12월 / 2026-12 중복 방지)
+    out["월"] = pd.to_numeric(out["월"], errors="coerce").fillna(0).astype(int)
     out = (
-        out.groupby(group_cols, as_index=False)
-        .agg(제품명=("제품명", "last"), 필요수량=("필요수량", "sum"))
+        out.groupby(["제품코드", "월"], as_index=False)
+        .agg(
+            년도=("년도", "first"),
+            월라벨=("월라벨", "first"),
+            제품명=("제품명", "last"),
+            필요수량=("필요수량", "sum"),
+        )
     )
     out["필요수량_원"] = out["필요수량"].astype(float)
     out["차감매수"] = 0.0
@@ -489,20 +515,15 @@ def apply_qty_deduct(
         default_amt = float(row.get("매월차감") or 0)
         applied_months: list[str] = []
         for month in range(1, 13):
-            mcol = f"{month}월"
-            raw = row.get(mcol)
-            if raw is not None and not (isinstance(raw, float) and pd.isna(raw)) and str(raw).strip() != "":
-                amt = float(pd.to_numeric(raw, errors="coerce") or 0)
-            else:
-                amt = default_amt
-            if amt <= 0:
+            amt = _deduct_amount_for_month(row, month, default_amt)
+            if amt <= 0 or pd.isna(amt):
                 continue
             mask = (out["제품코드"].map(_code_key) == code) & (out["월"] == month)
             if not mask.any():
                 continue
-            # 해당 제품·월 합계에 대해 한 번만 차감 (행마다 500씩 빼지 않음)
-            out.loc[mask, "차감매수"] = amt
-            applied_months.append(f"{mcol} {amt:g}")
+            # 해당 제품·월 합계에 대해 한 번만 차감
+            out.loc[mask, "차감매수"] = float(amt)
+            applied_months.append(f"{month}월 {amt:g}")
         if applied_months:
             if default_amt > 0 and len(applied_months) >= 2:
                 notes.append(f"{code}: 매월 {default_amt:g}매 차감")
@@ -511,6 +532,7 @@ def apply_qty_deduct(
         elif default_amt > 0:
             notes.append(f"{code}: 해당 월 수량이 없어 차감하지 않음")
 
+    out["차감매수"] = pd.to_numeric(out["차감매수"], errors="coerce").fillna(0.0).clip(lower=0)
     out["필요수량"] = (out["필요수량_원"].astype(float) - out["차감매수"].astype(float)).clip(lower=0)
     # 0매 행도 남겨 수동차감 합계가 빠지지 않게 한다. 필요시간 계산에서 제외.
     return out.reset_index(drop=True), notes, missing
