@@ -3,5 +3,10 @@
   "drill_day_hours": 24.0,
   "drill_util": 90.0,
   "drill_owned": 315,
-  "drill_deduct_rows": []
+  "drill_deduct_rows": [
+    {
+      "제품코드": "A3E00T-SM",
+      "매월차감": 500
+    }
+  ]
 }
