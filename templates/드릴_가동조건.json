@@ -3,5 +3,14 @@
   "drill_day_hours": 24.0,
   "drill_util": 90.0,
   "drill_owned": 315,
-  "drill_deduct_rows": []
+  "drill_deduct_rows": [
+    {
+      "제품코드": "A4E323-SL",
+      "매월차감": 200
+    },
+    {
+      "제품코드": "A4E001-SM",
+      "매월차감": 200
+    }
+  ]
 }
