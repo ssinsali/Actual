@@ -81,6 +81,15 @@ def render() -> None:
             else:
                 st.caption("저장됨: 보이는 메뉴 없음")
 
+            edit_key = f"perm_{username}_data_edit"
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = bool(user.get("data_edit"))
+            data_edit = st.checkbox(
+                "데이터 수정 (업로드·삭제·가동조건 저장)",
+                key=edit_key,
+            )
+            st.caption("끄면 이 아이디는 조회만 할 수 있습니다.")
+
             _ensure_checks(username, set(saved))
             preset_cols = st.columns(3)
             for i, (label, ids) in enumerate(PRESETS):
@@ -103,7 +112,7 @@ def render() -> None:
                     chosen.append(page["id"])
             st.caption("체크를 모두 끄면 이 아이디는 로그인 후 메뉴가 없습니다.")
             if st.button("저장", key=f"save_{username}", type="primary"):
-                ok, msg = update_user_pages(username, chosen)
+                ok, msg = update_user_pages(username, chosen, data_edit=bool(data_edit))
                 if ok:
                     st.success(msg)
                 else:
