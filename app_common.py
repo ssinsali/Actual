@@ -196,11 +196,17 @@ def newest_data_names() -> list[str]:
 
 
 def select_analysis_files(names: list[str]) -> None:
-    """분석 대상을 이 파일들로만 맞춘다."""
+    """분석 대상을 이 파일들로만 맞춘다.
+
+    파일 선택 위젯 키를 바꿔, 직전에 고른 예전 파일이 다시 선택되지 않게 한다.
+    """
     st.session_state.selected_files = list(names)
-    for key in list(st.session_state.keys()):
-        if "file_select" in str(key):
-            st.session_state.pop(key, None)
+    st.session_state["file_select_generation"] = int(st.session_state.get("file_select_generation") or 0) + 1
+
+
+def analysis_file_select_key(key_prefix: str) -> str:
+    gen = int(st.session_state.get("file_select_generation") or 0)
+    return f"{key_prefix}file_select_{gen}"
 
 
 def _upload_nonce() -> int:
@@ -223,11 +229,10 @@ def clear_performance_data() -> list[str]:
             continue
     st.session_state.selected_files = []
     st.session_state["upload_widget_nonce"] = _upload_nonce() + 1
+    st.session_state["file_select_generation"] = int(st.session_state.get("file_select_generation") or 0) + 1
     for key in list(st.session_state.keys()):
         name = str(key)
         if name.endswith("last_upload_sig") or name.endswith("confirm_reset_data"):
-            st.session_state.pop(key, None)
-        elif "file_select" in name:
             st.session_state.pop(key, None)
     st.cache_data.clear()
     return deleted
@@ -381,8 +386,8 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
     selected = st.multiselect(
         "분석할 파일 (기본: 마지막 업로드)",
         options=file_names,
-        default=st.session_state.selected_files,
-        key=f"{key_prefix}file_select",
+        default=list(st.session_state.selected_files),
+        key=analysis_file_select_key(key_prefix),
     )
     # widget 값과 session 동기화 (불필요한 연속 rerun 방지)
     if selected != st.session_state.selected_files:
