@@ -1,7 +1,9 @@
 """실적 분석 통계 — 페이지 공통 (경로·로드·데이터 사이드바)."""
 from __future__ import annotations
 
+import json
 import sys
+import time
 from pathlib import Path
 
 _APP_DIR = Path(__file__).resolve().parent
@@ -26,6 +28,9 @@ from stats_engine import (
 
 _DATA_DIR = _APP_DIR / "data"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
+_SHARED_MANIFEST = "data/current_performance.json"
+_SHARED_SYNC_SEC = 20
+_SHARED_SKIP_NAMES = {"users.json", "current_performance.json", "README.txt"}
 
 TEAM_STACK_ORDER = ("A조", "B조", "C조")
 
@@ -239,6 +244,10 @@ def clear_performance_data() -> list[str]:
         if name.endswith("last_upload_sig") or name.endswith("confirm_reset_data"):
             st.session_state.pop(key, None)
     st.cache_data.clear()
+    try:
+        publish_shared_performance([])
+    except Exception:
+        pass
     return deleted
 
 
@@ -291,6 +300,120 @@ def save_upload(uploaded) -> Path:
     return dest
 
 
+def _shared_entry_name(item: object) -> str:
+    if isinstance(item, dict):
+        name = str(item.get("name") or "").strip()
+    else:
+        name = str(item or "").strip()
+    if not name or "/" in name or "\\" in name or name in _SHARED_SKIP_NAMES:
+        return ""
+    return name
+
+
+def publish_shared_performance(names: list[str]) -> str:
+    """올린 실적 파일을 GitHub data/ 에 저장해 모두가 같은 파일을 보게 한다."""
+    from auth import github_file_get, github_file_put, github_store_enabled
+
+    clean = []
+    for name in names:
+        text = _shared_entry_name(name)
+        if text and text not in clean:
+            clean.append(text)
+    if not github_store_enabled():
+        st.session_state["perf_applied_sig"] = tuple(clean)
+        return "이 서버에만 저장되었습니다. GitHub 연동이 없으면 재시작 후 다른 사람에게는 남지 않습니다."
+
+    entries: list[dict[str, str]] = []
+    try:
+        for name in clean:
+            local = _DATA_DIR / name
+            if not local.is_file():
+                continue
+            rel = f"data/{name}"
+            content = local.read_bytes()
+            _, sha = github_file_get(rel)
+            new_sha = github_file_put(rel, content, f"chore: update performance data {name}", sha)
+            entries.append({"name": name, "sha": str(new_sha or sha or "")})
+        raw = (json.dumps({"files": entries}, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        _, manifest_sha = github_file_get(_SHARED_MANIFEST)
+        github_file_put(
+            _SHARED_MANIFEST,
+            raw,
+            "chore: set shared performance files",
+            manifest_sha,
+        )
+    except Exception as e:
+        return f"GitHub 저장 실패: {e}"
+
+    st.session_state["perf_manifest_files"] = entries
+    st.session_state["perf_manifest_at"] = time.time()
+    st.session_state["perf_applied_sig"] = tuple(item["name"] for item in entries)
+    for item in entries:
+        st.session_state[f"perf_local_sha_{item['name']}"] = item["sha"]
+    if not entries:
+        return "공유할 실적 파일이 없습니다."
+    return "GitHub에 저장했습니다. 다른 사람도 이 파일로 봅니다."
+
+
+def sync_shared_performance() -> None:
+    """GitHub에 저장된 현재 실적 파일을 받아, 바뀌었으면 분석 대상으로 맞춘다."""
+    from auth import github_file_get, github_store_enabled
+
+    if not github_store_enabled():
+        return
+    now = time.time()
+    fetched_at = float(st.session_state.get("perf_manifest_at") or 0)
+    entries = st.session_state.get("perf_manifest_files")
+    if not isinstance(entries, list) or (now - fetched_at) >= _SHARED_SYNC_SEC:
+        try:
+            raw, _sha = github_file_get(_SHARED_MANIFEST)
+        except Exception:
+            return
+        st.session_state["perf_manifest_at"] = now
+        if not raw:
+            st.session_state["perf_manifest_files"] = []
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        got = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(got, list):
+            return
+        entries = got
+        st.session_state["perf_manifest_files"] = entries
+
+    names: list[str] = []
+    changed = False
+    for item in entries:
+        name = _shared_entry_name(item)
+        if not name:
+            continue
+        want_sha = str(item.get("sha") or "") if isinstance(item, dict) else ""
+        local = _DATA_DIR / name
+        have_sha = str(st.session_state.get(f"perf_local_sha_{name}") or "")
+        if (not local.is_file()) or (want_sha and have_sha != want_sha):
+            try:
+                content, sha = github_file_get(f"data/{name}")
+            except Exception:
+                continue
+            if not content:
+                continue
+            local.write_bytes(content)
+            st.session_state[f"perf_local_sha_{name}"] = sha or want_sha
+            changed = True
+        names.append(name)
+    if changed:
+        st.cache_data.clear()
+    if not names:
+        return
+    sig = tuple(names)
+    if st.session_state.get("perf_applied_sig") == sig:
+        return
+    select_analysis_files(names)
+    st.session_state["perf_applied_sig"] = sig
+
+
 @st.cache_data(show_spinner=False)
 def load_cached(path_mtimes: tuple[tuple[str, float], ...]) -> tuple[pd.DataFrame, list[str]]:
     paths = [Path(p) for p, _ in path_mtimes]
@@ -309,6 +432,7 @@ def ensure_dims(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_records() -> tuple[pd.DataFrame, list[str], list[Path]]:
+    sync_shared_performance()
     files = default_files()
     if "selected_files" not in st.session_state:
         st.session_state.selected_files = newest_data_names()
@@ -381,11 +505,14 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
             for up in uploads:
                 save_upload(up)
                 names.append(up.name)
-                st.success(f"저장: {up.name}")
             st.session_state[last_key] = upload_sig
             select_analysis_files(names)
+            st.session_state["perf_share_note"] = publish_shared_performance(names)
             st.cache_data.clear()
             st.rerun()
+        share_note = st.session_state.pop("perf_share_note", None)
+        if share_note:
+            st.success(str(share_note))
 
     files = default_files()
     if not files:
