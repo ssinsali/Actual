@@ -14,6 +14,7 @@ from app_common import (
     render_exit_ui,
     render_process_daily_avg,
     render_slicer,
+    analysis_file_select_key,
     select_analysis_files,
 )
 from auth import render_logout_controls
@@ -278,8 +279,8 @@ def render() -> None:
         selected = st.multiselect(
             "분석할 파일 (기본: 마지막 업로드)",
             options=file_names,
-            default=st.session_state.selected_files,
-            key="summary_file_select",
+            default=list(st.session_state.selected_files),
+            key=analysis_file_select_key("summary_"),
         )
         if selected != st.session_state.selected_files:
             st.session_state.selected_files = selected
