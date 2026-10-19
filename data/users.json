@@ -57,6 +57,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "2180128": {
+      "password_hash": "pbkdf2_sha256$260000$97a1647cb6f14f7f67ae8e25a103a639$8c60e8f879e510cb58fe5f9e5eb95f404f79475214d67ea867661bd6a34bff59",
+      "display_name": "김윤지",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
