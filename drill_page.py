@@ -10,6 +10,7 @@ import streamlit as st
 
 from app_common import data_dir, render_exit_ui
 from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
+from page_access import can_edit_data, render_view_only_note
 from drill_engine import (
     DEFAULT_DAY_HOURS,
     DEFAULT_UTILIZATION_PCT,
@@ -110,6 +111,8 @@ def _load_settings_local() -> dict:
 
 
 def _save_settings(settings: dict) -> str:
+    if not can_edit_data():
+        return ""
     path = _settings_path()
     payload = {k: settings.get(k) for k in SETTINGS_KEYS}
     payload["drill_deduct_rows"] = list(settings.get("drill_deduct_rows") or [])
@@ -176,6 +179,8 @@ def _normalize_settings(settings: dict) -> dict:
 
 
 def _persist_settings_if_changed() -> None:
+    if not can_edit_data():
+        return
     now = _normalize_settings(_current_settings_from_session())
     prev = st.session_state.get("drill_settings_saved")
     if isinstance(prev, dict):
@@ -200,6 +205,8 @@ def _list_drill_paths(stem: str | None = None) -> list[Path]:
 
 
 def _clear_drill_files(stem: str | None = None) -> list[str]:
+    if not can_edit_data():
+        return []
     deleted: list[str] = []
     for path in _list_drill_paths(stem):
         try:
@@ -273,6 +280,8 @@ def _sync_from_github(*, force: bool = False) -> list[str]:
 
 
 def _save_upload(uploaded, prefix: str):
+    if not can_edit_data():
+        raise PermissionError("데이터 수정 권한이 없습니다.")
     name = canonical_master_name(uploaded.name, prefix)
     _clear_drill_files(prefix)
     dest = master_dir() / name
@@ -363,26 +372,34 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
     rows: list[dict] = st.session_state.drill_deduct_rows
 
     st.subheader("제품별 수동 차감")
-    c1, c2, c3, c4 = st.columns([2.2, 2.2, 1.6, 1])
-    with c1:
-        options = ["(선택)"] + list(code_options)
-        picked = st.selectbox("제품코드 선택", options, key="drill_deduct_pick")
-    with c2:
-        typed = st.text_input("직접 입력", placeholder="제품코드", key="drill_deduct_typed")
-    with c3:
-        amt = int(
-            st.number_input(
-                "매월 차감매수",
-                min_value=0,
-                max_value=10_000_000,
-                value=0,
-                step=1,
-                key="drill_deduct_amt",
+    editable = can_edit_data()
+    if not editable:
+        st.caption("조회 전용입니다. 등록된 차감만 표시합니다.")
+    add_clicked = False
+    picked = "(선택)"
+    typed = ""
+    amt = 0
+    if editable:
+        c1, c2, c3, c4 = st.columns([2.2, 2.2, 1.6, 1])
+        with c1:
+            options = ["(선택)"] + list(code_options)
+            picked = st.selectbox("제품코드 선택", options, key="drill_deduct_pick")
+        with c2:
+            typed = st.text_input("직접 입력", placeholder="제품코드", key="drill_deduct_typed")
+        with c3:
+            amt = int(
+                st.number_input(
+                    "매월 차감매수",
+                    min_value=0,
+                    max_value=10_000_000,
+                    value=0,
+                    step=1,
+                    key="drill_deduct_amt",
+                )
             )
-        )
-    with c4:
-        st.write("")
-        add_clicked = st.button("추가", type="primary", use_container_width=True, key="drill_deduct_add")
+        with c4:
+            st.write("")
+            add_clicked = st.button("추가", type="primary", use_container_width=True, key="drill_deduct_add")
 
     if add_clicked:
         code = (typed or "").strip()
@@ -408,16 +425,20 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
             with d2:
                 st.write(f"{int(row.get('매월차감') or 0):,}매 / 월")
             with d3:
-                if st.button("삭제", key=f"drill_deduct_del_{i}", use_container_width=True):
+                if editable and st.button("삭제", key=f"drill_deduct_del_{i}", use_container_width=True):
                     st.session_state.drill_deduct_rows = [r for j, r in enumerate(rows) if j != i]
                     _persist_settings_if_changed()
                     st.rerun()
-        if st.button("차감 목록 비우기", key="drill_deduct_clear"):
+        if editable and st.button("차감 목록 비우기", key="drill_deduct_clear"):
             st.session_state.drill_deduct_rows = []
             _persist_settings_if_changed()
             st.rerun()
     else:
-        st.caption("차감할 제품코드와 매월 차감매수를 넣고 추가하세요.")
+        st.caption(
+            "차감할 제품코드와 매월 차감매수를 넣고 추가하세요."
+            if editable
+            else "등록된 차감이 없습니다."
+        )
 
     if not rows:
         return pd.DataFrame(columns=list(DEDUCT_COLUMNS))
@@ -427,7 +448,7 @@ def _render_deduct_ui(code_options: list[str]) -> pd.DataFrame:
 def render() -> None:
     st.title("드릴설비 필요 분석")
 
-    force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False))
+    force_gh = bool(st.session_state.pop("drill_gh_force_refresh", False)) and can_edit_data()
     if force_gh:
         _sync_from_github(force=True)
         for k in SETTINGS_KEYS:
@@ -455,6 +476,7 @@ def render() -> None:
                 step=1,
                 help="지금 가동 중인 드릴 설비 대수. 부족대수 = 월 필요대수 − 보유대수.",
                 key="drill_owned",
+                disabled=not can_edit_data(),
             )
         )
     with own_help:
@@ -473,7 +495,13 @@ def render() -> None:
         render_logout_controls()
         st.divider()
         st.header("가동 조건")
-        st.caption("값을 바꾸면 자동으로 저장됩니다. Cloud에서는 GitHub에도 반영됩니다.")
+        drill_edit = can_edit_data()
+        render_view_only_note()
+        st.caption(
+            "값을 바꾸면 자동으로 저장됩니다. Cloud에서는 GitHub에도 반영됩니다."
+            if drill_edit
+            else "저장된 가동 조건입니다."
+        )
         work_days = float(
             st.number_input(
                 "월 작업일수",
@@ -482,6 +510,7 @@ def render() -> None:
                 step=1.0,
                 help="한 달 실제 조업일. 모든 월에 동일하게 적용합니다.",
                 key="drill_work_days",
+                disabled=not drill_edit,
             )
         )
         day_hours = float(
@@ -492,6 +521,7 @@ def render() -> None:
                 step=0.5,
                 help="드릴 설비 하루 가동 시간. 3조 연속이면 24.",
                 key="drill_day_hours",
+                disabled=not drill_edit,
             )
         )
         util_pct = float(
@@ -502,6 +532,7 @@ def render() -> None:
                 step=1.0,
                 help="셋업·비가동을 빼려면 100보다 낮게. 1대 가용시간 = 작업일 × 일가동 × 60 × 가동률.",
                 key="drill_util",
+                disabled=not drill_edit,
             )
         )
         _persist_settings_if_changed()
@@ -514,36 +545,40 @@ def render() -> None:
         note = st.session_state.pop("drill_settings_note", None)
         if note:
             st.caption(note)
-        if github_store_enabled():
+        if drill_edit and github_store_enabled():
             if st.button("GitHub에서 다시 가져오기", use_container_width=True, key="drill_gh_refresh"):
                 st.session_state["drill_gh_force_refresh"] = True
                 st.session_state["drill_gh_ok"] = False
                 st.rerun()
-        else:
+        elif not github_store_enabled():
             st.caption("GitHub Secrets가 없으면 이 서버의 로컬 파일만 유지됩니다.")
 
         st.divider()
         st.header("데이터 등록")
-        st.caption("양식을 받아 작성한 뒤 업로드하세요. 새로 올리면 같은 종류 이전 파일을 교체합니다.")
+        st.caption(
+            "양식을 받아 작성한 뒤 업로드하세요. 새로 올리면 같은 종류 이전 파일을 교체합니다."
+            if drill_edit
+            else "저장된 파일을 조회합니다."
+        )
         st.dataframe(pd.DataFrame(_active_files()), use_container_width=True, hide_index=True)
-        _render_reset_ui()
-
-        qty_up = st.file_uploader("① 월별 제품코드 필요수량", type=["csv", "xlsx"], key="drill_up_qty")
-        time_up = st.file_uploader("② 제품별 가공시간", type=["csv", "xlsx"], key="drill_up_time")
-        qty_sig = (qty_up.name, int(getattr(qty_up, "size", 0) or 0)) if qty_up else None
-        time_sig = (time_up.name, int(getattr(time_up, "size", 0) or 0)) if time_up else None
-        if qty_up is not None and qty_sig != st.session_state.get("drill_qty_sig"):
-            path, gh = _save_upload(qty_up, DRILL_QTY_STEM)
-            st.session_state["drill_qty_sig"] = qty_sig
-            st.session_state["drill_use_sample"] = False
-            st.session_state["drill_flash"] = f"필요수량 저장: {path.name}" + (f" · {gh}" if gh else "")
-            st.rerun()
-        if time_up is not None and time_sig != st.session_state.get("drill_time_sig"):
-            path, gh = _save_upload(time_up, DRILL_TIME_STEM)
-            st.session_state["drill_time_sig"] = time_sig
-            st.session_state["drill_use_sample"] = False
-            st.session_state["drill_flash"] = f"가공시간 저장: {path.name}" + (f" · {gh}" if gh else "")
-            st.rerun()
+        if drill_edit:
+            _render_reset_ui()
+            qty_up = st.file_uploader("① 월별 제품코드 필요수량", type=["csv", "xlsx"], key="drill_up_qty")
+            time_up = st.file_uploader("② 제품별 가공시간", type=["csv", "xlsx"], key="drill_up_time")
+            qty_sig = (qty_up.name, int(getattr(qty_up, "size", 0) or 0)) if qty_up else None
+            time_sig = (time_up.name, int(getattr(time_up, "size", 0) or 0)) if time_up else None
+            if qty_up is not None and qty_sig != st.session_state.get("drill_qty_sig"):
+                path, gh = _save_upload(qty_up, DRILL_QTY_STEM)
+                st.session_state["drill_qty_sig"] = qty_sig
+                st.session_state["drill_use_sample"] = False
+                st.session_state["drill_flash"] = f"필요수량 저장: {path.name}" + (f" · {gh}" if gh else "")
+                st.rerun()
+            if time_up is not None and time_sig != st.session_state.get("drill_time_sig"):
+                path, gh = _save_upload(time_up, DRILL_TIME_STEM)
+                st.session_state["drill_time_sig"] = time_sig
+                st.session_state["drill_use_sample"] = False
+                st.session_state["drill_flash"] = f"가공시간 저장: {path.name}" + (f" · {gh}" if gh else "")
+                st.rerun()
 
         st.subheader("양식 받기")
         st.caption("엑셀에서 한글이 깨지면 xlsx를 받으세요. 숫자는 예시이므로 자사 계획으로 바꿔 올리세요.")
