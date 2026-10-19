@@ -11,6 +11,7 @@ import hmac
 import json
 import re
 import secrets
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +23,8 @@ import streamlit as st
 _APP_DIR = Path(__file__).resolve().parent
 USERS_PATH = _APP_DIR / "data" / "users.json"
 APP_TITLE = "실적 분석 통계"
+# 메뉴 권한은 사용자 세션마다 이 시간 동안 캐시한다. 관리자가 바꾼 뒤에는 이 시간 안에 반영된다.
+_USERS_CACHE_SEC = 15
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]{3,32}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -276,11 +279,19 @@ def _push_github_users(data: dict[str, Any], sha: str | None) -> None:
 def _load_users(*, force_remote: bool = False) -> dict[str, Any]:
     if github_store_enabled():
         cache_key = "users_db_cache"
-        if not force_remote and cache_key in st.session_state:
+        fetched_at = float(st.session_state.get("users_db_cache_at") or 0)
+        fresh = (time.time() - fetched_at) < _USERS_CACHE_SEC
+        if not force_remote and fresh and cache_key in st.session_state:
             return _normalize_users(st.session_state[cache_key])
-        data, sha = _fetch_github_users()
+        try:
+            data, sha = _fetch_github_users()
+        except RuntimeError:
+            if cache_key in st.session_state:
+                return _normalize_users(st.session_state[cache_key])
+            raise
         st.session_state[cache_key] = data
         st.session_state["users_db_sha"] = sha
+        st.session_state["users_db_cache_at"] = time.time()
         try:
             _save_users_local(data)
         except OSError:
@@ -313,6 +324,7 @@ def _save_users(data: dict[str, Any]) -> None:
     st.session_state["users_db_cache"] = data
     _, sha = _fetch_github_users()
     st.session_state["users_db_sha"] = sha
+    st.session_state["users_db_cache_at"] = time.time()
 
 
 def _hash_password(password: str) -> str:
@@ -398,11 +410,14 @@ def register_user(
     if username in data["users"]:
         return False, "이미 사용 중인 아이디입니다."
 
-    data["users"][username] = {
+    record: dict[str, Any] = {
         "password_hash": _hash_password(password),
         "display_name": display_name,
         "role": "admin" if bootstrap else "user",
     }
+    if not bootstrap:
+        record["pages"] = _default_user_pages()
+    data["users"][username] = record
     try:
         _save_users(data)
     except RuntimeError as e:
@@ -410,7 +425,11 @@ def register_user(
 
     if bootstrap:
         return True, "최초 관리자 계정이 생성되었습니다. 로그인해 주세요."
-    return True, "회원가입이 완료되었습니다. 로그인해 주세요."
+    return True, (
+        "회원가입이 완료되었습니다. "
+        "캠퍼스·종합·월평균 메뉴만 열려 있습니다. "
+        "다른 메뉴는 관리자에게 요청하세요."
+    )
 
 
 def authenticate(username: str, password: str) -> tuple[bool, str]:
@@ -423,6 +442,51 @@ def authenticate(username: str, password: str) -> tuple[bool, str]:
     if not user or not _verify_password(password, user.get("password_hash", "")):
         return False, "아이디 또는 비밀번호가 올바르지 않습니다."
     return True, user.get("display_name") or username
+
+
+def _default_user_pages() -> list[str]:
+    from page_access import DEFAULT_PAGE_IDS
+
+    return list(DEFAULT_PAGE_IDS)
+
+
+def list_accounts() -> dict[str, Any]:
+    """아이디 → 계정 정보. 비밀번호 해시는 화면에 표시하지 않는다."""
+    try:
+        data = _load_users()
+    except RuntimeError:
+        data = _load_users_local()
+    users = data.get("users")
+    if not isinstance(users, dict):
+        return {}
+    return users
+
+
+def update_user_pages(username: str, page_ids: list[str]) -> tuple[bool, str]:
+    """일반 계정이 볼 메뉴를 저장한다."""
+    username = username.strip()
+    if not isinstance(page_ids, list) or any(not isinstance(item, str) for item in page_ids):
+        return False, "메뉴 목록이 올바르지 않습니다."
+    if not is_admin():
+        return False, "관리자만 권한을 바꿀 수 있습니다."
+    try:
+        data = _load_users(force_remote=True)
+    except RuntimeError as e:
+        return False, f"계정 저장소 연결 실패: {e}"
+    user = data["users"].get(username)
+    if not isinstance(user, dict):
+        return False, "계정을 찾을 수 없습니다."
+    if user.get("role") == "admin":
+        return False, "관리자는 모든 메뉴를 보며, 메뉴를 제한하지 않습니다."
+    from page_access import CONTENT_PAGE_IDS
+
+    picked = {page_id for page_id in page_ids if page_id in CONTENT_PAGE_IDS}
+    user["pages"] = [page_id for page_id in CONTENT_PAGE_IDS if page_id in picked]
+    try:
+        _save_users(data)
+    except RuntimeError as e:
+        return False, f"저장 실패: {e}"
+    return True, "저장했습니다. 해당 아이디는 잠시 후, 또는 다시 로그인하면 메뉴가 바뀝니다."
 
 
 def is_authenticated() -> bool:
@@ -457,6 +521,7 @@ def logout_session() -> None:
         "auth_display_name",
         "users_db_cache",
         "users_db_sha",
+        "users_db_cache_at",
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state.keys()):
@@ -497,6 +562,11 @@ def render_auth_gate() -> bool:
     with tab_signup:
         if not _load_users()["users"]:
             st.info("등록된 계정이 없습니다. **첫 가입자가 관리자**가 됩니다.")
+        else:
+            st.caption(
+                "가입 직후 메뉴는 캠퍼스·종합·월평균입니다. "
+                "드릴·CAPA·시뮬레이션은 관리자가 권한을 주면 나타납니다."
+            )
         with st.form("signup_form", clear_on_submit=False):
             new_user = st.text_input("아이디 (영문·숫자·._-)", key="signup_user")
             new_name = st.text_input("이름", key="signup_name")
@@ -519,7 +589,13 @@ def render_auth_gate() -> bool:
 
 def render_logout_controls() -> None:
     name = current_display_name()
-    st.caption(f"로그인: **{name}**")
+    user = current_user() or ""
+    if name and user and name != user:
+        st.caption(f"로그인: **{name}** ({user})")
+    else:
+        st.caption(f"로그인: **{name or user}**")
+    if is_admin():
+        st.caption("권한: 관리자 · 모든 메뉴")
     if st.button("로그아웃", use_container_width=True):
         logout_session()
         st.rerun()
