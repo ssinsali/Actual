@@ -160,9 +160,18 @@ def github_file_get(path: str) -> tuple[bytes | None, str | None]:
         return None, None
     content_b64 = str(info.get("content") or "").replace("\n", "")
     sha = str(info.get("sha") or "") or None
-    if not content_b64:
-        return b"", sha
-    return base64.b64decode(content_b64), sha
+    if content_b64:
+        return base64.b64decode(content_b64), sha
+    # 1MB가 넘는 파일은 content가 비고 download_url로 받아야 한다.
+    download = str(info.get("download_url") or "")
+    if download and int(info.get("size") or 0) > 0:
+        req = urllib.request.Request(download, method="GET")
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Accept", "application/vnd.github.raw")
+        req.add_header("User-Agent", "performance-stats-auth")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read(), sha
+    return b"", sha
 
 
 def github_file_put(path: str, content: bytes, message: str, sha: str | None) -> str | None:
