@@ -10,6 +10,8 @@ from app_common import (
     app_dir,
     apply_uploader_dropzone_style,
     newest_data_names,
+    publish_shared_performance,
+    sync_shared_performance,
     render_data_reset_ui,
     render_exit_ui,
     render_process_daily_avg,
@@ -111,6 +113,7 @@ def render() -> None:
     st.title("종합 실적 분석")
     st.caption("조별 · 주/야별 · 공정별 실적·인당실적 비교 (인당실적 = 실적 ÷ 인력)")
 
+    sync_shared_performance()
     files = _default_files()
     if "selected_files" not in st.session_state:
         st.session_state.selected_files = newest_data_names()
@@ -266,11 +269,14 @@ def render() -> None:
                 for up in uploads:
                     _save_upload(up)
                     names.append(up.name)
-                    st.success(f"저장: {up.name}")
                 st.session_state["summary_last_upload_sig"] = upload_sig
                 select_analysis_files(names)
+                st.session_state["perf_share_note"] = publish_shared_performance(names)
                 st.cache_data.clear()
                 st.rerun()
+            share_note = st.session_state.pop("perf_share_note", None)
+            if share_note:
+                st.success(str(share_note))
 
         files = _default_files()
         if not files:
