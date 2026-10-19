@@ -101,6 +101,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "mihwa00": {
+      "password_hash": "pbkdf2_sha256$260000$ee6ef25e87df59172f0f27eaba1d6e8c$b6c59e4a9aba2b555138b61575f5597fbeaea5134339f41ad5b9d46a81895ac8",
+      "display_name": "이미화",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
