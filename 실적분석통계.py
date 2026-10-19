@@ -1,5 +1,5 @@
 """
-실적 분석 통계 — 메인: 캠퍼스 · 조별 분석
+실적 분석 통계 — 로그인 아이디별 메뉴
 
 로컬 실행:
   python 실적분석통계.py
@@ -76,13 +76,9 @@ if __name__ == "__main__" and not _launched_by_streamlit():
     _run_streamlit()
     raise SystemExit(0)
 
-st.set_page_config(page_title="캠퍼스·조별 실적", page_icon="📊", layout="wide")
+st.set_page_config(page_title="실적 분석 통계", page_icon="📊", layout="wide")
 
-from auth import render_auth_gate  # noqa: E402
+from page_access import navigation_pages  # noqa: E402
 
-if not render_auth_gate():
-    st.stop()
-
-from campus_page import render  # noqa: E402
-
-render()
+_pg = st.navigation(navigation_pages(), expanded=True)
+_pg.run()
