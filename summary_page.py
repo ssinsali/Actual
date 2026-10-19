@@ -17,6 +17,7 @@ from app_common import (
     analysis_file_select_key,
     select_analysis_files,
 )
+from page_access import can_edit_data, render_view_only_note
 from auth import render_logout_controls
 from stats_engine import (
     AREAS,
@@ -52,6 +53,8 @@ def _default_files() -> list[Path]:
 
 
 def _save_upload(uploaded) -> Path:
+    if not can_edit_data():
+        raise PermissionError("데이터 수정 권한이 없습니다.")
     dest = _DATA_DIR / uploaded.name
     dest.write_bytes(uploaded.getvalue())
     return dest
@@ -221,7 +224,13 @@ def render() -> None:
 
         st.divider()
         st.header("데이터")
-        st.markdown(f"기본 폴더: `{_DATA_DIR}`  \n새로 올리면 **그 파일만** 분석합니다.")
+        edit_note = (
+            "새로 올리면 **그 파일만** 분석합니다."
+            if can_edit_data()
+            else "저장된 파일 중에서 조회할 파일을 고릅니다."
+        )
+        st.markdown(f"기본 폴더: `{_DATA_DIR}`  \n{edit_note}")
+        render_view_only_note()
         st.download_button(
             "기본 CSV 양식 다운로드",
             data=template_csv_bytes(),
@@ -241,26 +250,27 @@ def render() -> None:
         with st.expander("양식 컬럼 안내"):
             st.dataframe(template_dataframe(), use_container_width=True)
 
-        apply_uploader_dropzone_style(key_prefix="summary")
-        st.caption("엑셀/CSV를 **끌어다 놓거나** Upload를 눌러 추가할 수 있습니다. (여러 파일 가능)")
-        uploads = st.file_uploader(
-            "엑셀/CSV 업로드 (드래그앤드롭)",
-            type=["xlsx", "xls", "csv"],
-            accept_multiple_files=True,
-            key=f"summary_upload_{int(st.session_state.get('upload_widget_nonce') or 0)}",
-            help="파일을 이 상자로 끌어다 놓거나 Upload를 클릭하세요. 여러 개 동시 업로드 가능.",
-        )
-        upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
-        if uploads and upload_sig and upload_sig != st.session_state.get("summary_last_upload_sig"):
-            names: list[str] = []
-            for up in uploads:
-                _save_upload(up)
-                names.append(up.name)
-                st.success(f"저장: {up.name}")
-            st.session_state["summary_last_upload_sig"] = upload_sig
-            select_analysis_files(names)
-            st.cache_data.clear()
-            st.rerun()
+        if can_edit_data():
+            apply_uploader_dropzone_style(key_prefix="summary")
+            st.caption("엑셀/CSV를 **끌어다 놓거나** Upload를 눌러 추가할 수 있습니다. (여러 파일 가능)")
+            uploads = st.file_uploader(
+                "엑셀/CSV 업로드 (드래그앤드롭)",
+                type=["xlsx", "xls", "csv"],
+                accept_multiple_files=True,
+                key=f"summary_upload_{int(st.session_state.get('upload_widget_nonce') or 0)}",
+                help="파일을 이 상자로 끌어다 놓거나 Upload를 클릭하세요. 여러 개 동시 업로드 가능.",
+            )
+            upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
+            if uploads and upload_sig and upload_sig != st.session_state.get("summary_last_upload_sig"):
+                names: list[str] = []
+                for up in uploads:
+                    _save_upload(up)
+                    names.append(up.name)
+                    st.success(f"저장: {up.name}")
+                st.session_state["summary_last_upload_sig"] = upload_sig
+                select_analysis_files(names)
+                st.cache_data.clear()
+                st.rerun()
 
         files = _default_files()
         if not files:
