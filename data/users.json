@@ -35,6 +35,17 @@
       "password_hash": "pbkdf2_sha256$260000$eb04a4a534bf1f842dbef46f28fce1d4$765e33e96d86da3005384a87eed4ed5e0f41b5a30d6560e7b61fb5dd2b7450f2",
       "display_name": "박민종",
       "role": "user"
+    },
+    "chlwhd6736": {
+      "password_hash": "pbkdf2_sha256$260000$634b4aa60e66f283ec9e481ed48e0c74$583c10fff3fd61ba3b544b716d4c7ba0536e0bc2b787a0ff898d5c5f9d4a874a",
+      "display_name": "윤종화",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
