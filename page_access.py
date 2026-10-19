@@ -89,6 +89,25 @@ def effective_page_ids(user: dict) -> list[str]:
     return [page_id for page_id in CONTENT_PAGE_IDS if page_id in picked]
 
 
+def can_edit_data() -> bool:
+    """업로드·삭제·가동조건 저장. 조회만 하는 계정은 False."""
+    username = current_user()
+    if not username:
+        return False
+    user = list_accounts().get(username)
+    if not isinstance(user, dict):
+        return False
+    if user.get("role") == "admin":
+        return True
+    return bool(user.get("data_edit"))
+
+
+def render_view_only_note() -> None:
+    if can_edit_data():
+        return
+    st.caption("조회만 가능합니다. 업로드·삭제·저장은 데이터 수정 권한이 있는 아이디만 할 수 있습니다.")
+
+
 def allowed_page_ids() -> list[str]:
     """지금 로그인한 아이디가 볼 수 있는 메뉴."""
     username = current_user()
