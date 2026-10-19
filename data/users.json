@@ -114,7 +114,7 @@
       "data_edit": false
     },
     "mihwa85": {
-      "password_hash": "pbkdf2_sha256$260000$d77c2ef31bf71bfdbffacd8c50ccf140$b685f9ab438b5c1d042572b8293d7ec79551c04fe1472348087b85b84a5419dc",
+      "password_hash": "pbkdf2_sha256$260000$0f9241c5699b6fc26c5cc5e60250e326$abf0a7ff852591f99d2551e1b71c6008623851d1578910b53b905b9967d7039c",
       "display_name": "이미화",
       "role": "user",
       "pages": [
