@@ -46,6 +46,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "2180424": {
+      "password_hash": "pbkdf2_sha256$260000$3a32642587c0babf070fcfa414a4b162$6ade8d64de6d92a7f5bf4f4e4a441cd14d5adbcac3b269f36a1b0b5871c9017c",
+      "display_name": "윤종화",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
