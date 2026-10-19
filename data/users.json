@@ -68,6 +68,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "rlazk91": {
+      "password_hash": "pbkdf2_sha256$260000$537f5487ebb50efb826cabfbed541088$aafd8580ba68750c0c8934193f499760f15544b687392237a76c5e35296674c7",
+      "display_name": "김병준",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
