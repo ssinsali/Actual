@@ -18,6 +18,7 @@ from pathlib import Path
 from io import BytesIO
 
 from auth import github_file_get, github_file_put, github_store_enabled, render_logout_controls
+from page_access import can_edit_data, render_view_only_note
 from stats_engine import AREAS, SHIFTS, add_calendar_parts
 from sim_engine import (
     DEFAULT_SHIFT_MINUTES,
@@ -252,6 +253,8 @@ def _list_master_paths(stem: str | None = None) -> list[Path]:
 
 
 def _clear_master_files(stem: str | None = None) -> list[str]:
+    if not can_edit_data():
+        return []
     """운영 중 기준정보 파일을 지운다. stem 없으면 전부."""
     deleted: list[str] = []
     for path in _list_master_paths(stem):
@@ -328,6 +331,8 @@ def _sync_master_from_github(*, force: bool = False) -> list[str]:
 
 def _save_upload(uploaded, prefix: str):
     """같은 종류 옛 파일을 지우고 새 파일만 운영한다."""
+    if not can_edit_data():
+        raise PermissionError("데이터 수정 권한이 없습니다.")
     name = canonical_master_name(uploaded.name, prefix)
     _clear_master_files(prefix)
     dest = master_dir() / name
@@ -439,7 +444,7 @@ def render() -> None:
     records, rec_notes, _chosen = load_records()
 
     # GitHub 다시 가져오기 / 초기화 직후 메시지
-    force_gh = bool(st.session_state.pop("sim_gh_force_refresh", False))
+    force_gh = bool(st.session_state.pop("sim_gh_force_refresh", False)) and can_edit_data()
     if force_gh:
         _sync_master_from_github(force=True)
         st.session_state["sim_flash"] = "GitHub 기준정보 다시 가져오기 완료"
@@ -531,54 +536,59 @@ def render() -> None:
                 help="실적 활용률 분모. 1인 1교대 기준이면 보통 720(12시간). 설비 이론능력은 대수×1440.",
             )
         )
-        if github_store_enabled():
+        sim_edit = can_edit_data()
+        render_view_only_note()
+        if sim_edit and github_store_enabled():
             if st.button("GitHub에서 기준정보 다시 가져오기", use_container_width=True, key="sim_gh_refresh"):
                 st.session_state["sim_gh_force_refresh"] = True
                 st.session_state["sim_gh_master_ok"] = False
                 st.rerun()
-        else:
+        elif not github_store_enabled():
             st.caption("GitHub Secrets([github] token/repo)가 없으면 다시 가져오기를 쓸 수 없습니다.")
 
         st.divider()
-        st.header("기준정보 등록")
+        st.header("기준정보")
         st.caption(
             "파일명: 설비_기준정보 / 인력_기준정보 / 제품_기준정보 / 제품별_실적 (.csv 또는 .xlsx). "
             "외관 등 수작업은 인력_기준정보에 인원을 넣으세요. "
             "치수·Hole 등 설비 공정도 인력_기준정보에 공정별 인원을 넣으면 총인원/근무인원에 반영됩니다. "
             "새로 올리면 같은 종류의 이전 운영 파일은 자동으로 교체됩니다."
+            if sim_edit
+            else "저장된 설비·인력·제품 기준정보를 조회합니다."
         )
         st.markdown("**지금 운영 중**")
         active_df = pd.DataFrame(_active_master_files())
         st.dataframe(active_df, use_container_width=True, hide_index=True)
-        _render_master_reset_ui()
-        eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
-        man_up = st.file_uploader("② 인력_기준정보 (외관 등)", type=["csv", "xlsx"], key="sim_up_man")
-        pr_up = st.file_uploader("③ 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
-        act_up = st.file_uploader("④ 제품별_실적", type=["csv", "xlsx"], key="sim_up_act")
-        eq_sig = (eq_up.name, int(getattr(eq_up, "size", 0) or 0)) if eq_up else None
-        man_sig = (man_up.name, int(getattr(man_up, "size", 0) or 0)) if man_up else None
-        pr_sig = (pr_up.name, int(getattr(pr_up, "size", 0) or 0)) if pr_up else None
-        act_sig = (act_up.name, int(getattr(act_up, "size", 0) or 0)) if act_up else None
-        if eq_up is not None and eq_sig != st.session_state.get("sim_eq_sig"):
-            path, gh = _save_upload(eq_up, "설비_기준정보")
-            st.session_state["sim_eq_sig"] = eq_sig
-            st.session_state["sim_flash"] = f"설비 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
-            st.rerun()
-        if man_up is not None and man_sig != st.session_state.get("sim_man_sig"):
-            path, gh = _save_upload(man_up, "인력_기준정보")
-            st.session_state["sim_man_sig"] = man_sig
-            st.session_state["sim_flash"] = f"인력 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
-            st.rerun()
-        if pr_up is not None and pr_sig != st.session_state.get("sim_pr_sig"):
-            path, gh = _save_upload(pr_up, "제품_기준정보")
-            st.session_state["sim_pr_sig"] = pr_sig
-            st.session_state["sim_flash"] = f"제품 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
-            st.rerun()
-        if act_up is not None and act_sig != st.session_state.get("sim_act_sig"):
-            path, gh = _save_upload(act_up, "제품별_실적")
-            st.session_state["sim_act_sig"] = act_sig
-            st.session_state["sim_flash"] = f"제품별 실적 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
-            st.rerun()
+        if sim_edit:
+            _render_master_reset_ui()
+            eq_up = st.file_uploader("① 설비_기준정보", type=["csv", "xlsx"], key="sim_up_eq")
+            man_up = st.file_uploader("② 인력_기준정보 (외관 등)", type=["csv", "xlsx"], key="sim_up_man")
+            pr_up = st.file_uploader("③ 제품_기준정보", type=["csv", "xlsx"], key="sim_up_pr")
+            act_up = st.file_uploader("④ 제품별_실적", type=["csv", "xlsx"], key="sim_up_act")
+            eq_sig = (eq_up.name, int(getattr(eq_up, "size", 0) or 0)) if eq_up else None
+            man_sig = (man_up.name, int(getattr(man_up, "size", 0) or 0)) if man_up else None
+            pr_sig = (pr_up.name, int(getattr(pr_up, "size", 0) or 0)) if pr_up else None
+            act_sig = (act_up.name, int(getattr(act_up, "size", 0) or 0)) if act_up else None
+            if eq_up is not None and eq_sig != st.session_state.get("sim_eq_sig"):
+                path, gh = _save_upload(eq_up, "설비_기준정보")
+                st.session_state["sim_eq_sig"] = eq_sig
+                st.session_state["sim_flash"] = f"설비 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+                st.rerun()
+            if man_up is not None and man_sig != st.session_state.get("sim_man_sig"):
+                path, gh = _save_upload(man_up, "인력_기준정보")
+                st.session_state["sim_man_sig"] = man_sig
+                st.session_state["sim_flash"] = f"인력 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+                st.rerun()
+            if pr_up is not None and pr_sig != st.session_state.get("sim_pr_sig"):
+                path, gh = _save_upload(pr_up, "제품_기준정보")
+                st.session_state["sim_pr_sig"] = pr_sig
+                st.session_state["sim_flash"] = f"제품 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+                st.rerun()
+            if act_up is not None and act_sig != st.session_state.get("sim_act_sig"):
+                path, gh = _save_upload(act_up, "제품별_실적")
+                st.session_state["sim_act_sig"] = act_sig
+                st.session_state["sim_flash"] = f"제품별 실적 교체 완료: {path.name}" + (f" · {gh}" if gh else "")
+                st.rerun()
         st.subheader("양식 받기")
         st.caption("엑셀에서 한글이 깨지면 xlsx를 받으세요.")
         st.download_button(
