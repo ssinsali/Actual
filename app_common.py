@@ -220,6 +220,10 @@ def list_resettable_data_files() -> list[Path]:
 
 def clear_performance_data() -> list[str]:
     """업로드된 실적 파일을 삭제한다. users.json 은 유지."""
+    from page_access import can_edit_data
+
+    if not can_edit_data():
+        return []
     deleted: list[str] = []
     for path in list_resettable_data_files():
         try:
@@ -240,6 +244,10 @@ def clear_performance_data() -> list[str]:
 
 def render_data_reset_ui(*, key_prefix: str = "") -> None:
     """잘못 올린 실적 파일을 확인 후 삭제."""
+    from page_access import can_edit_data
+
+    if not can_edit_data():
+        return
     files = list_resettable_data_files()
     flag = f"{key_prefix}confirm_reset_data"
     if flag not in st.session_state:
@@ -274,6 +282,10 @@ def render_data_reset_ui(*, key_prefix: str = "") -> None:
 
 
 def save_upload(uploaded) -> Path:
+    from page_access import can_edit_data
+
+    if not can_edit_data():
+        raise PermissionError("데이터 수정 권한이 없습니다.")
     dest = _DATA_DIR / uploaded.name
     dest.write_bytes(uploaded.getvalue())
     return dest
@@ -320,10 +332,14 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
     """사이드바 하단: 양식·업로드·파일선택."""
     st.divider()
     st.header("데이터")
-    st.markdown(
-        f"기본 폴더: `{_DATA_DIR}`  \n"
+    from page_access import can_edit_data, render_view_only_note
+
+    edit_note = (
         "새로 올리면 **그 파일만** 분석합니다. 이전 파일은 목록에만 남습니다."
+        if can_edit_data()
+        else "저장된 파일 중에서 조회할 파일을 고릅니다."
     )
+    st.markdown(f"기본 폴더: `{_DATA_DIR}`  \n{edit_note}")
     st.download_button(
         "기본 CSV 양식 다운로드 (예시 포함)",
         data=template_csv_bytes(),
@@ -346,28 +362,30 @@ def render_data_sidebar(*, key_prefix: str = "") -> None:
             "A 일자, B 조, C~J 영역별 인력/실적, K 캠퍼스(천안/아산), L 주야(주/야)"
         )
 
-    apply_uploader_dropzone_style(key_prefix=key_prefix or "sidebar")
-    st.caption("엑셀/CSV를 **끌어다 놓거나** Upload를 눌러 추가할 수 있습니다. (여러 파일 가능)")
-    uploads = st.file_uploader(
-        "엑셀/CSV 추가 업로드 (드래그앤드롭)",
-        type=["xlsx", "xls", "csv"],
-        accept_multiple_files=True,
-        key=f"{key_prefix}uploader_{_upload_nonce()}",
-        help="파일을 이 상자로 끌어다 놓거나 Upload를 클릭하세요. 여러 개 동시 업로드 가능.",
-    )
-    # file_uploader는 파일이 남아 있으면 매 실행마다 True → rerun 루프 방지
-    upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
-    last_key = f"{key_prefix}last_upload_sig"
-    if uploads and upload_sig and upload_sig != st.session_state.get(last_key):
-        names: list[str] = []
-        for up in uploads:
-            save_upload(up)
-            names.append(up.name)
-            st.success(f"저장: {up.name}")
-        st.session_state[last_key] = upload_sig
-        select_analysis_files(names)
-        st.cache_data.clear()
-        st.rerun()
+    render_view_only_note()
+    if can_edit_data():
+        apply_uploader_dropzone_style(key_prefix=key_prefix or "sidebar")
+        st.caption("엑셀/CSV를 **끌어다 놓거나** Upload를 눌러 추가할 수 있습니다. (여러 파일 가능)")
+        uploads = st.file_uploader(
+            "엑셀/CSV 추가 업로드 (드래그앤드롭)",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            key=f"{key_prefix}uploader_{_upload_nonce()}",
+            help="파일을 이 상자로 끌어다 놓거나 Upload를 클릭하세요. 여러 개 동시 업로드 가능.",
+        )
+        # file_uploader는 파일이 남아 있으면 매 실행마다 True → rerun 루프 방지
+        upload_sig = tuple((u.name, int(getattr(u, "size", 0) or 0)) for u in (uploads or []))
+        last_key = f"{key_prefix}last_upload_sig"
+        if uploads and upload_sig and upload_sig != st.session_state.get(last_key):
+            names: list[str] = []
+            for up in uploads:
+                save_upload(up)
+                names.append(up.name)
+                st.success(f"저장: {up.name}")
+            st.session_state[last_key] = upload_sig
+            select_analysis_files(names)
+            st.cache_data.clear()
+            st.rerun()
 
     files = default_files()
     if not files:
