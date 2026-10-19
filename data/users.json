@@ -79,6 +79,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "asan01_B": {
+      "password_hash": "pbkdf2_sha256$260000$a2333071bc040219237221b63a58294e$0f6e7d3a8e70a0a6d86212a6f05893196bf800979bef9576adbd297d518966a0",
+      "display_name": "유승민",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
