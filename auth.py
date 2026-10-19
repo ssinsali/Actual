@@ -417,6 +417,7 @@ def register_user(
     }
     if not bootstrap:
         record["pages"] = _default_user_pages()
+        record["data_edit"] = False
     data["users"][username] = record
     try:
         _save_users(data)
@@ -462,8 +463,13 @@ def list_accounts() -> dict[str, Any]:
     return users
 
 
-def update_user_pages(username: str, page_ids: list[str]) -> tuple[bool, str]:
-    """일반 계정이 볼 메뉴를 저장한다."""
+def update_user_pages(
+    username: str,
+    page_ids: list[str],
+    *,
+    data_edit: bool = False,
+) -> tuple[bool, str]:
+    """일반 계정의 메뉴와 데이터 수정 권한을 저장한다."""
     username = username.strip()
     if not isinstance(page_ids, list) or any(not isinstance(item, str) for item in page_ids):
         return False, "메뉴 목록이 올바르지 않습니다."
@@ -482,6 +488,7 @@ def update_user_pages(username: str, page_ids: list[str]) -> tuple[bool, str]:
 
     picked = {page_id for page_id in page_ids if page_id in CONTENT_PAGE_IDS}
     user["pages"] = [page_id for page_id in CONTENT_PAGE_IDS if page_id in picked]
+    user["data_edit"] = bool(data_edit)
     try:
         _save_users(data)
     except RuntimeError as e:
