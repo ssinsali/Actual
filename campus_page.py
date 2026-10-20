@@ -263,37 +263,109 @@ def render() -> None:
         rank["인당실적"] = rank.apply(
             lambda r: r["실적합계"] / r["인력합계"] if r["인력합계"] else None, axis=1
         )
+        by_month = pd.DataFrame(columns=["년월", "조", "실적", "인력"])
+        if "년월" in filtered.columns:
+            src = filtered[filtered["캠퍼스"] == campus]
+            if not src.empty:
+                by_month = src.groupby(["년월", "조"], as_index=False).agg(
+                    실적=("실적", "sum"),
+                    인력=("인력", "sum"),
+                )
+        n_months = int(by_month["년월"].nunique()) if not by_month.empty else 0
+        if n_months:
+            month_avg = by_month.groupby("조", as_index=False).agg(실적=("실적", "sum"), 인력=("인력", "sum"))
+            month_avg["월평균실적"] = month_avg["실적"] / n_months
+            month_avg["월평균인력"] = month_avg["인력"] / n_months
+            rank = rank.merge(month_avg[["조", "월평균실적", "월평균인력"]], on="조", how="left")
+        else:
+            rank["월평균실적"] = None
+            rank["월평균인력"] = None
         rank = rank.sort_values("실적합계", ascending=False)
+
+        def _avg(row: pd.Series, col: str) -> float | None:
+            if col not in row.index or pd.isna(row[col]):
+                return None
+            return float(row[col])
+
+        def _month_pp_gap(high: str, low: str) -> float | None:
+            if by_month.empty:
+                return None
+            wide = by_month.pivot_table(index="년월", columns="조", values=["실적", "인력"], aggfunc="sum")
+            gaps: list[float] = []
+            for period in wide.index:
+                try:
+                    out_h = float(wide.loc[period, ("실적", high)])
+                    man_h = float(wide.loc[period, ("인력", high)])
+                    out_l = float(wide.loc[period, ("실적", low)])
+                    man_l = float(wide.loc[period, ("인력", low)])
+                except KeyError:
+                    continue
+                if pd.isna(man_h) or pd.isna(man_l) or man_h <= 0 or man_l <= 0:
+                    continue
+                gaps.append(out_h / man_h - out_l / man_l)
+            if not gaps:
+                return None
+            return float(sum(gaps) / len(gaps))
+
         r1, r2, r3 = st.columns(3)
         if len(rank):
             top = rank.iloc[0]
             bot = rank.iloc[-1]
             diff_out = float(top["실적합계"]) - float(bot["실적합계"])
+            top_m = _avg(top, "월평균실적")
+            bot_m = _avg(bot, "월평균실적")
             with r1:
                 st.metric("실적 상위 조", f"{top['조']}")
                 st.caption(f"실적 {top['실적합계']:,.0f}")
+                if top_m is not None:
+                    st.caption(f"월평균 실적 {top_m:,.1f}")
             with r2:
                 st.metric("실적 차이", f"{diff_out:,.0f}")
                 st.caption(f"{top['조']} − {bot['조']}")
+                if top_m is not None and bot_m is not None:
+                    st.caption(f"월평균 실적 차이 {top_m - bot_m:,.1f}")
             with r3:
                 st.metric("실적 하위 조", f"{bot['조']}")
                 st.caption(f"실적 {bot['실적합계']:,.0f}")
+                if bot_m is not None:
+                    st.caption(f"월평균 실적 {bot_m:,.1f}")
 
             pp_rank = rank.dropna(subset=["인당실적"]).sort_values("인당실적", ascending=False)
             if not pp_rank.empty:
                 pp_top = pp_rank.iloc[0]
                 pp_bot = pp_rank.iloc[-1]
                 diff_pp = float(pp_top["인당실적"]) - float(pp_bot["인당실적"])
+                pp_top_out = _avg(pp_top, "월평균실적")
+                pp_bot_out = _avg(pp_bot, "월평균실적")
+                pp_top_man = _avg(pp_top, "월평균인력")
+                pp_bot_man = _avg(pp_bot, "월평균인력")
+                pp_month_gap = _month_pp_gap(str(pp_top["조"]), str(pp_bot["조"]))
                 p1, p2, p3 = st.columns(3)
                 with p1:
                     st.metric("인당실적 상위 조", f"{pp_top['조']}")
                     st.caption(f"인당실적 {pp_top['인당실적']:,.1f}")
+                    if pp_top_out is not None:
+                        st.caption(f"월평균 실적 {pp_top_out:,.1f}")
+                    if pp_top_man is not None:
+                        st.caption(f"월평균 인력 {pp_top_man:,.1f}")
                 with p2:
                     st.metric("인당실적 차이", f"{diff_pp:,.1f}")
                     st.caption(f"{pp_top['조']} − {pp_bot['조']}")
+                    if pp_month_gap is not None:
+                        st.caption(f"월평균 인당실적 차이 {pp_month_gap:,.1f}")
+                    if pp_top_out is not None and pp_bot_out is not None:
+                        st.caption(f"월평균 실적 차이 {pp_top_out - pp_bot_out:,.1f}")
+                    if pp_top_man is not None and pp_bot_man is not None:
+                        st.caption(f"월평균 인력 차이 {pp_top_man - pp_bot_man:,.1f}")
                 with p3:
                     st.metric("인당실적 하위 조", f"{pp_bot['조']}")
                     st.caption(f"인당실적 {pp_bot['인당실적']:,.1f}")
+                    if pp_bot_out is not None:
+                        st.caption(f"월평균 실적 {pp_bot_out:,.1f}")
+                    if pp_bot_man is not None:
+                        st.caption(f"월평균 인력 {pp_bot_man:,.1f}")
+            if n_months:
+                st.caption(f"월평균 = 선택한 기간 합계 ÷ {n_months}개월. 월평균 인당실적 차이는 달마다 인당실적 차이를 낸 뒤 그 평균입니다.")
 
         chart = (
             alt.Chart(sub)
