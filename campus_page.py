@@ -318,17 +318,17 @@ def render() -> None:
                 st.metric("실적 상위 조", f"{top['조']}")
                 st.caption(f"실적 {top['실적합계']:,.0f}")
                 if top_m is not None:
-                    st.caption(f"월평균 실적 {top_m:,.1f}")
+                    st.caption(f"월평균 실적 {top_m:,.0f}")
             with r2:
                 st.metric("실적 차이", f"{diff_out:,.0f}")
                 st.caption(f"{top['조']} − {bot['조']}")
                 if top_m is not None and bot_m is not None:
-                    st.caption(f"월평균 실적 차이 {top_m - bot_m:,.1f}")
+                    st.caption(f"월평균 실적 차이 {top_m - bot_m:,.0f}")
             with r3:
                 st.metric("실적 하위 조", f"{bot['조']}")
                 st.caption(f"실적 {bot['실적합계']:,.0f}")
                 if bot_m is not None:
-                    st.caption(f"월평균 실적 {bot_m:,.1f}")
+                    st.caption(f"월평균 실적 {bot_m:,.0f}")
 
             pp_rank = rank.dropna(subset=["인당실적"]).sort_values("인당실적", ascending=False)
             if not pp_rank.empty:
@@ -343,27 +343,27 @@ def render() -> None:
                 p1, p2, p3 = st.columns(3)
                 with p1:
                     st.metric("인당실적 상위 조", f"{pp_top['조']}")
-                    st.caption(f"인당실적 {pp_top['인당실적']:,.1f}")
+                    st.caption(f"인당실적 {pp_top['인당실적']:,.0f}")
                     if pp_top_out is not None:
-                        st.caption(f"월평균 실적 {pp_top_out:,.1f}")
+                        st.caption(f"월평균 실적 {pp_top_out:,.0f}")
                     if pp_top_man is not None:
-                        st.caption(f"월평균 인력 {pp_top_man:,.1f}")
+                        st.caption(f"월평균 인력 {pp_top_man:,.0f}")
                 with p2:
-                    st.metric("인당실적 차이", f"{diff_pp:,.1f}")
+                    st.metric("인당실적 차이", f"{diff_pp:,.0f}")
                     st.caption(f"{pp_top['조']} − {pp_bot['조']}")
                     if pp_month_gap is not None:
-                        st.caption(f"월평균 인당실적 차이 {pp_month_gap:,.1f}")
+                        st.caption(f"월평균 인당실적 차이 {pp_month_gap:,.0f}")
                     if pp_top_out is not None and pp_bot_out is not None:
-                        st.caption(f"월평균 실적 차이 {pp_top_out - pp_bot_out:,.1f}")
+                        st.caption(f"월평균 실적 차이 {pp_top_out - pp_bot_out:,.0f}")
                     if pp_top_man is not None and pp_bot_man is not None:
-                        st.caption(f"월평균 인력 차이 {pp_top_man - pp_bot_man:,.1f}")
+                        st.caption(f"월평균 인력 차이 {pp_top_man - pp_bot_man:,.0f}")
                 with p3:
                     st.metric("인당실적 하위 조", f"{pp_bot['조']}")
-                    st.caption(f"인당실적 {pp_bot['인당실적']:,.1f}")
+                    st.caption(f"인당실적 {pp_bot['인당실적']:,.0f}")
                     if pp_bot_out is not None:
-                        st.caption(f"월평균 실적 {pp_bot_out:,.1f}")
+                        st.caption(f"월평균 실적 {pp_bot_out:,.0f}")
                     if pp_bot_man is not None:
-                        st.caption(f"월평균 인력 {pp_bot_man:,.1f}")
+                        st.caption(f"월평균 인력 {pp_bot_man:,.0f}")
             if n_months:
                 st.caption(f"월평균 = 선택한 기간 합계 ÷ {n_months}개월. 월평균 인당실적 차이는 달마다 인당실적 차이를 낸 뒤 그 평균입니다.")
 
