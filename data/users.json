@@ -123,6 +123,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "2191214A": {
+      "password_hash": "pbkdf2_sha256$260000$705c1d0f6e897636bba75e2215713b56$2df22a0742062f604d4ca4c65673c23a55e53b358e08fe81f1d70ed871e52509",
+      "display_name": "박재범",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
