@@ -134,6 +134,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "cbk6334": {
+      "password_hash": "pbkdf2_sha256$260000$9b57e2ac50acc65ac187bd0e3584c8e1$4450455b2ebd1f3ca150054b53ff6de9f5294fffe998d202116c2654a1653dde",
+      "display_name": "조벽권",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
