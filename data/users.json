@@ -145,6 +145,17 @@
         "trend"
       ],
       "data_edit": false
+    },
+    "2180820": {
+      "password_hash": "pbkdf2_sha256$260000$50bce63f04ea45888a063e0070ea5862$49238d6c4c6532581388c84480ec86a189acd7bee35bac39210b14b291349869",
+      "display_name": "손형우",
+      "role": "user",
+      "pages": [
+        "campus",
+        "summary",
+        "trend"
+      ],
+      "data_edit": false
     }
   }
 }
