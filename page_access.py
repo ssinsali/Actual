@@ -65,6 +65,13 @@ CONTENT_PAGES: tuple[dict[str, str], ...] = (
         "section": "설비·CAPA",
         "path": "screens/capa.py",
     },
+    {
+        "id": "hole_offset",
+        "title": "홀 틀어짐 분석",
+        "icon": "🎯",
+        "section": "분석 Tool",
+        "path": "screens/hole_offset.py",
+    },
 )
 
 DEFAULT_PAGE_IDS: tuple[str, ...] = ("campus", "summary", "trend")
@@ -75,6 +82,7 @@ PRESETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("드릴만", ("drill",)),
     ("CAPA만", ("capa",)),
     ("시뮬레이션만", ("sim",)),
+    ("홀틀어짐만", ("hole_offset",)),
     ("전체", CONTENT_PAGE_IDS),
     ("없음", ()),
 )
